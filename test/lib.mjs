@@ -4,6 +4,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { spawn } from 'node:child_process';
 import { readdir } from 'node:fs/promises';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
@@ -66,7 +67,10 @@ export async function connect(label, { ownTurns = false, env = {}, command = MCP
     // The turn-end hook's message to this server (ownTurns only); resolves to its JSON reply.
     endTurn: () => new Promise((resolve, reject) => {
       let reply = '';
-      const socket = net.connect(`/tmp/fowlbrowser-turn-${transport.pid}.sock`, () => socket.write('turn_ended\n'));
+      // Where the server listens (mcp/src/turns.mjs turnSocketPath): the FowlBrowser folder, the temp folder only for a long path.
+      const turns = path.join(SOCKET_DIR, 'turns', `${transport.pid}.sock`);
+      const fallback = path.join(os.tmpdir(), `fowlbrowser-turn-${transport.pid}.sock`);
+      const socket = net.connect(Buffer.byteLength(turns) < 104 ? turns : fallback, () => socket.write('turn_ended\n'));
       socket.on('data', (chunk) => { reply += chunk; });
       socket.on('end', () => { try { resolve(JSON.parse(reply)); } catch (e) { reject(e); } });
       socket.on('error', reject);

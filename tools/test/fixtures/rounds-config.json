@@ -1,0 +1,8 @@
+{
+  "codexBrowsers": { "helium": "H-ID", "chrome": "C-ID" },
+  "codexProxy": "~/codex-cu/proxy.mjs",
+  "devtools": { "command": "~/bin/devtools-mcp.sh", "env": { "chrome": { "PORT": "9001" }, "helium": { "PORT": "9002" } } },
+  "guiDriver": "~/bin/gui-driver",
+  "remoteGuiLock": "~/bin/guilock",
+  "remoteDeploy": "deploy.sh"
+}

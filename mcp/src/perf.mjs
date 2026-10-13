@@ -123,8 +123,20 @@ export async function isUsersTab(tab) {
 // Where big results go: os.tmpdir()/fowlbrowser-<kind>/, created for this user only. stamp(): 20261011-131500-123 (ms);
 // with the tab id ("chrome-52") in the name, two measurements never share a file.
 export function outputDir(kind) {
-  const dir = path.join(os.tmpdir(), `fowlbrowser-${kind}`);
+  return privateDir(path.join(os.tmpdir(), `fowlbrowser-${kind}`));
+}
+
+// mkdir's mode does nothing to a folder that is already there: in a shared /tmp (TMPDIR unset) another user may have
+// made it first, or put a symlink there. Ours that others could only read (older versions made the exports one 0755)
+// is made private; one others could write to may hold their files, so it is refused like theirs.
+export function privateDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory() || stat.uid !== process.getuid() || stat.mode & 0o022) {
+    throw new Error(`${dir} is not a private folder of this user (a symlink, someone else's, or writable by others), so nothing is written there. ` +
+      'Remove it, or set TMPDIR to a private folder.');
+  }
+  if (stat.mode & 0o077) fs.chmodSync(dir, 0o700);
   return dir;
 }
 export const stamp = () => new Date().toISOString().slice(0, 23).replace(/[-:]/g, '').replace('T', '-').replace('.', '-');

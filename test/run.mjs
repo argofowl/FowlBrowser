@@ -2,7 +2,7 @@
 // Runs the end-to-end scenarios through one FowlBrowser MCP server.
 //   node test/run.mjs --browser chrome|helium|both --parallel N [--only name,name] [--local] [--gui]
 // --local skips the real-site scenarios. gui scenarios (real mouse and keyboard on this Mac) run only with --gui, which
-// needs the GUI to itself (mac2's lock). exclusive scenarios run alone after the others. The test site is started if
+// needs the GUI to itself (a test Mac's lock). exclusive scenarios run alone after the others. The test site is started if
 // it isn't already up.
 import { browsersFrom, connect, ensureSite, loadScenarios, parseArgs, parseTabs, pool, printTable, runJob, sweepLeaks } from './lib.mjs';
 

@@ -10,7 +10,7 @@ import { HostClient, listSockets } from './hostClient.mjs';
 import { installPopups } from './popups.mjs';
 import { downloadDone, record } from './record.mjs';
 import { currentCall, heldBack, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
-import { tabInfo } from './util.mjs';
+import { isLocalUrl, tabInfo } from './util.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
 
 export const LABEL = process.env.FOWLBROWSER_LABEL || 'Claude';
@@ -68,15 +68,18 @@ export class Tab extends EventEmitter {
     });
     // Answered by the user in the browser, or by the dialog tool: actions are no longer blocked.
     page.on('dialogclosed', (dialog) => { if (this.dialog === dialog) this.dialog = null; });
-    page.on('console', (message) => push(this.console, {
+    // Nothing a local file page logs or loads is kept: it could be read back after the tab leaves it.
+    const local = () => isLocalUrl(page.url());
+    page.on('console', (message) => local() || push(this.console, {
       time: Date.now(), level: message.type(), text: message.text(), url: message.location()?.url,
     }));
-    page.on('pageerror', (error) => push(this.console, { time: Date.now(), level: 'error', text: `Uncaught ${error.message}` }));
+    page.on('pageerror', (error) => local() || push(this.console, { time: Date.now(), level: 'error', text: `Uncaught ${error.message}` }));
     page.on('response', (response) => {
       const request = response.request();
+      if (local() || isLocalUrl(request.url())) return;
       push(this.network, { time: Date.now(), method: request.method(), url: request.url(), status: response.status(), type: request.resourceType() });
     });
-    page.on('requestfailed', (request) => push(this.network, {
+    page.on('requestfailed', (request) => local() || isLocalUrl(request.url()) || push(this.network, {
       time: Date.now(), method: request.method(), url: request.url(), status: 'failed', type: request.resourceType(), failure: request.failure()?.errorText,
     }));
   }
@@ -99,7 +102,9 @@ export class Tab extends EventEmitter {
   }
 
   // A new document in the main frame (not same-document history): any dialog of the old one is gone.
-  _newDocument() {
+  // url: the new document's, when known; a local file one is noted (localPageAt) so no result read meanwhile is kept.
+  _newDocument(url) {
+    if (isLocalUrl(url)) this.localPageAt = Date.now();
     this.documentGeneration++;
     this.dialog = null;
   }
@@ -187,7 +192,7 @@ export class Browser {
     if (method === 'Page.frameNavigated' && (source.sessionId || params?.frame?.parentId)) tab.frameGeneration++;
     else if (source.sessionId) return;
     else if (method === 'Page.frameNavigated') {
-      tab._newDocument();
+      tab._newDocument(params?.frame?.url);
       prepareCursor(tab);
     } else if (method === 'Page.windowOpen') tab.emit('windowopen', params?.url ?? '');
     else if (isOwnBinding(method, params)) tab.emit('binding', params.name, params.payload);

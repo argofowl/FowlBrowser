@@ -239,6 +239,16 @@ test('trace_stop end to end: summary and file, and the close listener goes with 
   assert.notEqual(await slotIsFree(), null, 'slot released');
 });
 
+test('trace_stop: a recording during which the tab showed a local file is discarded, not saved', async () => {
+  const tab = fakeTab();
+  assert.match(await tools.trace_start(tab, { reload: false, auto_stop: false }), /Trace recording\./);
+  tab.localPageAt = Date.now(); // history back into a local file page, then away again
+  await assert.rejects(tools.trace_stop(tab), /showed a local file during the recording.*trace was discarded/);
+  assert.ok(!tab.trace.startedAt && !tab.trace.last, 'nothing kept');
+  assert.equal(tab.page.listenerCount('close'), 0);
+  assert.equal(await slotState(), 'free', 'slot released');
+});
+
 test('trace_stop: a refused Tracing.end stops waiting for tracingComplete and keeps the recording for a retry', async () => {
   const tab = fakeTab({ 'Tracing.end': (n) => (n === 1 ? 'end failed' : undefined) });
   await tools.trace_start(tab, { reload: false, auto_stop: false });

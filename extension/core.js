@@ -14,9 +14,13 @@ const BLOCKED_CDP = [
   // Only these Target methods; attachToTarget only flattened and only for the tab's own children. No
   // sendMessageToTarget: a non-flat session would carry commands past this filter.
   /^Target\.(?!(setAutoAttach|getTargetInfo|detachFromTarget|attachToTarget)$)/,
-  /^Network\.(clearBrowserCookies|clearBrowserCache|setCookie|setCookies|deleteCookies)$/,
-  // Profile-wide storage domains: reads (get*, request*), tracking and enable/disable only.
-  /^(Storage|DOMStorage|IndexedDB|CacheStorage|ServiceWorker)\.(?!((get|request|track|untrack)[A-Z]\w*|enable|disable)$)/,
+  /^Network\.(clearBrowserCookies|clearBrowserCache|setCookie|setCookies|deleteCookies|getCookies|getAllCookies)$/,
+  // Profile-wide storage domains: Storage only the quota read Lighthouse makes, and enable/disable; ServiceWorker
+  // reads (get*, request*), tracking and enable/disable; any site's DOM storage, IndexedDB and Cache Storage only
+  // enable/disable, never their data.
+  /^Storage\.(?!(getUsageAndQuota|enable|disable)$)/,
+  /^ServiceWorker\.(?!((get|request|track|untrack)[A-Z]\w*|enable|disable)$)/,
+  /^(DOMStorage|IndexedDB|CacheStorage)\.(?!(enable|disable)$)/,
 ];
 const CHILD_ONLY_CDP = /^Target\.attachToTarget$/;
 const isBlockedCommand = (method) => BLOCKED_CDP.some((rule) => rule.test(String(method)));
@@ -41,9 +45,14 @@ export function isNewTabPage(url) {
   return /^(chrome|edge):\/\/(newtab|new-tab-page)\b/.test(url) || url.startsWith('chrome-search://');
 }
 
+// Parsed as Chrome does, so "fi\tle:" is a local file too. new URL, not URL.parse: Chrome 125 lacks that.
+function isLocalFile(url) {
+  try { return ['file:', 'view-source:'].includes(new URL(String(url ?? '')).protocol); } catch { return false; }
+}
+
 export function isRestricted(url) {
   if (url === 'about:blank') return false;
-  return /^(chrome|chrome-extension|devtools|edge|about):/.test(url)
+  return /^(chrome|chrome-extension|devtools|edge|about|file|view-source):/.test(url)
     || url.startsWith('https://chromewebstore.google.com')
     || url.startsWith('https://chrome.google.com/webstore');
 }
@@ -198,6 +207,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // drives it until it disconnects. It stays muted while driven (focus emulation lets background pages autoplay) and
   // is unmuted when control ends, unless the agent set its mute itself or the user changed it meanwhile.
   async function openTab({ client, live }, { url = 'about:blank', group, muted = true, forUser = false } = {}) {
+    if (isLocalFile(url)) throw new Error(`${url} can't be opened: local files and view-source: pages are never opened`);
     const label = group || labelFor(client);
     const windowId = await pickWindow();
     const tab = windowId === undefined
@@ -457,6 +467,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         if (owner?.releasing) throw new Error(`Tab ${tabId} is being released`);
         if (owner && owner.client !== client) throw new Error(`Tab ${tabId} is owned by another client`);
         let tab = await chrome.tabs.get(tabId);
+        if (tab.incognito) throw new Error(`Tab ${tabId} is in an incognito window, which is left alone`);
         if (owner) {
           if (owner.parked && !resume) throw new Error(`Tab ${tabId} is parked (the user has it); only a resume takes it back`);
           if (owner.parked && !owner.parked.resuming) tab = await unpark(tabId, owner, tab);
@@ -693,6 +704,9 @@ export function createCore({ chrome, send, timers = globalThis }) {
       if (isBlockedCommand(method)
         || (CHILD_ONLY_CDP.test(method) && (params?.flatten !== true || !children?.has(params?.targetId)))) {
         throw new Error(`${method} is blocked: it reaches beyond the tab (other tabs, the browser, the whole profile or the user's focus)`);
+      }
+      if (method === 'Page.navigate' && isLocalFile(params?.url)) {
+        throw new Error(`${method} to ${params.url} is blocked: local files and view-source: pages can't be opened`);
       }
       if (String(method).startsWith('Input.')) agentInputAt.set(target.tabId, Date.now()); // the agent's input (usersTurn)
       let timer;

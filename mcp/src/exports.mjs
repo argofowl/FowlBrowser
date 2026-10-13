@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import { debug } from './debug.mjs';
+import { privateDir } from './perf.mjs';
 
 export const EXPORT_DIR = path.join(os.tmpdir(), 'fowlbrowser-exports');
 const DEFAULT_MAX_CHARS = 20_000;
@@ -272,7 +273,7 @@ export async function exportTab(tab, args) {
   if (!page) throw new Error(`Nothing to export here: read normal pages with snapshot. export supports ${SUPPORTED}.`);
   const result = page.kind === 'youtube' ? await exportYouTube(tab, page, args) : await exportGoogle(tab, page, args);
   // A folder per export, so no other export (another language, another session) ever overwrites a returned file.
-  await fs.mkdir(EXPORT_DIR, { recursive: true });
+  privateDir(EXPORT_DIR);
   const file = path.join(await fs.mkdtemp(path.join(EXPORT_DIR, 'export-')), fileName(result.name, result.ext));
   await fs.writeFile(file, result.text ?? result.data);
   if (result.data) return `Exported ${result.what} (${Math.ceil(result.data.length / 1024).toLocaleString('en-US')} KB).\nSaved: ${file}`;

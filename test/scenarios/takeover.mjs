@@ -1,10 +1,10 @@
-// The user in the tab an agent works in, with a real mouse and keyboard (mac2 only, under its GUI lock: run.mjs
+// The user in the tab an agent works in, with a real mouse and keyboard (a test Mac only, under its GUI lock: run.mjs
 // --gui). Like Codex, the agent keeps going: the user's real click, typing, scrolling and an address typed into the
 // address bar no longer take the tab over (nothing is parked, no call fails, no notice), and neither does a burst of
 // the agent's own input. Cmd-W still does, and the next call says so in words. A tab the user opens from an agent tab
 // with their own click is theirs (in front, not owned, grouped or muted); the agent's own click still opens one of its
 // own in the background. Also records what opening DevTools on an agent tab does.
-// Real input comes from cua-driver-local (mac2's GUI driver): pixel clicks posted to the browser, keys through the HID
+// Real input comes from the test Mac's GUI driver (cua-driver): pixel clicks posted to the browser, keys through the HID
 // queue for the browser's own shortcuts. The scenario brings its tabs to the front and gives the window its previous
 // active tab back at the end, like cursor.mjs.
 import { execFileSync } from 'node:child_process';
@@ -13,7 +13,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { rawHost, sleep, tabIdsIn, ToolError } from '../lib.mjs';
 
-const CUA = `${os.homedir()}/.local/bin/cua-driver-local`;
+// The GUI driver, from PATH unless named (the test Mac's runner puts ~/.local/bin on PATH).
+const CUA = process.env.FOWLBROWSER_GUI_DRIVER || 'cua-driver-local';
 const APPS = { chrome: 'Google Chrome', helium: 'Helium' };
 // One driver session per job, so a pixel click finds the capture it was measured on; ended when the job is done.
 // Exclusive scenarios run one at a time, so one variable does.
@@ -27,8 +28,8 @@ function cua(tool, args) {
     out = execFileSync(CUA, ['call', tool, JSON.stringify({ session, ...args })], { encoding: 'utf8', maxBuffer: 256 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (error) {
     const output = `${error.stdout ?? ''} ${error.stderr ?? ''}`.trim();
-    console.error(`cua-driver-local call ${tool} failed: ${output}`);
-    throw new Error(`cua-driver-local call ${tool} ${JSON.stringify(args)} failed: ${output.slice(0, 600)}`);
+    console.error(`GUI driver call ${tool} failed: ${output}`);
+    throw new Error(`GUI driver call ${tool} ${JSON.stringify(args)} failed: ${output.slice(0, 600)}`);
   }
   try { return JSON.parse(out); } catch { return out; }
 }

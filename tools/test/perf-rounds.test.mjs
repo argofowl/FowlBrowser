@@ -1,4 +1,5 @@
 // The performance round pieces of tools/rounds.mjs: the devtools surface, number checks and url-matched tabs.
+import './fixtures/rounds-config.mjs';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import test from 'node:test';
@@ -9,9 +10,9 @@ const t = 1_760_000_000_000;
 test('devtools surface: the relay MCP of the task\'s browser, only its tools, and the prompt asks to close pages', () => {
   const setup = agentSetup({ task: { name: 'slow-dt', browser: 'helium', prompt: 'why is {browser} slow', result: 'x' }, surface: 'devtools', dir: '/tmp/x', mcpRoot: '/r', settings: '/s', model: 'opus', effort: 'medium' });
   const server = setup.mcpConfig.mcpServers.devtools;
-  assert.equal(server.command, `${os.homedir()}/.claude/tools/cdp-relay/devtools-mcp.sh`);
-  assert.equal(server.env.CDP_RELAY_PORT, '5299');
-  assert.equal(agentSetup({ task: { name: 'a', browser: 'chrome', prompt: 'p', result: 'x' }, surface: 'devtools', dir: '/tmp/x', mcpRoot: '/r', settings: '/s', model: 'opus', effort: 'medium' }).mcpConfig.mcpServers.devtools.env.CDP_RELAY_PORT, '5298');
+  assert.equal(server.command, `${os.homedir()}/bin/devtools-mcp.sh`);
+  assert.deepEqual(server.env, { PORT: '9002' });
+  assert.deepEqual(agentSetup({ task: { name: 'a', browser: 'chrome', prompt: 'p', result: 'x' }, surface: 'devtools', dir: '/tmp/x', mcpRoot: '/r', settings: '/s', model: 'opus', effort: 'medium' }).mcpConfig.mcpServers.devtools.env, { PORT: '9001' });
   assert.equal(setup.args[setup.args.indexOf('--allowedTools') + 1], 'mcp__devtools');
   assert.match(setup.prompt, /mcp__devtools__\* tools .*connected to Helium/);
   assert.match(setup.prompt, /close every page you opened with close_page/);

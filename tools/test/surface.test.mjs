@@ -1,4 +1,5 @@
 // The head-to-head pieces of tools/rounds.mjs: surfaces, transcripts, flashes and the session 5 checks.
+import './fixtures/rounds-config.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -6,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { activityFlashes, agentSetup, agentTabs, codexAgentEvent, codexMcpServers, codexServer, controlledBy, downloadsDiff, elicitationsOf, gradeCalls, gradeHandoff,
+import { activityFlashes, agentSetup, CODEX_AGENT_CWD, agentTabs, codexAgentEvent, codexMcpServers, codexServer, controlledBy, downloadsDiff, elicitationsOf, gradeCalls, gradeHandoff,
   gradeOutcome, gradeSite, gradeTabs, gradeTakeover, gradeViewport, parseTranscript, readJsonl, remoteServer, remoteTurnEnd, roundSettings } from '../rounds.mjs';
 
 const t = 1_760_000_000_000;
@@ -90,7 +91,7 @@ test('codex-agent: codex exec with only the browser, its JSON events read as a t
   const setup = agentSetup({ task, surface: 'codex-agent', dir: '/r/shop', model: 'gpt-6.1-sol', effort: 'medium', codex: { browsers: { chrome: 'C-ID' }, disable: ['posthog', 'chrome-devtools'] } });
   assert.equal(setup.command, 'codex');
   assert.equal(setup.mcpConfig, null);
-  assert.deepEqual(setup.args.slice(0, 8), ['exec', '-C', '/tmp/fb-rounds/codex-agent', '--skip-git-repo-check', '--json', '-m', 'gpt-6.1-sol', '-c']);
+  assert.deepEqual(setup.args.slice(0, 8), ['exec', '-C', CODEX_AGENT_CWD, '--skip-git-repo-check', '--json', '-m', 'gpt-6.1-sol', '-c']);
   assert.ok(setup.args.includes('model_reasoning_effort=medium'));
   for (const f of ['shell_tool', 'unified_exec', 'multi_agent', 'multi_agent_v2', 'apps']) assert.equal(setup.args[setup.args.indexOf(f) - 1], '--disable');
   assert.deepEqual(setup.args.slice(-5), ['-c', 'mcp_servers.posthog.enabled=false', '-c', 'mcp_servers.chrome-devtools.enabled=false', '-']);
@@ -257,7 +258,7 @@ test('downloads for Codex: new or replaced files in ~/Downloads become download 
 });
 
 test('remote: servers run over the round\'s ssh, record on the remote Mac and keep a shell parent whose pid is written down', async () => {
-  const remote = { ssh: ['-o', 'ControlPath=/tmp/fb-remote/cm', 'mac2'], bed: '/Users/u/Projects/FowlBrowser', runDir: '/tmp/fb-rounds-remote/r1' };
+  const remote = { ssh: ['-o', 'ControlPath=/tmp/fb-remote/cm', 'testmac'], bed: '/Users/u/Projects/FowlBrowser', runDir: '/tmp/fb-rounds-remote/r1' };
   const task = { name: 'takeover', browser: 'chrome', prompt: 'p', result: 'r' };
   const common = { task, dir: '/r/takeover', mcpRoot: '/repo', settings: '/r/s.json', model: 'opus', effort: 'medium', remote };
   const fb = agentSetup({ ...common, surface: 'fowlbrowser' }).mcpConfig.mcpServers.fowlbrowser;
@@ -266,7 +267,7 @@ test('remote: servers run over the round\'s ssh, record on the remote Mac and ke
   assert.match(fb.args[3], /mkdir -p '\/tmp\/fb-rounds-remote\/r1\/takeover' && echo \$\$ > '\/tmp\/fb-rounds-remote\/r1\/takeover'\/server\.pid && env FOWLBROWSER_LABEL='🧪 takeover' FOWLBROWSER_RECORD='\/tmp\/fb-rounds-remote\/r1\/takeover' '\/Users\/u\/Projects\/FowlBrowser\/mcp\/bin\/fowlbrowser-mcp'; :$/);
   const cx = agentSetup({ ...common, surface: 'codex', codex: { entry: codexEntry, browsers: { chrome: 'C2' } } }).mcpConfig.mcpServers['codex-cu'];
   assert.match(cx.args[3], /env CUA_REPL_ENABLED_SURFACES='browser' BROWSER_USE_CODEX_APP_VERSION='26\.930\.31730' '\/Applications\/ChatGPT\.app\/Contents\/Resources\/cua_node\/bin\/node' '\/Users\/u\/\.claude\/tools\/codex-cu\/proxy\.mjs' '\/Applications\/ChatGPT\.app\/Contents\/Resources\/cua_node\/bin\/node' '\/Users\/u\/Projects\/FowlBrowser\/tools\/mcp-tee\.mjs' '\/tmp\/fb-rounds-remote\/r1\/takeover\/elicitations\.jsonl'/);
-  assert.equal(remoteTurnEnd('fowlbrowser', '/d'), "printf 'turn_ended\\n' | nc -U -w 5 /tmp/fowlbrowser-turn-$(cat '/d'/server.pid).sock");
+  assert.equal(remoteTurnEnd('fowlbrowser', '/d'), "s=~/.fowlbrowser/turns/$(cat '/d'/server.pid).sock; [ -S \"$s\" ] || s=/tmp/fowlbrowser-turn-$(cat '/d'/server.pid).sock; printf 'turn_ended\\n' | nc -U -w 5 \"$s\"");
   assert.equal(remoteTurnEnd('codex', '/d'), "nc -U -w 2 /tmp/codex-cu-$(cat '/d'/server.pid).sock </dev/null");
 
   // The line itself, run by a local shell with a stand-in server: env arrives, quotes survive, the pid file names its parent.

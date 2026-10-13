@@ -1,4 +1,4 @@
-// What a popup from an agent's click does while the user works in another app (mac2 only, under its GUI lock: run.mjs
+// What a popup from an agent's click does while the user works in another app (a test Mac only, under its GUI lock: run.mjs
 // --gui). With a Finder window frontmost and the agent tab's browser behind it, the agent clicks a link and buttons
 // that window.open with and without popup features (a size guide, a sign-in window). The front app is polled with
 // lsappinfo for the whole action, and the extension's activity stream records activations, windows and focus.
@@ -7,10 +7,10 @@
 // failed: the browser coming to the front for opener-dependent popups (known limit, accepted).
 // The Finder window is closed and the frontmost app given back at the end.
 import { execFileSync, spawn } from 'node:child_process';
-import os from 'node:os';
 import { rawHost, sleep, tabIdsIn } from '../lib.mjs';
 
-const CUA = `${os.homedir()}/.local/bin/cua-driver-local`;
+// The GUI driver, from PATH unless named (the test Mac's runner puts ~/.local/bin on PATH).
+const CUA = process.env.FOWLBROWSER_GUI_DRIVER || 'cua-driver-local';
 const APPS = { chrome: 'Google Chrome', helium: 'Helium' };
 const SETTLE_MS = 1000;
 

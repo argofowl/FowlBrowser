@@ -1,5 +1,8 @@
 // Small helpers shared by the server's modules.
 
+// A local file or view-source: page, parsed as the browser parses it ("fi\tle:" is file: too).
+export const isLocalUrl = (url) => ['file:', 'view-source:'].includes(URL.parse(url ?? '')?.protocol);
+
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // The promise's value, or `fallback` when it fails or takes longer than ms (the timer is cleared either way).

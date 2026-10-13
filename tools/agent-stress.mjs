@@ -1,5 +1,5 @@
 // Runs real Claude agents (claude -p) against FowlBrowser in parallel and checks that they don't step on each other.
-//   node tools/agent-stress.mjs --tasks tools/agents/tasks.json [--dir /tmp/fb-stress] [--concurrency 10] [--only name,name]
+//   node tools/agent-stress.mjs --tasks tools/agents/tasks.json [--dir /tmp/fb-stress] [--concurrency 10] [--only name,name] [--out folder]
 // Each agent gets its own MCP server process (like separate Claude sessions). A task with "subagents": true lets one
 // agent spawn Agent-tool subagents that share its server. Before and after the run it records every tab nobody owns
 // (the "user's" tabs) and fails if any of them changed, and it fails if any agent tab is left open.
@@ -15,8 +15,12 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DIR = args.dir || path.join(os.homedir(), '.fowlbrowser');
 const CONCURRENCY = Number(args.concurrency || 10);
 let tasks = JSON.parse(fs.readFileSync(args.tasks || path.join(ROOT, 'tools/agents/tasks.json'), 'utf8'));
+// Task names become file paths.
+const bad = tasks.map((t) => t.name).filter((name) => !/^[A-Za-z0-9_-]+$/.test(name ?? ''));
+if (bad.length) { console.error(`task names may only have letters, digits, - and _: ${bad.map((n) => JSON.stringify(n)).join(', ')}`); process.exit(2); }
 if (args.only) tasks = tasks.filter((t) => String(args.only).split(',').includes(t.name));
-const OUT = path.join(os.tmpdir(), `fb-agents-${Date.now()}`);
+// A new private folder unless one is given: in a shared temp folder another account could plant the MCP configs.
+const OUT = args.out ? path.resolve(args.out) : fs.mkdtempSync(path.join(os.tmpdir(), `fb-agents-${Date.now()}-`));
 fs.mkdirSync(OUT, { recursive: true });
 
 // --- Direct socket client, for the before/after tab inventory ---

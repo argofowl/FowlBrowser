@@ -3,14 +3,23 @@
 // back to the user, and the session stays connected for the next turn. Modeled on Codex's per-turn cleanup.
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import * as cursor from './cursor/index.mjs';
+import { SOCKET_DIR } from './hostClient.mjs';
 import { uninstallPopups } from './popups.mjs';
 import { record, tabEvent } from './record.mjs';
 import { markEnding, parked } from './takeover.mjs';
 import { tabInfo } from './util.mjs';
 import { clearViewport } from './viewport.mjs';
 
-export const turnSocketPath = (pid = process.ppid) => `/tmp/fowlbrowser-turn-${pid}.sock`;
+// In the FowlBrowser folder (0700; its own subfolder, as *.sock there are browsers), not the shared /tmp. When that
+// is too long for a socket (104 bytes on macOS), in the user's temp folder (macOS gives each user a private one); the
+// hook looks in both, then in /tmp for servers from before.
+export const turnSocketPath = (pid = process.ppid, dir = SOCKET_DIR, tmp = os.tmpdir()) => {
+  const socketPath = path.join(dir, 'turns', `${pid}.sock`);
+  return Buffer.byteLength(socketPath) < 104 ? socketPath : path.join(tmp, `fowlbrowser-turn-${pid}.sock`);
+};
 
 // Tool calls running per tab id string ("chrome:52"), counted by the registration wrapper in tools.mjs.
 export const callsByTab = new Map();
@@ -87,6 +96,7 @@ export function listenForTurns(manager, socketPath = turnSocketPath()) {
   let running = null;
   const run = () => (running ??= endTurn(manager).finally(() => { running = null; }));
   const reply = (socket, result) => socket.end(`${JSON.stringify(result)}\n`);
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
   fs.rmSync(socketPath, { force: true });
   const server = net.createServer((socket) => {
     socket.on('error', () => {});

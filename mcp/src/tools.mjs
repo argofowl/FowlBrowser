@@ -1,4 +1,6 @@
 // MCP tools. Every tab-level tool takes an explicit tab id like "helium:1834"; there is no current tab.
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import { ACTION_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS } from './browsers.mjs';
@@ -57,11 +59,85 @@ async function resolveTab(manager, value) {
   return browser.waitForTab(tabId);
 }
 
-function refuseLocalFile(url) {
-  if (/^\s*file:/i.test(url ?? '')) {
+// Parsed like the browser does (it drops tabs, newlines and leading control characters), so "fi\tle:" is file: too.
+export function refuseLocalFile(url) {
+  const protocol = URL.parse(url ?? '')?.protocol;
+  if (protocol === 'file:') {
     throw new Error(`${url.trim()} is a local file: local files can't be opened in the browser. Read the file from disk instead (it is on this Mac).`);
   }
+  if (protocol === 'view-source:') throw new Error(`${url.trim()}: view-source: pages can't be opened. Open the page itself instead.`);
   return url;
+}
+
+// However a tab came to show a local file (history, a page's own history.back(), a link from one local file to another),
+// FowlBrowser doesn't read or act in it: it may only be navigated away, released, kept or closed.
+const LOCAL_PAGE = 'this tab shows a local file, which FowlBrowser doesn\'t read; navigate it to a web page or close it';
+const isLocalPage = (url) => ['file:', 'view-source:'].includes(URL.parse(url)?.protocol);
+function refuseLocalPage(tab) {
+  if (isLocalPage(tab.page.url())) throw new Error(`Tab ${tab.id}: ${LOCAL_PAGE}.`);
+}
+
+// Hidden files and folders (~/.ssh, ~/.aws, .env, ~/.config), ~/Library and system configuration are never uploaded,
+// also not through a symlink: paths are resolved first (natively, so "~/library" is ~/Library too). iCloud Drive and the
+// cloud drives (Dropbox, Google Drive, OneDrive) live in ~/Library too and stay allowed. A folder (a webkitdirectory
+// input) is uploaded with everything in it, so all of that is checked too.
+const MAX_FOLDER_ENTRIES = 10_000;
+// Finder writes these into folders it shows: view settings, no content. A folder holding them uploads as before.
+const FINDER_FILES = new Set(['.DS_Store', '.localized']);
+const DATA_VOLUME = '/System/Volumes/Data/';
+export function uploadPaths(paths, home = os.homedir()) {
+  // The Data volume's firmlinks name the same folders: /System/Volumes/Data/Users/me/Downloads is /Users/me/Downloads.
+  const unalias = (real) => (real.startsWith(DATA_VOLUME) ? real.slice(DATA_VOLUME.length - 1) : real);
+  const library = path.join(unalias(fs.realpathSync.native(home)), 'Library');
+  const refusedDirs = [library, '/etc', '/private/etc', '/System', '/private/var/db'];
+  const cloudDirs = [path.join(library, 'Mobile Documents'), path.join(library, 'CloudStorage')];
+  const inside = (real, d) => real === d || real.startsWith(d + path.sep);
+  // Why a resolved path can't be uploaded, or null.
+  const refusal = (real) => {
+    real = unalias(real);
+    const dir = cloudDirs.some((d) => inside(real, d)) ? null : refusedDirs.find((d) => inside(real, d));
+    return real.split(path.sep).some((part) => part.startsWith('.')) ? 'it is hidden (a file or folder name starts with ".")'
+      : dir ? `it is inside ${dir}` : null;
+  };
+  const refuse = (p, real, why) => {
+    throw new Error(`${p}${real === p ? '' : ` (${real})`} can't be uploaded: ${why}, where keys, passwords and app data live. ` +
+      'If the user really wants it uploaded, ask them to move or copy it somewhere like ~/Downloads first.');
+  };
+  // Everything in a folder, walked without following links blindly: a link is resolved and checked like a path given
+  // itself, and a linked folder is walked too (once).
+  const checkFolder = (p, folder) => {
+    let count = 0;
+    const seen = new Set([folder]);
+    const walk = (dir, rel) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        const shown = path.join(rel, entry.name);
+        if (++count > MAX_FOLDER_ENTRIES) {
+          throw new Error(`${p} can't be uploaded: it holds more than ${MAX_FOLDER_ENTRIES.toLocaleString('en-US')} files and folders. ` +
+            'Upload the files the page needs, or a smaller folder.');
+        }
+        if (entry.name.startsWith('.') && !(FINDER_FILES.has(entry.name) && entry.isFile())) refuse(p, folder, `it holds ${shown}, which is hidden (its name starts with ".")`);
+        let real = full;
+        if (entry.isSymbolicLink()) {
+          try { real = fs.realpathSync.native(full); } catch { continue; } // a broken link carries nothing
+          const why = refusal(real);
+          if (why) refuse(p, folder, `it holds ${shown}, a link to ${real}: ${why}`);
+        }
+        if ((entry.isDirectory() || (entry.isSymbolicLink() && fs.statSync(real).isDirectory())) && !seen.has(real)) {
+          seen.add(real);
+          walk(real, shown);
+        }
+      }
+    };
+    walk(folder, '');
+  };
+  return paths.map((p) => {
+    const real = fs.realpathSync.native(path.resolve(p));
+    const why = refusal(real);
+    if (why) refuse(p, real, why);
+    if (fs.statSync(real).isDirectory()) checkFolder(p, real);
+    return real;
+  });
 }
 
 function locator(tab, ref) {
@@ -233,6 +309,7 @@ async function loaded(page, timeout = 5000) {
 }
 
 async function header(tab) {
+  if (isLocalPage(tab.page.url())) return `Browser: ${tab.browser.name} · Tab: ${tab.id} · ${tab.page.url()}`;
   return `Browser: ${tab.browser.name} · Tab: ${tab.id} · ${(await tab.currentTitle()) || '(no title)'} · ${tab.page.url()}`;
 }
 
@@ -253,6 +330,7 @@ async function snapshotText(tab, { ref, changes = false, maxChars = SNAPSHOT_MAX
     generation = tab.documentGeneration;
     frameGeneration = tab.frameGeneration;
     url = tab.page.url();
+    if (isLocalPage(url)) return `Snapshot unavailable: ${LOCAL_PAGE}.`;
     const target = ref ? locator(tab, ref) : tab.page;
     yaml = await target.ariaSnapshot({ mode: 'ai', timeout: ACTION_TIMEOUT_MS });
     // Playwright resolves refs through its last snapshot's table, a section's only of the section: the whole page is read
@@ -291,7 +369,9 @@ const PAGE_TEXT_FN = (el) => {
 
 async function pageText(tab, { ref, maxChars = SNAPSHOT_MAX_CHARS } = {}) {
   if (tab.dialog) return 'Text unavailable while a dialog is open. Resolve it with the dialog tool.';
+  refuseLocalPage(tab);
   const { name, text: raw } = ref ? await locator(tab, ref).evaluate(PAGE_TEXT_FN, null, { timeout: ACTION_TIMEOUT_MS }) : await tab.page.evaluate(PAGE_TEXT_FN, null);
+  refuseLocalPage(tab); // it went there while the text was read
   const body = collapseText(raw) || '(no text)';
   return `Text of ${ref ? `${ref} (<${name}>)` : `<${name}>`} (readable text only, no refs; to act on the page, call snapshot without mode for refs):\n` +
     capText(body, maxChars - 150, 'To read them, call snapshot with mode "text" and ref=<eN> of a section, or with a larger max_chars');
@@ -299,7 +379,7 @@ async function pageText(tab, { ref, maxChars = SNAPSHOT_MAX_CHARS } = {}) {
 
 function dialogLine(tab) {
   const d = tab.dialog;
-  if (!d) return null;
+  if (!d || isLocalPage(tab.page.url())) return null;
   const prompt = d.type() === 'prompt' ? ` (default value "${d.defaultValue()}")` : '';
   return `Dialog open: ${d.type()} "${d.message()}"${prompt}. The page is blocked until you resolve it with the dialog tool.`;
 }
@@ -423,7 +503,7 @@ const actOpening = (tab, args, fn, options) => act(tab, args, fn, { ...options, 
 // Runs fn on the tab, returns early if it opens a dialog, and reports new tabs plus the snapshot.
 // New tabs are the acting page's own children only, never tabs other agents of this session open meanwhile.
 async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenTabs = false, read = false, waited = false } = {}) {
-  if (tab.dialog) throw new Error(`${dialogLine(tab)}`);
+  if (tab.dialog) throw new Error(dialogLine(tab) ?? `A dialog is open, and ${LOCAL_PAGE}.`);
   // A tab this action opens from the user's claimed tab is adopted (ours, in the background) instead of being the user's.
   // Only for actions that can open tabs (a shorter window means fewer chances to catch the user's own Cmd-click, and
   // such a tab is handed back to them, never closed). Older extensions don't know the command; that only loses
@@ -484,11 +564,13 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
   return report(tab, { lines, newTabs, snapshot: snapshot && !tab.dialog, changes: true });
 }
 
-function withTab(manager, handler) {
+// onLocalPage: the call may run on a tab showing a local file (navigate with a url, which takes it away).
+function withTab(manager, handler, { onLocalPage = () => false } = {}) {
   return async (args) => {
     const tab = await resolveTab(manager, args.tab);
     const started = Date.now();
     return tab.run(async () => {
+      if (!onLocalPage(args)) refuseLocalPage(tab);
       await checkRefs(tab, args);
       return handler(tab, args);
     }).catch((error) => {
@@ -1135,6 +1217,7 @@ export function registerTools(server, manager) {
     { tab: tabArg, reason: z.string().min(1).describe('What the user should do there, as words for them, e.g. "log in to your bank" or "enter the card details".') },
     async ({ tab: value, reason }) => {
       const tab = await resolveTab(manager, value);
+      refuseLocalPage(tab);
       const title = (await tab.currentTitle()) || tab.page.url();
       await tab.run(() => takeover.handOff(tab, reason));
       return text(`Browser: ${tab.browser.name} · Tab: ${tab.id}\nHanded ${tab.id} to the user. Tell them: Your turn in ${tab.browser.name} tab "${title}": ${reason}, then tell me.\n` +
@@ -1169,7 +1252,7 @@ export function registerTools(server, manager) {
       await loaded(tab.page);
       if (response === null && args.action && args.action !== 'reload') return `No ${args.action} history entry.`;
       return response && !response.ok() ? `HTTP ${response.status()} ${response.statusText()}` : null;
-    }, { after: true }), { waited: true })));
+    }, { after: true }), { waited: true }), { onLocalPage: (args) => !!args.url }));
 
   tool('snapshot',
     'Read the page as an accessibility snapshot (YAML). Elements carry refs like [ref=e12] that click, type and other tools take. ' +
@@ -1348,7 +1431,7 @@ export function registerTools(server, manager) {
     { tab: tabArg, ref: refArg, paths: z.array(z.string()).min(1), snapshot: snapshotArg, timeout_ms: timeoutArg },
     withTab(manager, (tab, args) => act(tab, args, async () => {
       const loc = locator(tab, args.ref);
-      const files = args.paths.map((p) => path.resolve(p));
+      const files = uploadPaths(args.paths);
       const isInput = await loc.evaluate((el) => el instanceof HTMLInputElement && el.type === 'file', null, { timeout: args.timeout_ms });
       await pointed(tab, refPoint(tab, args.ref), async () => {
         if (isInput) await loc.setInputFiles(files, { timeout: args.timeout_ms });
@@ -1366,6 +1449,7 @@ export function registerTools(server, manager) {
     // Not queued: the action that opened the dialog may still hold this tab's queue until the dialog is resolved.
     async (args) => {
       const tab = await resolveTab(manager, args.tab);
+      refuseLocalPage(tab);
       const started = Date.now();
       const dialog = tab.dialog;
       if (!dialog) throw new Error('No dialog is open on this tab.');
@@ -1424,6 +1508,7 @@ export function registerTools(server, manager) {
       const image = await cued(tab, 'observe', () => cursor.hideForCapture(tab, () => (args.ref
         ? locator(tab, args.ref).screenshot(options)
         : tab.page.screenshot({ ...options, fullPage: !!args.full_page }))), { after: true });
+      refuseLocalPage(tab); // it went there while the screenshot was taken
       const what = args.ref ? `element ${args.ref}` : args.full_page ? 'full page' : 'viewport';
       return { content: [
         { type: 'text', text: `${await header(tab)}\nScreenshot of the ${what}, JPEG, 1 image px = 1 CSS px.` },
@@ -1471,6 +1556,7 @@ export function registerTools(server, manager) {
       if (!args.function && !args.expression) throw new Error('Pass function, e.g. "() => document.title".');
       const source = functionSource(args.function ?? args.expression, { withElement: !!args.ref });
       const urlBefore = tab.page.url();
+      const started = Date.now();
       // A page function that never settles must not hold this tab's queue for the rest of the session.
       const timeout = args.timeout_ms ?? ACTION_TIMEOUT_MS;
       let result;
@@ -1489,6 +1575,8 @@ export function registerTools(server, manager) {
       } finally {
         if (record.recording) record.scriptClicks(tab, await cursor.drainClicks(tab).catch(() => []));
       }
+      // The page went to a local file while the function ran (and maybe back): its result may be read from that file.
+      if (tab.localPageAt >= started) throw new Error(`Tab ${tab.id}: it showed a local file while this ran, which FowlBrowser doesn't read, so the result was discarded.`);
       const json = result === undefined ? 'undefined' : JSON.stringify(result, null, 2);
       return `Result:\n${cap(json, 'Return less data.')}`;
     }, { snapshot: args.snapshot === true, read: true })));

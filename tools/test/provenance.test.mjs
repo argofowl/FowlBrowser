@@ -1,4 +1,5 @@
 // Codex teardown provenance and the --remote round's own resources (unique local dir, free ports, bed manifest).
+import './fixtures/rounds-config.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import net from 'node:net';

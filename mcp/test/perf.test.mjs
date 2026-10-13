@@ -1,8 +1,11 @@
 // perf.mjs helpers: the process-wide tracing slot (traces and Lighthouse runs take turns).
 import assert from 'node:assert/strict';
 import EventEmitter from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
-import { readStream, startTracing, tracingSlot, waitForTracing } from '../src/perf.mjs';
+import { privateDir, readStream, startTracing, tracingSlot, waitForTracing } from '../src/perf.mjs';
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -110,4 +113,21 @@ test('tracingSlot: a holder that never releases is skipped once, 10 min after it
   assert.deepEqual(order, ['second', 'third', 'fourth'], 'the fourth gets the slot when the third releases, not 10 min later');
   (await fourth)();
   stuck();
+});
+
+test('privateDir: made 0700; a symlink or a folder others can write to is refused; ours others could only read is made private', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-outdir-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const mode = (dir) => fs.statSync(dir).mode & 0o777;
+  assert.equal(mode(privateDir(path.join(root, 'fresh'))), 0o700);
+  const elsewhere = path.join(root, 'elsewhere');
+  fs.mkdirSync(elsewhere);
+  fs.symlinkSync(elsewhere, path.join(root, 'link'));
+  assert.throws(() => privateDir(path.join(root, 'link')), /not a private folder of this user/);
+  fs.mkdirSync(path.join(root, 'open'));
+  fs.chmodSync(path.join(root, 'open'), 0o777);
+  assert.throws(() => privateDir(path.join(root, 'open')), /not a private folder of this user/);
+  fs.mkdirSync(path.join(root, 'old'));
+  fs.chmodSync(path.join(root, 'old'), 0o755);
+  assert.equal(mode(privateDir(path.join(root, 'old'))), 0o700);
 });

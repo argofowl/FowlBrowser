@@ -437,6 +437,52 @@ test('claim refuses browser pages and turns a new tab page into about:blank', as
   assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && c[2].active));
 });
 
+test('local files and view-source: pages are never opened or claimed, however the URL is written', async () => {
+  const { call, chrome } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  for (const url of ['file:///Users/me/.ssh/id_ed25519', 'fi\tle:///etc/passwd', ' FILE:///etc/passwd', '\u0001file:///etc/passwd',
+    'view-source:file:///etc/passwd', 'view-source:https://example.com/']) {
+    assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url }])).error?.message ?? '', /is blocked/, JSON.stringify(url));
+  }
+  assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url: 'https://example.com/file:///x' }])).error);
+  assert.equal(chrome.calls.filter((c) => c[0] === 'debugger.sendCommand' && c[2] === 'Page.navigate').length, 1, 'only the https one reached the tab');
+  for (const url of ['file:///Users/me/notes.txt', 'view-source:https://example.com/']) {
+    const local = chrome.addTab({ url });
+    assert.match((await call(1, 'tabs.claim', { tabId: local.id })).error.message, /can't be controlled/, url);
+  }
+  // Nor opened in a new tab, by tabs.open or by chrome.tabs.create (the relay's Target.createTarget).
+  for (const url of ['file:///etc/passwd', 'fi\tle:///etc/passwd', 'view-source:file:///etc/passwd']) {
+    assert.match((await call(1, 'tabs.open', { url })).error?.message ?? '', /never opened/, JSON.stringify(url));
+    assert.match((await call(1, 'chrome.tabs.create', [{ url }])).error?.message ?? '', /never opened/, JSON.stringify(url));
+  }
+  assert.equal(chrome.calls.filter((c) => c[0] === 'tabs.create' || c[0] === 'windows.create').length, 1, 'only the first about:blank tab was created');
+  assert.ok(!(await call(1, 'tabs.open', { url: 'https://example.com/file:///x' })).error);
+});
+
+test('navigation checks work on Chrome 125, which has no URL.parse', async (t) => {
+  const parse = URL.parse;
+  delete URL.parse;
+  t.after(() => { URL.parse = parse; });
+  const { call, chrome } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url: 'https://example.org/' }])).error);
+  assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url: 'file:///etc/passwd' }])).error?.message ?? '', /is blocked/);
+  assert.match((await call(1, 'tabs.open', { url: 'file:///etc/passwd' })).error?.message ?? '', /never opened/);
+  assert.equal(chrome.calls.filter((c) => c[0] === 'debugger.sendCommand' && c[2] === 'Page.navigate').length, 1);
+});
+
+test('incognito tabs are never claimed, also not by a resume', async () => {
+  const { call, chrome, core } = setup();
+  const privateTab = chrome.addTab({ url: 'https://mail.example', incognito: true });
+  assert.match((await call(1, 'tabs.claim', { tabId: privateTab.id })).error.message, /incognito/);
+  assert.ok(!core.owners.has(privateTab.id));
+  // A tab owned (parked) before it was moved into an incognito window: the resume is refused too.
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://shop.example' });
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'handoff' });
+  chrome.tabsById.get(tab.id).incognito = true;
+  assert.match((await call(1, 'tabs.claim', { tabId: tab.id, resume: true })).error.message, /incognito/);
+});
+
 test('chunked host messages are reassembled', async () => {
   const { sent, core, connect } = setup();
   await connect(1);
@@ -679,11 +725,19 @@ test('CDP commands that reach beyond the tab are refused for every client', asyn
   // Another tab's children are not this tab's.
   const { result: other } = await call(1, 'tabs.open', {});
   assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: other.id }, 'Target.attachToTarget', { targetId: 'child-frame', flatten: true }])).error?.message ?? '', /is blocked/);
-  for (const method of ['Network.getCookies', 'Network.getAllCookies', 'Network.enable', 'Storage.getCookies',
-    'IndexedDB.requestDatabaseNames', 'IndexedDB.enable', 'DOMStorage.getDOMStorageItems', 'CacheStorage.requestCacheNames',
-    'ServiceWorker.enable', 'Storage.trackCacheStorageForOrigin', 'Target.getTargetInfo', 'Target.detachFromTarget',
-    'Page.navigate', 'Runtime.evaluate']) {
+  for (const method of ['Network.enable', 'Network.loadNetworkResource', 'IndexedDB.enable', 'IndexedDB.disable', 'DOMStorage.enable',
+    'CacheStorage.enable', 'ServiceWorker.enable', 'ServiceWorker.disable', 'Storage.getUsageAndQuota', 'Target.getTargetInfo',
+    'Target.detachFromTarget', 'Page.navigate', 'Runtime.evaluate']) {
     assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, method, {}])).error, method);
+  }
+  // Cookies and other sites' stored data are never read out, for any site.
+  for (const method of ['Network.getCookies', 'Network.getAllCookies', 'Storage.getCookies', 'DOMStorage.getDOMStorageItems',
+    'IndexedDB.requestData', 'IndexedDB.requestDatabase', 'IndexedDB.requestDatabaseNames', 'IndexedDB.getMetadata',
+    'CacheStorage.requestCacheNames', 'CacheStorage.requestEntries', 'CacheStorage.requestCachedResponse',
+    // nor profile-wide storage metadata (trust token issuers, other origins' database names and activity)
+    'Storage.getTrustTokens', 'Storage.trackIndexedDBForOrigin', 'Storage.trackCacheStorageForStorageKey',
+    'Storage.getSharedStorageEntries', 'Storage.getInterestGroupDetails']) {
+    assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, method, {}])).error?.message ?? '', /is blocked/, method);
   }
   assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id, sessionId: 'child' }, 'Target.setAutoAttach', {}])).error);
 });

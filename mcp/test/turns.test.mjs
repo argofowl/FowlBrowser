@@ -218,15 +218,44 @@ test('the hook stops at the first claude ancestor and never looks further up', (
     asked.push(Number(pid));
     return String(field === 'comm=' ? chain[pid][0] : chain[pid][1]);
   };
-  const outer = turnSocketPath(100);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-turns-'));
+  fs.mkdirSync(path.join(dir, 'turns'));
+  const outer = turnSocketPath(100, dir);
   fs.writeFileSync(outer, '');
   try {
-    assert.equal(findSocket(300, ps), null, 'no socket at the first claude: stop there');
+    assert.equal(findSocket(300, ps, dir), null, 'no socket at the first claude: stop there');
     assert.ok(!asked.includes(100), 'the outer claude is never asked about');
-    const inner = turnSocketPath(200);
+    const inner = turnSocketPath(200, dir);
     fs.writeFileSync(inner, '');
-    try { assert.equal(findSocket(300, ps), inner); } finally { fs.rmSync(inner); }
-  } finally { fs.rmSync(outer); }
+    try { assert.equal(findSocket(300, ps, dir), inner); } finally { fs.rmSync(inner); }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the turn socket is in the FowlBrowser folder, made private, else in the user\'s temp folder; the hook still finds a server from before that in /tmp', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-turns-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  assert.equal(turnSocketPath(4321, dir), path.join(dir, 'turns', '4321.sock'));
+  // Too long for a socket path: the user's own temp folder, never the shared /tmp.
+  const long = `/tmp/${'x'.repeat(90)}`;
+  assert.equal(turnSocketPath(4321, long), path.join(os.tmpdir(), 'fowlbrowser-turn-4321.sock'));
+  const tmp = path.join(dir, 'T');
+  fs.mkdirSync(tmp);
+  const fallback = turnSocketPath(4322, long, tmp);
+  assert.equal(fallback, path.join(tmp, 'fowlbrowser-turn-4322.sock'));
+  const late = listenForTurns({ browsers: new Map() }, fallback);
+  await new Promise((resolve) => late.listening ? resolve() : late.once('listening', resolve));
+  try { assert.equal(findSocket(4322, () => 'claude', long, tmp), fallback); } finally { late.close(); }
+  const server = listenForTurns({ browsers: new Map() }, turnSocketPath(4321, dir));
+  await new Promise((resolve) => server.listening ? resolve() : server.once('listening', resolve));
+  try {
+    assert.equal(fs.statSync(path.join(dir, 'turns')).mode & 0o777, 0o700);
+    const ps = ([, field]) => (field === 'comm=' ? 'claude' : '1');
+    assert.equal(findSocket(4321, ps, dir), path.join(dir, 'turns', '4321.sock'));
+  } finally { server.close(); }
+  const pid = 900_000 + (process.pid % 90_000); // a pid no claude has, so no real server's socket
+  const legacy = `/tmp/fowlbrowser-turn-${pid}.sock`;
+  fs.writeFileSync(legacy, '');
+  try { assert.equal(findSocket(pid, () => 'claude', dir), legacy); } finally { fs.rmSync(legacy, { force: true }); }
 });
 
 // A real process chain: this test process (with a socket named after it) -> a fake `claude` -> the hook. The hook
@@ -235,16 +264,17 @@ test('the hook talks to its claude parent only, one line per known event, nothin
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-hook-'));
   const fakeClaude = path.join(dir, 'claude');
   fs.symlinkSync(process.execPath, fakeClaude);
+  fs.mkdirSync(path.join(dir, 'turns'));
   const outerLines = [];
   const outer = net.createServer((socket) => socket.on('data', (chunk) => { outerLines.push(String(chunk)); socket.end('{}\n'); }));
-  await new Promise((resolve) => outer.listen(turnSocketPath(process.pid), resolve));
+  await new Promise((resolve) => outer.listen(turnSocketPath(process.pid, dir), resolve));
   const hook = fileURLToPath(new URL('../bin/turn-ended.mjs', import.meta.url));
   const script = `
     const net = require('node:net');
     const { execFile } = require('node:child_process');
     const lines = [];
     const server = net.createServer((s) => s.on('data', (c) => { lines.push(String(c).trim()); s.end('{}\\n'); }));
-    server.listen('/tmp/fowlbrowser-turn-' + process.pid + '.sock', async () => {
+    server.listen(require('node:path').join(process.env.FOWLBROWSER_DIR, 'turns', process.pid + '.sock'), async () => {
       // null: no hook_event_name; 'not json': unreadable input. Neither may send anything.
       for (const event of ['SubagentStart', 'PreToolUse', null, 'not json', 'toString', 'SubagentStop', 'Stop']) {
         await new Promise((resolve) => {
@@ -256,12 +286,12 @@ test('the hook talks to its claude parent only, one line per known event, nothin
       console.log(JSON.stringify(lines));
     });`;
   try {
-    const out = await new Promise((resolve, reject) => execFile(fakeClaude, ['-e', script], (error, stdout) => (error ? reject(error) : resolve(stdout))));
+    const out = await new Promise((resolve, reject) => execFile(fakeClaude, ['-e', script], { env: { ...process.env, FOWLBROWSER_DIR: dir } },
+      (error, stdout) => (error ? reject(error) : resolve(stdout))));
     assert.deepEqual(JSON.parse(out), ['subagent_start', 'subagent_stop', 'turn_ended'], 'printed nothing, one line per known event, none for the rest');
     assert.deepEqual(outerLines, [], 'the socket beyond the first claude ancestor was never contacted');
   } finally {
     outer.close();
-    fs.rmSync(turnSocketPath(process.pid), { force: true });
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

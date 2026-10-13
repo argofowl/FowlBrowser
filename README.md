@@ -126,6 +126,8 @@ Name your browsers (Work, Personal) by clicking the FowlBrowser icon in the tool
 - **Agents only touch their own tabs.** The tabs they opened and the ones they borrowed from you. They never close your
   tabs unless you asked, incognito windows are left alone, and commands that would reach other tabs, your window focus
   or your whole profile's cookies and storage are blocked.
+- **Your files stay yours.** Agents can't open local files in the browser, and won't upload hidden files (like
+  `~/.ssh` or `.env`), anything in `~/Library` other than iCloud Drive and cloud drives, or system files.
 
 ## Good to know
 

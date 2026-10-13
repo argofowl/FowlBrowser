@@ -368,6 +368,11 @@ async function stop(tab, header, text) {
     tab.page.on('close', tab.trace.release);
     throw new Error(`Chrome did not stop the recording: ${error.message.replace(/\.$/, '')}. Call trace_stop again.`);
   }
+  // The tab showed a local file while it recorded: its screenshots and sources may hold the file, so nothing is kept.
+  if (tab.localPageAt >= tab.trace.startedAt) {
+    endRecording(tab);
+    throw new Error('The tab showed a local file during the recording, which FowlBrowser doesn\'t record, so the trace was discarded. Start a new one on a web page.');
+  }
   try {
     const { gz, dataLoss } = recording;
     const file = path.join(outputDir('traces'), `trace-${stamp()}-${fileTab(tab)}.json.gz`);

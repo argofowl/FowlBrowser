@@ -2,10 +2,10 @@
 //   node tools/rounds.mjs [--tasks tools/agents/example.json] [--swap] [--only a,b] [--model opus] [--effort medium]
 //                         [--surface fowlbrowser|codex|codex-agent|devtools] [--codex-browsers chrome=<id>,helium=<id>|auto]
 //                         [--mcp repo|installed] [--out <dir>] [--keep-tabs] [--serve "<command>"] [--gui]
-//                         [--remote mac2 [--remote-owner fb-rounds | --remote-held]]
+//                         [--remote <host> [--remote-owner fb-rounds | --remote-held]]
 // All agents start at once, each its own `claude -p` session. --surface picks its browser tools: FowlBrowser (its own
-// MCP server, record mode on), Codex's browser extension (ChatGPT.app's cua_repl through ~/.claude/tools/codex-cu) or
-// Chrome DevTools MCP through the user's cdp-relay (devtools); a task's own `surface` overrides it, so one round can mix.
+// MCP server, record mode on), Codex's browser extension (ChatGPT.app's cua_repl through the user's codex-cu proxy) or
+// Chrome DevTools MCP through the user's own launcher (devtools); a task's own `surface` overrides it, so one round can mix.
 // codex-agent: Codex itself is the agent (`codex exec`, gpt-6.1-sol unless --model) with its own browser extension.
 // Both run through the same spawner, monitor and grading. While they run, a monitor logs the frontmost app, active
 // tabs, windows, audible tabs and the extension's exact activation events. Then every run is graded (outcome, cursor,
@@ -17,6 +17,14 @@
 // ssh connection, which also forwards that Mac's FowlBrowser sockets (the monitor) and the graded site ports. The round
 // holds that Mac's GUI lock throughout (implies --gui); --remote-held: the caller already holds it (a deploy script's
 // command, so no other tree lands in the bed meanwhile).
+// What only the user's own Macs have lives in local/rounds.json (git-ignored; FOWLBROWSER_ROUNDS_CONFIG names another
+// file), read at startup. Keys, each needed only by its feature ("~/" is the home of the Mac it runs on):
+//   codexBrowsers {helium, chrome}: Codex's extensionInstanceId of each browser here (default of --codex-browsers)
+//   codexProxy: the codex-cu proxy.mjs, when ~/.claude.json has no codex-cu entry or with --remote
+//   devtools {command, env: {helium, chrome}}: the DevTools MCP launcher and each browser's env for it
+//   guiDriver: the cua-driver binary (takeover tasks)
+//   remoteGuiLock: the GUI lock command on a second test Mac (--remote without --remote-held)
+//   remoteDeploy: the script that deploys a tree to that Mac's test bed (named when the bed differs)
 import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -36,8 +44,18 @@ const labelOf = (name) => `🧪 ${name}`;
 const keyOf = (browser, tab) => `${browser}:${tab.id}`;
 // Demo site pages carry the task's name in their path (test/demo/server.mjs), so a tab on one belongs to that task.
 const tagged = (name, url) => String(url ?? '').includes(`/t/${name}/`);
-// Codex's browser instances on the user's Mac (extensionInstanceId); --codex-browsers overrides them on another Mac.
-const CODEX_BROWSERS = { helium: '2486f887-ceb1-4218-b5f3-a8dec18f80ca', chrome: 'ec0ffb6e-74d3-4d7e-9d6d-a6dcd584b224' };
+
+const CONFIG_FILE = process.env.FOWLBROWSER_ROUNDS_CONFIG || path.join(ROOT, 'local/rounds.json');
+const CONFIG = fs.existsSync(CONFIG_FILE) ? JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) : {};
+// A config value; missing, the round stops with the key to set (main prints the message alone).
+export function setting(key) {
+  if (CONFIG[key] === undefined) throw Object.assign(new Error(`set "${key}" in ${CONFIG_FILE} (see the top of tools/rounds.mjs)`), { setting: key });
+  return CONFIG[key];
+}
+const homePath = (p, home = os.homedir()) => p.replace(/^~(?=\/|$)/, home);
+
+// Task names become folder and remote shell paths.
+export const badTaskNames = (tasks) => tasks.map((t) => t.name).filter((name) => !/^[A-Za-z0-9_-]+$/.test(name ?? ''));
 
 // --- Grading (pure, unit-tested in tools/test/rounds.test.mjs) ---
 
@@ -267,7 +285,9 @@ export function remoteServer({ command, args = [], env = {} }, { ssh, dir }) {
 // proxy ends the turn on any connection to its socket.
 export function remoteTurnEnd(surface, dir) {
   const pid = `$(cat ${shq(dir)}/server.pid)`;
-  return surface === 'codex' ? `nc -U -w 2 /tmp/codex-cu-${pid}.sock </dev/null` : `printf 'turn_ended\\n' | nc -U -w 5 /tmp/fowlbrowser-turn-${pid}.sock`;
+  // FowlBrowser's socket is in ~/.fowlbrowser/turns (servers from before that: /tmp/fowlbrowser-turn-<pid>.sock).
+  return surface === 'codex' ? `nc -U -w 2 /tmp/codex-cu-${pid}.sock </dev/null`
+    : `s=~/.fowlbrowser/turns/${pid}.sock; [ -S "$s" ] || s=/tmp/fowlbrowser-turn-${pid}.sock; printf 'turn_ended\\n' | nc -U -w 5 "$s"`;
 }
 
 const sh = (file, args, input) => new Promise((resolve, reject) => {
@@ -361,16 +381,16 @@ async function connectRemote(host, { owner, ports, stamp, held, surface, dir, pr
   }
   remote = { host, ssh, dir, home, bed: `${home}/Projects/FowlBrowser`, runDir: `/tmp/fb-rounds-remote/${stamp}-${path.basename(dir).slice('fb-remote-'.length)}` };
   if (!held) console.log(`--remote ${host}: waiting for its GUI lock as ${owner}`);
-  const lock = held ? null : procs.spawn('ssh', [...ssh, `~/cua-test/bin/guilock ${shq(owner)} sh -c 'echo locked; exec cat >/dev/null'`], { stdio: ['pipe', 'pipe', 'inherit'] });
+  const lock = held ? null : procs.spawn('ssh', [...ssh, `${shq(homePath(setting('remoteGuiLock'), home))} ${shq(owner)} sh -c 'echo locked; exec cat >/dev/null'`], { stdio: ['pipe', 'pipe', 'inherit'] });
   if (lock) {
     await new Promise((resolve, reject) => {
       lock.stdout.on('data', (d) => /locked/.test(d) && resolve());
-      lock.on('exit', (code) => reject(new Error(`--remote ${host}: guilock exited ${code}`)));
+      lock.on('exit', (code) => reject(new Error(`--remote ${host}: the GUI lock exited ${code}`)));
     });
   }
   const manifest = bedManifest(surface);
   const differ = bedDiff(manifest, await onRemote(`cd ${shq(remote.bed)} && md5 -r ${Object.keys(manifest).map(shq).join(' ')} 2>/dev/null; true`));
-  if (differ.length) throw new Error(`--remote ${host}: its test bed (${remote.bed}) is not this tree (${differ.length} files differ or are missing: ${differ.slice(0, 5).join(', ')}${differ.length > 5 ? ', ...' : ''}); deploy it first (e.g. /tmp/fb-s5/bin/mac2-e2e.sh <tree> <owner> true)`);
+  if (differ.length) throw new Error(`--remote ${host}: its test bed (${remote.bed}) is not this tree (${differ.length} files differ or are missing: ${differ.slice(0, 5).join(', ')}${differ.length > 5 ? ', ...' : ''}); deploy it first${CONFIG.remoteDeploy ? ` (e.g. ${CONFIG.remoteDeploy} <tree> <owner> true)` : ''}`);
   fs.writeFileSync(path.join(dir, 'token'), await onRemote('cat ~/.fowlbrowser/token'), { mode: 0o600 });
   // The remote front app, streamed (an ssh call per monitor tick is too slow): remote.front is the latest. The loop ends
   // when its output can't be written any more (ssh gone); nothing else would stop it there.
@@ -399,7 +419,7 @@ async function connectRemote(host, { owner, ports, stamp, held, surface, dir, pr
 // codex-cu on the remote Mac, built from ChatGPT's plugin config there and our proxy (copied to the same path).
 async function loadRemoteCodex(args) {
   const plugin = JSON.parse(await onRemote('cat "$(ls -d ~/.codex/plugins/cache/openai-bundled/unified-computer-use/*/ | sort | tail -1).mcp.json"')).mcpServers.cua_repl;
-  const entry = { command: plugin.command, args: [`${remote.home}/.claude/tools/codex-cu/proxy.mjs`, plugin.command, ...plugin.args], env: plugin.env };
+  const entry = { command: plugin.command, args: [homePath(setting('codexProxy'), remote.home), plugin.command, ...plugin.args], env: plugin.env };
   await onRemote(`ls ${shq(entry.args[0])} /tmp/codex-browser-use/*.sock >/dev/null`).catch(() => { console.error(`--surface codex --remote: no proxy at ${entry.args[0]} or no Codex browser socket on ${remote.host}`); process.exit(2); });
   const browsers = Object.fromEntries((args['codex-browsers'] || '').split(',').filter((p) => p && p !== 'auto').map((p) => p.split('=')));
   return { entry, browsers };
@@ -609,8 +629,18 @@ export function codexServer(entry, { tee, log }) {
 
 // $ per 1M tokens, short context (input up to 272K), from developers.openai.com/api/docs/pricing on 2026-10-12.
 export const CODEX_PRICES = { 'gpt-6.1-sol': { input: 2, cached: 0.1, cacheWrite: 2.5, output: 10 } };
-// Codex trusts every new working folder in the user's config: all its agents share this one.
-const CODEX_AGENT_CWD = '/tmp/fb-rounds/codex-agent';
+// Codex trusts every new working folder in the user's config: all its agents share this one, private to the user here.
+export const CODEX_AGENT_CWD = path.join(os.tmpdir(), 'fb-rounds-codex-agent');
+const REMOTE_CODEX_AGENT_CWD = '/tmp/fb-rounds/codex-agent';
+
+// Makes dir (0700) unless it is there; either way it must be a real folder of this user's.
+export function privateDir(dir) {
+  try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (err) { if (err.code !== 'EEXIST') throw err; }
+  const st = fs.lstatSync(dir);
+  // Group- or world-writable: another account could plant instructions (AGENTS.md) there.
+  if (!st.isDirectory() || st.uid !== process.getuid() || st.mode & 0o022) throw new Error(`${dir} is not a folder of this user's: remove it`);
+  return dir;
+}
 
 // The user's own MCP servers in a Codex config.toml. A Codex agent gets them all turned off (its browser tool, cua_repl,
 // comes from ChatGPT's plugin), as a Claude agent gets only its browser server.
@@ -620,8 +650,8 @@ export function codexMcpServers(toml) {
 
 // `codex exec` for one agent: model and effort pinned, JSON events on stdout, the prompt on stdin, and nothing but the
 // browser (no shell, web search, subagents, connectors or the user's MCP servers), like a Claude agent's tools.
-export function codexAgentArgs({ model, effort, disable }) {
-  return ['exec', '-C', CODEX_AGENT_CWD, '--skip-git-repo-check', '--json', '-m', model, '-c', `model_reasoning_effort=${effort}`,
+export function codexAgentArgs({ model, effort, disable, cwd = CODEX_AGENT_CWD }) {
+  return ['exec', '-C', cwd, '--skip-git-repo-check', '--json', '-m', model, '-c', `model_reasoning_effort=${effort}`,
     '-c', 'approvals_reviewer=auto_review', '-c', 'web_search=disabled',
     ...['shell_tool', 'unified_exec', 'multi_agent', 'multi_agent_v2', 'apps', 'image_generation'].flatMap((f) => ['--disable', f]),
     ...disable.flatMap((name) => ['-c', `mcp_servers.${name}.enabled=false`]), '-'];
@@ -671,7 +701,7 @@ export function agentSetup({ task, surface, dir, mcpRoot, settings, model, effor
   if (surface === 'codex-agent') {
     // Codex runs where the browsers are; on another Mac over the round's ssh connection.
     prompt = `Use the browser through your cua_repl js tool (the browser extension, not Computer Use on desktop apps). ${find} and ${open}.\n\n${prompt}`;
-    const args = codexAgentArgs({ model, effort, disable: codex.disable });
+    const args = codexAgentArgs({ model, effort, disable: codex.disable, cwd: remote ? REMOTE_CODEX_AGENT_CWD : CODEX_AGENT_CWD });
     if (!remote) return { command: 'codex', args, prompt, mcpConfig: null };
     return { command: 'ssh', args: [...remote.ssh, `${REMOTE_PATH}; exec codex ${args.map(shq).join(' ')}`], prompt, mcpConfig: null };
   }
@@ -683,9 +713,10 @@ export function agentSetup({ task, surface, dir, mcpRoot, settings, model, effor
     disallowed.push('mcp__codex-cu__js_add_node_module_dir');
     prompt = `Use the browser through the mcp__codex-cu__js tool. ${find} and ${open}.\n\n${prompt}`;
   } else if (surface === 'devtools') {
-    // Chrome DevTools MCP through the user's cdp-relay (~/.claude/tools/cdp-relay): one relay per browser, on this Mac.
+    // Chrome DevTools MCP through the user's own launcher (config devtools), with the task's browser's env, on this Mac.
     if (remote) throw new Error('--surface devtools has no --remote');
-    mcpServers = { devtools: { command: path.join(os.homedir(), '.claude/tools/cdp-relay/devtools-mcp.sh'), env: { CDP_RELAY_PORT: task.browser === 'helium' ? '5299' : '5298' } } };
+    const devtools = setting('devtools');
+    mcpServers = { devtools: { command: homePath(devtools.command), env: devtools.env[task.browser] } };
     allowed = 'mcp__devtools';
     prompt = `Use the browser through the mcp__devtools__* tools (Chrome DevTools MCP, connected to ${browserName}). Open your own pages with new_page, and close every page you opened with close_page before you finish.\n\n${prompt}`;
   } else {
@@ -973,6 +1004,9 @@ function htmlReport(rows) {
 
 // --- Codex surface and the user's part ---
 
+// Codex's browser ids here: the config's, required unless --codex-browsers names them.
+const defaultCodexBrowsers = (args) => (args['codex-browsers'] ? CONFIG.codexBrowsers ?? {} : setting('codexBrowsers'));
+
 // codex-cu as the user registered it (~/.claude.json), else built from ChatGPT's bundled plugin config and our proxy
 // (a Mac without the user entry). Preflight: the proxy, ChatGPT's node and a live Codex browser socket.
 function loadCodex(args) {
@@ -982,7 +1016,7 @@ function loadCodex(args) {
     const pluginDir = path.join(home, '.codex/plugins/cache/openai-bundled/unified-computer-use');
     const version = fs.existsSync(pluginDir) ? fs.readdirSync(pluginDir).sort().at(-1) : null;
     const plugin = version && readJson(path.join(pluginDir, version, '.mcp.json'))?.mcpServers?.cua_repl;
-    if (plugin) entry = { command: plugin.command, args: [path.join(home, '.claude/tools/codex-cu/proxy.mjs'), plugin.command, ...plugin.args], env: plugin.env };
+    if (plugin) entry = { command: plugin.command, args: [homePath(setting('codexProxy')), plugin.command, ...plugin.args], env: plugin.env };
   }
   const missing = !entry ? ['a codex-cu entry in ~/.claude.json or ChatGPT\'s unified-computer-use plugin']
     : [entry.command, entry.args[0], path.join(path.dirname(entry.args[0]), 'turn-ended.mjs')].filter((f) => !fs.existsSync(f));
@@ -991,7 +1025,7 @@ function loadCodex(args) {
   if (missing.length) { console.error(`--surface codex: missing ${missing.join(', ')}`); process.exit(2); }
   // `--codex-browsers auto`: no ids (another Mac), the agent finds its browser by name.
   const browsers = args['codex-browsers'] === 'auto' ? {}
-    : { ...CODEX_BROWSERS, ...Object.fromEntries((args['codex-browsers'] || '').split(',').filter(Boolean).map((p) => p.split('='))) };
+    : { ...defaultCodexBrowsers(args), ...Object.fromEntries((args['codex-browsers'] || '').split(',').filter(Boolean).map((p) => p.split('='))) };
   return { entry, browsers };
 }
 
@@ -1005,17 +1039,17 @@ async function loadCodexAgent(args) {
     console.error(`--surface codex-agent: ${!version ? 'no codex CLI' : 'no /tmp/codex-browser-use/*.sock (is ChatGPT running with its browser extension?)'}${remote ? ` on ${remote.host}` : ''}`);
     process.exit(2);
   }
-  await run(`mkdir -p ${CODEX_AGENT_CWD}`);
+  if (remote) await run(`mkdir -p ${REMOTE_CODEX_AGENT_CWD}`);
+  else privateDir(CODEX_AGENT_CWD);
   const disable = codexMcpServers(await run('cat ~/.codex/config.toml').catch(() => ''));
   const given = Object.fromEntries((args['codex-browsers'] || '').split(',').filter((p) => p && p !== 'auto').map((p) => p.split('=')));
-  const browsers = args['codex-browsers'] === 'auto' ? {} : remote ? given : { ...CODEX_BROWSERS, ...given };
+  const browsers = args['codex-browsers'] === 'auto' ? {} : remote ? given : { ...defaultCodexBrowsers(args), ...given };
   return { version: version.trim(), disable, browsers };
 }
 
 const readJson = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
 const getJson = (url) => fetch(url).then((r) => r.json()).catch((err) => ({ error: err.message }));
-const CUA_DRIVER = path.join(os.homedir(), '.local/bin/cua-driver-local');
-const cua = (tool, params) => (remote ? onRemote(`~/.local/bin/cua-driver-local call ${tool} ${shq(JSON.stringify(params))}`) : sh(CUA_DRIVER, ['call', tool, JSON.stringify(params)]))
+const cua = (tool, params) => (remote ? onRemote(`${shq(homePath(setting('guiDriver'), remote.home))} call ${tool} ${shq(JSON.stringify(params))}`) : sh(homePath(setting('guiDriver')), ['call', tool, JSON.stringify(params)]))
   .then((stdout) => JSON.parse(stdout), (err) => { throw new Error(`${tool}: ${err.message}`); });
 
 // --gui only (a test Mac under its GUI lock): once a takeover task's agent has made task.takeover.afterViews page views
@@ -1041,7 +1075,7 @@ export async function takeoverAct(task, hosts, finished) {
       .filter((w) => w.app_name === BROWSER_APP[tab.browser]).sort((a, b) => (b.z_index ?? 0) - (a.z_index ?? 0));
     const win = windows.find((w) => w.title.includes(tab.title)) ?? windows[0];
     // A pixel click is in the coordinates of the window's latest screenshot, which must be taken first. Through the HID
-    // (foreground) like a person's: a click posted to the app arrives with event.timeStamp 0 (measured on mac2 Chrome),
+    // (foreground) like a person's: a click posted to the app arrives with event.timeStamp 0 (measured on a second test Mac's Chrome),
     // which dates it to the page's load.
     const shot = await cua('get_window_state', { session, pid: win.pid, window_id: win.window_id, include_accessibility_tree: false });
     const at = Date.now();
@@ -1076,6 +1110,8 @@ async function main() {
   // Stopped by hand: still run the exit handlers (agents, the remote connection and its lock, the site).
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => process.exit(130));
   let tasks = JSON.parse(fs.readFileSync(args.tasks || path.join(ROOT, 'tools/agents/example.json'), 'utf8'));
+  const bad = badTaskNames(tasks);
+  if (bad.length) { console.error(`task names may only have letters, digits, - and _: ${bad.map((n) => JSON.stringify(n)).join(', ')}`); process.exit(2); }
   if (args.only) tasks = tasks.filter((t) => args.only.split(',').includes(t.name));
   if (args.swap) tasks = tasks.map((t) => ({ ...t, browser: t.browser === 'helium' ? 'chrome' : 'helium' }));
   if (!args.gui && tasks.some((t) => t.takeover)) {
@@ -1088,6 +1124,9 @@ async function main() {
   for (const t of tasks) if (t.surface && !surfaces.includes(t.surface)) { console.error(`${t.name}: surface ${t.surface}: use ${surfaces.join(', ')}`); process.exit(2); }
   const surfaceOf = (t) => t.surface ?? surface;
   const anySurface = (name) => tasks.some((t) => surfaceOf(t) === name);
+  // Config values the agents' setup needs, before anything starts.
+  if (anySurface('devtools')) setting('devtools');
+  if (tasks.some((t) => t.takeover)) setting('guiDriver');
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
   const graded = tasks.flatMap((t) => [t.grade, t.site?.log].filter(Boolean)).map((u) => new URL(u));
   if (args.remote) await openRemote(args.remote, { owner: args['remote-owner'] || 'fb-rounds', ports: [...new Set(graded.map((u) => u.port))], stamp, held: args['remote-held'], surface });
@@ -1098,7 +1137,7 @@ async function main() {
   const model = modelOf({});
   const effort = args.effort || 'medium';
   const mcpRoot = args.mcp === 'installed' ? path.join(os.homedir(), 'Library/Application Support/FowlBrowser') : ROOT;
-  const out = path.resolve(args.out || `/tmp/fb-rounds/${stamp}`);
+  const out = path.resolve(args.out || fs.mkdtempSync(path.join(os.tmpdir(), `fb-rounds-${stamp}-`)));
   fs.mkdirSync(out, { recursive: true });
   fs.writeFileSync(path.join(out, 'settings.json'), JSON.stringify(roundSettings(anySurface('codex') ? 'codex' : 'fowlbrowser', { mcpRoot, codex }), null, 2));
 
@@ -1277,4 +1316,4 @@ async function main() {
   process.exit(problems.length ? 1 : 0);
 }
 
-if (import.meta.main) await main();
+if (import.meta.main) await main().catch((err) => { if (!err.setting) throw err; console.error(err.message); process.exit(2); });
