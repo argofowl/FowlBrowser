@@ -150,9 +150,9 @@ test('only the owner of a tab may start or expect downloads on it', async () => 
   const { result: tab } = await call(1, 'tabs.open', {});
   const usersTab = chrome.addTab({ url: 'https://user.example' });
 
-  assert.match((await call(2, 'downloads.start', { tabId: tab.id, url: FILE })).error.message, /not owned by this client/);
-  assert.match((await call(2, 'downloads.start', { tabId: usersTab.id, url: FILE })).error.message, /not owned by this client/);
-  assert.match((await call(2, 'downloads.expect', { tabId: tab.id, ms: 5000 })).error.message, /not owned by this client/);
+  assert.match((await call(2, 'downloads.start', { tabId: tab.id, url: FILE })).error.message, /controlled by another agent session/);
+  assert.match((await call(2, 'downloads.start', { tabId: usersTab.id, url: FILE })).error.message, /not controlled by this session/);
+  assert.match((await call(2, 'downloads.expect', { tabId: tab.id, ms: 5000 })).error.message, /controlled by another agent session/);
   assert.ok(!chrome.calls.some((c) => c[0] === 'downloads.download'));
 
   const { result: started } = await call(1, 'downloads.start', { tabId: tab.id, url: FILE });

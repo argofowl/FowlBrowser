@@ -48,7 +48,7 @@ export default {
         t.eq(seen.filter((f) => files.includes(f)), [], 'downloads of another client');
         const refused = await other.request('downloads.start', { tabId: Number(tab.split(':')[1]), url: `${t.site}/download.txt` })
           .then(() => 'started', (e) => e.message);
-        t.ok(/not owned by this client/.test(refused), `downloads.start on a tab it does not own: ${refused}`);
+        t.ok(/controlled by another agent session/.test(refused), `downloads.start on a tab it does not own: ${refused}`);
       } finally {
         other.close();
       }

@@ -33,7 +33,8 @@ export const exportShape = (tabArg) => ({
   format: z.string().optional().describe('Docs: md (default), txt, pdf, docx, html. Sheets: csv (default, the visible sheet), xlsx, pdf. ' +
     'Slides: txt (default), pdf, pptx. Drawings: png (default), svg, pdf, jpg. YouTube: txt only.'),
   language: z.string().optional().describe('YouTube: caption language code or name, e.g. "de" or "German" (default: page language, then English, then the video\'s own).'),
-  max_chars: z.number().int().positive().optional().describe(`Most characters returned inline (default ${DEFAULT_MAX_CHARS}); the file always has everything.`),
+  // At most 40,000: with its header that stays under the 50,000 characters Claude Code takes without counting.
+  max_chars: z.number().int().positive().max(40_000).optional().describe(`Most characters returned inline (default ${DEFAULT_MAX_CHARS}, at most 40000); the file always has everything.`),
 });
 
 // --- Page kinds ---

@@ -17,6 +17,12 @@ export default {
       t.step('assert');
       const r = await t.until(async () => { const v = await t.resultOf(tab); return Array.isArray(v) && v; }, 'file shown on page');
       t.eq(r, [{ name: `fowlbrowser-upload-${t.tag}.txt`, size: Buffer.byteLength(body), head: body }], 'uploaded file');
+
+      t.step('a drop zone that opens no chooser gets the file dropped on it');
+      const zoneTab = await t.open(`${t.site}/dropzone.html`);
+      const dropped = await t.call('upload_files', { tab: zoneTab, ref: await t.refOf(zoneTab, 'region', 'Drop files here'), paths: [path], snapshot: false });
+      t.ok(/opened no file chooser, so the 1 file was dropped on it/.test(dropped.text), `dropped: ${dropped.text}`);
+      t.eq(await t.eval(zoneTab, '() => window.__log'), [`fowlbrowser-upload-${t.tag}.txt:${Buffer.byteLength(body)}:${body.slice(0, 20)}`], 'the page got the file');
     } finally {
       await rm(path, { force: true });
     }

@@ -1,0 +1,155 @@
+[
+  {
+    "name": "studio",
+    "browser": "chrome",
+    "budgetSeconds": 300,
+    "needsClicks": true,
+    "prompt": "in the Spud Studio dashboard at http://127.0.0.1:5430/t/studio/studio/branding in {browser}: set our brand colour to #2E7D32, upload our logo ({repo}/test/jobs/files/spud-logo.png) and save the branding. then in Settings turn on email receipts, set payouts to weekly and save. leave everything else as it is",
+    "result": "what you changed and saved",
+    "site": {
+      "log": "http://127.0.0.1:5430/t/studio/api/log",
+      "expect": [
+        "^action /studio/branding color=#2e7d32 logo=spud-logo\\.png$",
+        "^action /studio/settings receipts=on notifications=off test=on payout=weekly$"
+      ]
+    }
+  },
+  {
+    "name": "feed",
+    "browser": "helium",
+    "budgetSeconds": 300,
+    "needsClicks": false,
+    "prompt": "on the Spudnet feed at http://127.0.0.1:5430/t/feed/feed/ in {browser}, find every post by @spudlabs from October 3 to October 9, 2026 (both days included) that mentions a launch, and give me each post's link",
+    "result": "the links of those posts",
+    "expect": [
+      "p1035",
+      "p1025",
+      "p1018"
+    ],
+    "forbid": [
+      "RESULT:[^\\n]*(p1014|p1037|p1029|p1024)"
+    ]
+  },
+  {
+    "name": "board",
+    "browser": "chrome",
+    "budgetSeconds": 240,
+    "needsClicks": true,
+    "prompt": "on our team board at http://127.0.0.1:5430/t/board/board/ in {browser}, move 'Write release notes' to Done and 'Fix login bug' to Doing",
+    "result": "where each card is now",
+    "site": {
+      "log": "http://127.0.0.1:5430/t/board/api/log",
+      "expect": [
+        "^action /board/move write-notes done$",
+        "^action /board/move fix-login doing$"
+      ],
+      "forbid": [
+        "^action /board/move (icons|perf|onboard|pricing) "
+      ]
+    }
+  },
+  {
+    "name": "refunds",
+    "browser": "helium",
+    "budgetSeconds": 240,
+    "needsClicks": true,
+    "prompt": "in the refunds admin at http://127.0.0.1:5430/t/refunds/admin/ in {browser}, which customer got the largest refund in September 2026, and how much was it?",
+    "result": "the customer and the amount",
+    "expect": [
+      "Priya Natarajan",
+      "1,?842(\\.50)?"
+    ]
+  },
+  {
+    "name": "booking",
+    "browser": "chrome",
+    "budgetSeconds": 300,
+    "needsClicks": true,
+    "prompt": "book a 30-minute call at http://127.0.0.1:5430/t/booking/book/ in {browser} for the first free afternoon slot (12:00 or later) on Tuesday, October 20, 2026, for Mira Hale, mira@example.net. stop at the confirmation step without confirming, and tell me the time you picked",
+    "result": "the time you picked, and whether the booking was confirmed",
+    "expect": [
+      "\\b13:30\\b|\\b1:30 ?(pm|PM)\\b"
+    ],
+    "site": {
+      "log": "http://127.0.0.1:5430/t/booking/api/log",
+      "expect": [
+        "^action /book/continue 2026-10-20 13:30 Mira Hale mira@example\\.net$"
+      ],
+      "forbid": [
+        "^action /book/confirm"
+      ]
+    },
+    "keep": [
+      "/book/"
+    ]
+  },
+  {
+    "name": "proto-qa",
+    "browser": "helium",
+    "budgetSeconds": 420,
+    "needsClicks": false,
+    "prompt": "QA the three variants of our sign-up prototype in {browser}: http://127.0.0.1:5430/t/proto-qa/proto/?variant=A, ?variant=B and ?variant=C. check each at desktop width and on a 390x844 phone, in light and dark mode, and tell me which variant spills sideways on the phone, which one has no dark mode, and which one logs a console error. put the view back the way it was when you are done",
+    "result": "which variant overflows on the phone, which has no dark mode, which logs an error",
+    "expect": [
+      "\\bB\\b[^\\n]{0,160}(overflow|sideways|horizontal|wider|spill)|(overflow|sideways|horizontal|wider|spill)[^\\n]{0,160}\\bB\\b",
+      "\\bC\\b[^\\n]{0,160}(error|console)|(error|console)[^\\n]{0,160}\\bC\\b"
+    ],
+    "viewport": {
+      "maxWidth": 600
+    },
+    "site": {
+      "log": "http://127.0.0.1:5430/t/proto-qa/api/log"
+    }
+  },
+  {
+    "name": "pricing",
+    "browser": "chrome",
+    "budgetSeconds": 240,
+    "needsClicks": true,
+    "prompt": "compare the monthly price of the Pro plan at these three in {browser} and tell me which is cheapest: http://127.0.0.1:5430/t/pricing/pricing/north , http://127.0.0.1:5430/t/pricing/pricing/quill , http://127.0.0.1:5430/t/pricing/pricing/ledger",
+    "result": "each Pro plan's monthly price and the cheapest",
+    "expect": [
+      "Quill",
+      "\\$?11\\b",
+      "12\\.50",
+      "\\$?14\\b"
+    ]
+  },
+  {
+    "name": "downloads",
+    "browser": "helium",
+    "budgetSeconds": 240,
+    "needsClicks": true,
+    "prompt": "from http://127.0.0.1:5430/t/downloads/apps/ in {browser}, download the Mac versions of Spudnote and Spudcut and tell me the file names they were saved as",
+    "result": "the saved file names",
+    "expect": [
+      "Spudnote-2\\.4\\.1",
+      "Spudcut-1\\.0\\.3"
+    ],
+    "downloads": {
+      "min": 2
+    },
+    "site": {
+      "log": "http://127.0.0.1:5430/t/downloads/api/log",
+      "expect": [
+        "^download /apps/files Spudnote-2\\.4\\.1\\.dmg$",
+        "^download /apps/files Spudcut-1\\.0\\.3\\.dmg$"
+      ],
+      "forbid": [
+        "^download /apps/files Spudbar"
+      ]
+    }
+  },
+  {
+    "name": "motion-qa",
+    "browser": "helium",
+    "budgetSeconds": 300,
+    "needsClicks": true,
+    "prompt": "QA the menu animation of our Spudnote prototype in {browser}: http://127.0.0.1:5430/t/motion-qa/motion/?variant=A and ?variant=B. in each, click Open menu and tell me whether the menu drawer slides in smoothly or just appears at once",
+    "result": "for each variant, slides or appears at once",
+    "expect": [
+      "\\bA\\b[^\\n]{0,200}slid|slid[^\\n]{0,200}\\bA\\b",
+      "\\bB\\b[^\\n]{0,200}(at once|instant|immediately|no (transition|animation)|jumps|snaps|pops)|(at once|instant|immediately|no (transition|animation)|jumps|snaps|pops)[^\\n]{0,200}\\bB\\b"
+    ]
+  }
+]

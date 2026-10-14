@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Native pickers</title>
+<style>
+  body { font: 15px system-ui; margin: 24px; }
+  .row { display: flex; gap: 12px; align-items: center; margin: 10px 0; }
+  .lazy { height: 40px; background: #eee; margin-top: 1400px; }
+  .lazy.seen { background: #30d158; }
+</style>
+<h1>Native pickers</h1>
+<div class="row"><label for="color">Accent colour</label><input id="color" type="color" value="#3366ff"></div>
+<div class="row"><label for="select">Plan</label>
+  <select id="select"><option>Free</option><option>Pro</option><option>Team</option></select></div>
+<div class="row"><label for="file">Attachment</label><input id="file" type="file"></div>
+<div class="row"><label for="date">Date</label><input id="date" type="date"></div>
+<div class="row"><label for="time">Time</label><input id="time" type="time"></div>
+<div class="row"><label for="dl">Fruit</label><input id="dl" list="fruits"><datalist id="fruits"><option>Apple</option><option>Banana</option></datalist></div>
+<div class="row">
+  <button id="eyedropper">Pick from screen</button>
+  <button id="fullscreen">Full screen</button>
+  <button id="print">Print</button>
+  <button id="fsapi">Open file (File System Access)</button>
+  <button id="dirapi">Open folder</button>
+  <button id="savefile">Save file</button>
+</div>
+<div class="row">
+  <button id="pointerlock">Lock pointer</button>
+  <button id="notify">Notifications</button>
+  <button id="geo">Location</button>
+  <button id="clipboard">Read clipboard</button>
+  <button id="share">Share</button>
+  <button id="camera">Camera</button>
+  <button id="avatar">Choose avatar</button><input id="avatar-input" type="file" hidden>
+  <a id="protocol" href="zoommtg://zoom.us/join?confno=1">Join meeting</a>
+  <a id="mailto" href="mailto:someone@example.com">Email us</a>
+</div>
+<div class="row">
+  <iframe id="frame-plain" style="width:220px;height:60px;border:1px solid #ccc" srcdoc="<select id=s aria-label='Size'><option>S</option><option>M</option></select>"></iframe>
+  <iframe id="frame-scaled" style="width:440px;height:120px;border:2px solid #ccc;transform:scale(0.5);transform-origin:0 0" srcdoc="<div style='height:40px'></div><select id=s style='margin-left:200px' aria-label='Colourway'><option>Red</option><option>Blue</option></select>"></iframe>
+</div>
+<div class="row">
+  <a id="card" href="https://example.com/theme">Theme card <input id="card-color" type="color" value="#00aa00" aria-label="Card colour"></a>
+  <button id="swatch">Pick swatch</button><div id="swatch-host"></div>
+</div>
+<div class="lazy" id="lazy">reveal when seen</div>
+<script>
+  const log = [];
+  window.__log = log;
+  const note = (what, detail) => log.push({ what, detail: String(detail ?? ''), t: Math.round(performance.now()) });
+  const on = (id, fn) => document.getElementById(id).addEventListener('click', async () => {
+    note(id, 'clicked');
+    try { note(id, await fn()); } catch (e) { note(id, `${e.name}: ${e.message}`); }
+  });
+  on('eyedropper', async () => (await new EyeDropper().open()).sRGBHex);
+  on('fullscreen', async () => { await document.documentElement.requestFullscreen(); return 'fullscreen'; });
+  on('print', () => { window.print(); return 'print returned'; });
+  on('fsapi', async () => (await showOpenFilePicker())[0].name);
+  on('dirapi', async () => (await showDirectoryPicker()).name);
+  on('savefile', async () => (await showSaveFilePicker({ suggestedName: 'x.txt' })).name);
+  on('pointerlock', async () => { await document.body.requestPointerLock(); return 'locked'; });
+  on('notify', () => Notification.requestPermission());
+  on('geo', () => new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition((p) => resolve('got position'), reject, { timeout: 4000 })));
+  on('clipboard', () => navigator.clipboard.readText());
+  on('share', () => navigator.share({ title: 'x', url: location.href }));
+  on('camera', async () => { const stream = await navigator.mediaDevices.getUserMedia({ video: true }); stream.getTracks().forEach((t) => t.stop()); return 'camera on'; });
+  on('avatar', () => { document.getElementById('avatar-input').click(); return 'input clicked'; });
+  // A colour input in a closed shadow root, opened by a script click (a custom swatch component).
+  const swatch = document.getElementById('swatch-host').attachShadow({ mode: 'closed' });
+  swatch.innerHTML = '<input type="color" value="#ff8800"><select aria-label="Shadow size"><option>S</option><option>L</option></select>';
+  swatch.firstChild.addEventListener('click', () => note('swatch-input', 'click'));
+  on('swatch', () => { swatch.firstChild.click(); return 'swatch clicked'; });
+  document.getElementById('avatar-input').addEventListener('change', (e) => note('avatar-input', [...e.target.files].map((f) => f.name).join(',')));
+  for (const id of ['color', 'date', 'time', 'select', 'file', 'dl']) {
+    const el = document.getElementById(id);
+    for (const type of ['click', 'input', 'change', 'focus']) el.addEventListener(type, () => note(id, `${type} ${el.value}`));
+  }
+  document.addEventListener('fullscreenchange', () => note('fullscreenchange', !!document.fullscreenElement));
+  document.addEventListener('pointerlockchange', () => note('pointerlockchange', !!document.pointerLockElement));
+  addEventListener('beforeprint', () => note('beforeprint'));
+  new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { e.target.classList.add('seen'); note('intersect', 'lazy'); }
+  }).observe(document.getElementById('lazy'));
+  let frames = 0;
+  (function count() { frames++; requestAnimationFrame(count); })();
+  window.__frames = () => frames;
+  setInterval(() => { window.__timer = (window.__timer ?? 0) + 1; }, 100);
+</script>

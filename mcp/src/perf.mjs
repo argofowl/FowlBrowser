@@ -182,6 +182,8 @@ export function registerPerf(tool, manager, helpers) {
     'Heap snapshots (retained objects) are not available through the extension API; for those use Chrome DevTools.',
     { tab: tabArg },
     withTab(async (tab) => {
+      // The page answers none of these reads while a dialog blocks it.
+      if (tab.dialog) throw new Error('A dialog is open on this tab; resolve it with the dialog tool first.');
       const now = await readMemory(tab);
       const lines = memoryLines(now, tab.memory);
       tab.memory = now;

@@ -94,7 +94,11 @@ To update, run `git pull` and `sh install.sh` again. To remove it, run `sh unins
 
 - **Uses the browser you're already signed in to.** No separate profile, no logging in again.
 - **Stays out of your way.** Agent tabs open in the background, muted, in their own tab group, and pop-ups they open
-  stay in the background too.
+  stay in the background too. An agent never opens anything that would land on your screen or take your mouse: colour
+  pickers and their eyedropper, dropdown menus, the Mac's file panels, full screen, print and share sheets, and links
+  that start another app (Mail, Zoom) are refused, and the agent is told what to do instead.
+- **Keeps working when you close windows.** Closing a browser's last window unloads its extensions; the next agent call
+  reopens a window in the background and carries on, and FowlBrowser never closes your last window itself.
 - **Shows its work.** In the tab you're looking at, a cursor with the agent's name moves to each click and says what
   it's doing.
 - **Works alongside you.** Watch an agent's tab or click around in it and the agent keeps going, like Codex's
@@ -163,13 +167,15 @@ Extension: chrome.debugger and chrome.tabs
 | Area | Tools |
 | --- | --- |
 | Browsers and tabs | `browser_list`, `tab_list`, `tab_open`, `tab_claim`, `tab_release`, `tab_close`, `tab_keep`, `tab_handoff`, `tab_mute`, `tab_focus` |
-| Reading | `snapshot`, `screenshot`, `evaluate`, `console`, `network`, `wait_for`, `viewport` |
-| Acting | `navigate`, `click`, `hover`, `type`, `fill_form`, `select_option`, `press_key`, `scroll`, `drag`, `upload_files`, `dialog`, `media` |
+| Reading | `snapshot` (also as text, a list of links, or just the lines with some text), `screenshot`, `evaluate`, `console`, `network`, `wait_for` (or until the page settles), `viewport` (sizes, phones, dark mode, reduced motion) |
+| Acting | `navigate`, `click`, `hover`, `type`, `fill_form`, `select_option`, `press_key`, `scroll`, `drag`, `upload_files` (inputs, buttons and drop zones), `dialog`, `media` |
 | Files and data | `download`, `downloads`, `export`, `browser_data` |
 | Performance | `trace_start`, `trace_stop`, `trace_insight`, `lighthouse`, `memory` |
 
 Agents read pages as an accessibility tree with element refs (`[ref=e12]`); after an action on the same page they
-usually get only what changed. Every tool names its tab (`chrome:52`, `helium:1834`), so parallel agents never share a
+usually get only what changed, and can ask for a screenshot in the same result, or a few frames of an animation as it
+plays. Reading tools are marked read-only, so
+Claude Code runs a batch of them at once. Every tool names its tab (`chrome:52`, `helium:1834`), so parallel agents never share a
 "current tab".
 
 Any MCP client can run the server: a stdio server with the command

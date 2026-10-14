@@ -15,16 +15,58 @@ export async function setViewport(tab, { width, height, mobile = false, deviceSc
   // Remembered before the sends, so a half-applied override is still cleared later.
   tab.viewport = { width, height, mobile, deviceScaleFactor: deviceScaleFactor ?? null };
   tab.browser.relay.viewports.set(tab.tabId, tab.viewport);
-  await cdp(tab, 'Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: deviceScaleFactor ?? 0, mobile });
+  // The browser's zoom for the site (the user's Cmd-minus) scales a desktop override: at 80% a 1100 px wide one lays the
+  // page out 1375 CSS px wide, and a scale of 2 gives devicePixelRatio 1.6. So both are sent divided through by it.
+  // Mobile emulation leaves the browser's zoom out, and while it is on the page reports none: a desktop size after a
+  // mobile one reads the zoom with that override cleared first.
+  let zoom = 1;
+  if (!mobile) {
+    if (touchWasOn) await cdp(tab, 'Emulation.clearDeviceMetricsOverride');
+    zoom = (await cdp(tab, 'Page.getLayoutMetrics')).cssVisualViewport?.zoom || 1;
+  }
+  tab.viewportZoom = zoom;
+  await cdp(tab, 'Emulation.setDeviceMetricsOverride', { width: Math.round(width * zoom), height: Math.round(height * zoom),
+    deviceScaleFactor: deviceScaleFactor ? deviceScaleFactor / zoom : 0, mobile });
   if (mobile) await cdp(tab, 'Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
   else if (touchWasOn) await cdp(tab, 'Emulation.setTouchEmulationEnabled', { enabled: false });
   viewportEvent('set', tab, tab.viewport, 'tool');
 }
 
+// A new document of another site may have another browser zoom (the user's per-site Cmd-minus): a desktop size is
+// sent again for it, so the page keeps the size the agent asked for (Browser._onDebuggerEvent).
+export async function keepViewportSize(tab) {
+  const viewport = tab.viewport;
+  if (!viewport || viewport.mobile) return;
+  const zoom = (await cdp(tab, 'Page.getLayoutMetrics')).cssVisualViewport?.zoom || 1;
+  if (tab.viewport !== viewport || zoom === tab.viewportZoom) return;
+  tab.viewportZoom = zoom;
+  await cdp(tab, 'Emulation.setDeviceMetricsOverride', { width: Math.round(viewport.width * zoom), height: Math.round(viewport.height * zoom),
+    deviceScaleFactor: viewport.deviceScaleFactor ? viewport.deviceScaleFactor / zoom : 0, mobile: false });
+}
+
+// The page's colour scheme and reduced-motion preference for the viewport tool, also as raw CDP (the relay answers
+// Playwright's own Emulation.setEmulatedMedia, so pages keep the user's real appearance). tab.media holds what is set;
+// it is cleared with the metrics.
+export async function setMedia(tab, { colorScheme, reducedMotion }) {
+  const media = { ...tab.media };
+  if (colorScheme !== undefined) media.colorScheme = colorScheme;
+  if (reducedMotion !== undefined) media.reducedMotion = reducedMotion;
+  tab.media = media;
+  const features = [];
+  if (media.colorScheme) features.push({ name: 'prefers-color-scheme', value: media.colorScheme });
+  if (media.reducedMotion !== undefined) features.push({ name: 'prefers-reduced-motion', value: media.reducedMotion ? 'reduce' : 'no-preference' });
+  await cdp(tab, 'Emulation.setEmulatedMedia', { media: '', features });
+}
+
 // reason: tool, release, turn end, handoff. Resolves false when no override was set.
 export async function clearViewport(tab, reason = 'tool') {
+  const media = tab.media;
+  if (media) {
+    await cdp(tab, 'Emulation.setEmulatedMedia', { media: '', features: [] });
+    if (tab.media === media) tab.media = null;
+  }
   const was = tab.viewport;
-  if (!was) return false;
+  if (!was) return !!media;
   if (was.clearing) return true; // another clear is at it
   // Forgotten only once Chrome cleared all of it, so a failed reset can be retried (clearing the metrics twice is harmless).
   was.clearing = true;

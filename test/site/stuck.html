@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Stuck page</title>
+<link rel="stylesheet" href="style.css">
+<h1>Stuck page</h1>
+<p>Like a broken dev build: the button starts a script that never yields, so the page answers nothing from then on.</p>
+<button id="loop">Start endless loop</button>
+<script>
+  // A moment after the click, so the click itself is answered (its input acknowledged) before the main thread stops.
+  document.getElementById('loop').onclick = () => setTimeout(() => { while (true) {} }, 300);
+</script>

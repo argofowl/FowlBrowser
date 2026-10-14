@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Just a moment...</title>
+<!-- Like a "Just a moment..." challenge page: once its check passes it loads itself again, and the new document waits
+     in its <head> (a slow script) before it has a body. -->
+<script>if (!location.search.includes('passed')) addEventListener('load', () => location.replace('challenge.html?passed'));</script>
+<script src="style.css?delay=2500&passed"></script>
+<p id="message">Verifying you are human</p>
+<script>if (location.search.includes('passed')) document.getElementById('message').textContent = 'Welcome back';</script>

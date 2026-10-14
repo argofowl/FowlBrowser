@@ -11,12 +11,13 @@ import * as cursor from '../src/cursor/index.mjs';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let nextTab = 1;
-function fakeTab({ captureDelayMs = 0, shown = true } = {}) {
+function fakeTab({ captureDelayMs = 0, shown = true, zoom = 1, zoomDelayMs = 0 } = {}) {
   const evaluated = []; // overlay calls, in the order the host received them
   const host = {
     async request(method, params) {
       if (method === 'tabs.isShown') return { shown };
       const [, cdp, args] = params;
+      if (cdp === 'Page.getLayoutMetrics') { await sleep(zoomDelayMs); return { cssVisualViewport: { zoom } }; }
       if (cdp === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main' } } };
       if (cdp === 'Page.createIsolatedWorld') return { executionContextId: 5 };
       const call = args.expression.startsWith('globalThis.__fbCursor.') ? args.expression.slice('globalThis.__fbCursor.'.length) : 'overlay source';
@@ -48,6 +49,45 @@ test('a cue and its end reach the overlay in order, after the overlay itself', a
   await sleep(50);
   const calls = evaluated.map((c) => c.split('(')[0]);
   assert.deepEqual(calls, ['overlay source', 'cue', 'cueEnd']);
+});
+
+test('a cue draws the cursor at the browser\'s zoom, and its end still comes after it when the zoom is slow to read', async () => {
+  const { tab, evaluated } = fakeTab({ zoom: 0.8, zoomDelayMs: 60 });
+  cursor.cue(tab, 'observe');
+  cursor.cueEnd(tab);
+  await sleep(150);
+  assert.deepEqual(evaluated.map((c) => c.split('(')[0]), ['overlay source', 'cue', 'cueEnd']);
+  assert.match(evaluated[1], /"zoom":0\.8/);
+});
+
+test('a cue, its end and the next cue reach the overlay in the order they were made, however slow the zoom is', async () => {
+  const { tab, evaluated } = fakeTab({ zoom: 1, zoomDelayMs: 80 });
+  cursor.cue(tab, 'observe');
+  cursor.cueEnd(tab);
+  cursor.cue(tab, 'text');
+  await sleep(250);
+  assert.deepEqual(evaluated.map((c) => c.split('(')[0]), ['overlay source', 'cue', 'cueEnd', 'cue']);
+  assert.match(evaluated.at(-1), /^cue\("text"/);
+});
+
+test('two captures of one tab at once (one held by a dialog): the cursor shows again only after the last', async () => {
+  const { tab, evaluated } = fakeTab();
+  cursor.cue(tab, 'observe');
+  await sleep(20);
+  let endFirst;
+  const first = cursor.hideForCapture(tab, () => new Promise((resolve) => { endFirst = resolve; }));
+  await sleep(10);
+  let endSecond;
+  const second = cursor.hideForCapture(tab, () => new Promise((resolve) => { endSecond = resolve; }));
+  await sleep(10);
+  endFirst();
+  await first;
+  await sleep(10);
+  assert.ok(!evaluated.includes('capture(false)'), 'shown while the second capture still runs');
+  endSecond();
+  await second;
+  await sleep(10);
+  assert.ok(evaluated.includes('capture(false)'));
 });
 
 test('no overlay, nothing to hide: the capture runs at once without injecting anything', async () => {
@@ -118,8 +158,8 @@ test('a target found after the budget is shown at once while the action runs, ne
 
 // The overlay in a vm: every DOM call answers with a stub (callable, every property another stub).
 // opacity: what getComputedStyle reports (the appear fade not yet run on a busy page: '0').
-// The returned overlay carries the test's handles: reads (layout reads of the viewport and top-layer queries so far)
-// and setReduced(on) (the reduced motion preference changing).
+// The returned overlay carries the test's handles: reads (layout reads of the viewport and top-layer queries so far),
+// setReduced(on) (the reduced motion preference changing) and resize(w, h) (the window, then its resize event).
 function overlay({ opacity = '1' } = {}) {
   const stub = new Proxy(function () {}, {
     get: (_, key) => (key === Symbol.toPrimitive ? () => 0 : key === 'then' ? undefined : key === Symbol.iterator ? [][Symbol.iterator]
@@ -128,7 +168,9 @@ function overlay({ opacity = '1' } = {}) {
     construct: () => stub,
   });
   const reads = { layout: 0, topLayer: 0 };
-  const html = { get clientWidth() { reads.layout++; return 1000; }, clientHeight: 800, appendChild() {}, querySelector: () => null };
+  const size = { w: 1000, h: 800 };
+  const listeners = {};
+  const html = { get clientWidth() { reads.layout++; return size.w; }, get clientHeight() { return size.h; }, appendChild() {}, querySelector: () => null };
   const document = new Proxy({ hidden: false, compatMode: 'CSS1Compat', documentElement: html, querySelectorAll: () => [],
     querySelector: () => { reads.topLayer++; return null; } }, { get: (t, k) => (k in t ? t[k] : stub) });
   const later = (fn, ms) => setTimeout(fn, ms).unref(); // the idle timer must not keep the test running
@@ -138,10 +180,11 @@ function overlay({ opacity = '1' } = {}) {
     requestAnimationFrame: (fn) => later(() => fn(performance.now()), 16), cancelAnimationFrame: clearTimeout,
     setTimeout: later, clearTimeout, performance, Date, Math, Number, Object, Promise, JSON,
     MutationObserver: function () { return stub; }, CSSStyleSheet: function () { return stub; },
-    getComputedStyle: () => ({ opacity, transform: 'none' }), addEventListener() {},
+    getComputedStyle: () => ({ opacity, transform: 'none' }), addEventListener: (type, fn) => { (listeners[type] ??= []).push(fn); },
   });
   vm.runInContext(fs.readFileSync(new URL('../src/cursor/overlay.js', import.meta.url), 'utf8'), context);
-  return { ...context.__fbCursor, reads, setReduced: (on) => media.onchange({ matches: on }) };
+  const resize = (w, h) => { Object.assign(size, { w, h }); for (const fn of listeners.resize ?? []) fn(); };
+  return { ...context.__fbCursor, reads, setReduced: (on) => media.onchange({ matches: on }), resize };
 }
 
 test('a travel longer than the time left is made quicker, and still arrives', async () => {
@@ -217,4 +260,65 @@ test('reduced motion turned on mid-travel puts the tip on the target at once', a
   c.setReduced(true);
   assert.deepEqual({ x: c.state().x, y: c.state().y }, { x: 100, y: 100 });
   assert.equal(await arrived, true);
+});
+
+test('a resize that leaves the resting cursor outside the window (a smaller viewport) brings it back inside', async () => {
+  const c = overlay();
+  await c.move(780, 300, { until: Date.now() + 80 }); // appears there
+  c.resize(600, 800);
+  assert.deepEqual({ x: c.state().x, y: c.state().y }, { x: 598, y: 300 });
+});
+
+// A click whose page is too busy to answer within the cursor's budget (a loaded Mac: the page's thread stalls for a
+// second or so): the action waits for the page and goes through, and so must the cursor. Its target, found once the
+// page answers, is landed while the action runs, and the click shows there, not where the last action was.
+test('a page too busy for the cursor budget still gets the cursor on the target, and the click shown there', async () => {
+  const { Tab } = await import('../src/browsers.mjs');
+  const { registerTools, REF_POINT_FN } = await import('../src/tools.mjs');
+  const { tab: shape, evaluated } = fakeTab();
+  const boxes = { e1: { x: 404, y: 215, w: 758, h: 43 }, e2: { x: 89, y: 258, w: 103, h: 22 } };
+  let busyUntil = 0; // the page answers nothing before this (wall clock)
+  let tab;
+  const page = Object.assign(new EventEmitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://mail.example/', mainFrame: () => page, isClosed: () => false,
+    ariaSnapshot: async () => '- row "Billing" [ref=e1]\n- row "Priya Natarajan" [ref=e2]',
+    getByRef: (ref) => ({
+      count: async () => 1,
+      async evaluate(fn, arg, { timeout } = {}) {
+        if (fn !== REF_POINT_FN) return null; // the native UI check: a plain row
+        const wait = busyUntil - Date.now();
+        if (wait > timeout) { await sleep(timeout); throw new Error(`locator.evaluate: Timeout ${timeout}ms exceeded.`); }
+        await sleep(Math.max(0, wait));
+        return boxes[ref];
+      },
+      async click() {
+        await sleep(Math.max(0, busyUntil + 20 - Date.now())); // behind the lookup in the page's queue
+        tab.emit('input', 'Input.dispatchMouseEvent', { type: 'mousePressed' });
+      },
+    }),
+  });
+  const host = {
+    async request(method, params) {
+      if (method === 'tabs.expectChild') return {};
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'Mail' } };
+      return shape.browser.host.request(method, params);
+    },
+  };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  tab = new Tab(browser, shape.tabId, page);
+  browser.tabs.set(tab.tabId, tab);
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  const call = async (name, args) => {
+    const result = await tools[name]({ tab: tab.id, ...args });
+    assert.equal(!!result.isError, false, result.content.map((c) => c.text).join('\n'));
+  };
+  await call('snapshot', {});
+  await call('click', { ref: 'e1', snapshot: false });
+  evaluated.length = 0;
+  busyUntil = Date.now() + 1200;
+  await call('click', { ref: 'e2', snapshot: false });
+  assert.ok(evaluated.some((c) => /^land\(89, 258,/.test(c)), `the cursor never reached the target: ${evaluated.join(' | ')}`);
+  assert.deepEqual(evaluated.filter((c) => c.startsWith('click(')), ['click(89, 258)'], 'the click is shown on the target');
 });

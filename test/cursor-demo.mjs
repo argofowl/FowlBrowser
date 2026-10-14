@@ -122,6 +122,13 @@ try {
       await sleep(1200);
       await tab.page.evaluate(() => document.getElementById('demo-modal')?.close()).catch(() => {});
     }
+    // The window's edges: the arrow turns to stay whole where its body would be cut off, the label moves beside it.
+    const { w, h } = await tab.page.evaluate(() => ({ w: innerWidth, h: innerHeight }));
+    for (const [name, x, y] of [['bottom edge', 640, h - 4], ['bottom-right corner', w - 4, h - 4], ['right edge', w - 4, 300], ['back to rest', 640, 380]]) {
+      await move(name, x, y);
+      cursor.click(tab);
+      await sleep(900);
+    }
     log('idle: fades out in 15 s');
     await sleep(16_500);
     log('done');

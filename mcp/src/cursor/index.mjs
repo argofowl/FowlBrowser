@@ -72,6 +72,19 @@ export function prepare(tab) {
   isShown(tab).then((shown) => { if (shown) world(tab); });
 }
 
+// The browser's zoom for the page (the user's Cmd-minus or Cmd-plus; 0.8 at 80%): the overlay draws the cursor that much
+// bigger or smaller, so it keeps its size on screen. Asked at most every 2 s per tab, alongside the target lookup.
+const ZOOM_TTL_MS = 2000;
+const zooms = new Map(); // Tab -> { at, value: Promise<number> }
+function zoomOf(tab) {
+  const known = zooms.get(tab);
+  if (known && Date.now() - known.at < ZOOM_TTL_MS) return known.value;
+  const value = send(tab, 'Page.getLayoutMetrics').then((m) => m?.cssVisualViewport?.zoom || 1, () => 1);
+  if (!known) tab.page.once('close', () => zooms.delete(tab));
+  zooms.set(tab, { at: Date.now(), value });
+  return value;
+}
+
 // Calls __fbCursor.<expression> in the overlay's world. A document that went away under us (the navigation
 // event not seen yet) gets a fresh world once.
 async function call(tab, expression, { create = true, wait = false } = {}) {
@@ -105,10 +118,11 @@ export async function moveTo(tab, where, budgetMs = ARRIVAL_CAP_MS, { acting, on
   acting?.finally(() => { over = true; }).catch(() => {});
   let sent = null;
   world(tab); // made while the target is looked up
+  const zooming = zoomOf(tab); // and the browser's zoom
   const work = (async () => {
     const point = typeof where === 'function' ? await where() : where;
     if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
-    const opts = { label: LABEL, from: states.get(tab)?.last ?? null, w: point.w, h: point.h, until };
+    const opts = { label: LABEL, from: states.get(tab)?.last ?? null, w: point.w, h: point.h, until, zoom: await zooming };
     if (late) {
       if (!acting || over || capturing.get(tab)) return;
       onLate?.(point);
@@ -140,10 +154,21 @@ export async function drainClicks(tab) {
 
 // Shows the cursor where it last was (or at its rest point) with an action cue beside the tip: observe, scroll,
 // text, key, navigate, drag, transfer. Looping cues run until cueEnd. Fire and forget.
+// A tab's cue calls go out one after another, in the order they were made: a cue waits for the zoom, and an end
+// sent before an earlier cue arrived would end the next one instead.
+const cues = new WeakMap(); // Tab -> the last cue call on its way
+const inTurn = (tab, send, failed) => {
+  const next = Promise.resolve(cues.get(tab)).then(send).catch((error) => debug(failed, tab.id, error.message));
+  cues.set(tab, next);
+};
 export function cue(tab, kind) {
   if (capturing.get(tab)) return; // a late cue of an earlier action would land in the screenshot
-  const opts = { label: LABEL, from: states.get(tab)?.last ?? null };
-  call(tab, `cue(${JSON.stringify(kind)}, ${JSON.stringify(opts)})`).catch((error) => debug('cursor: cue failed', tab.id, error.message));
+  world(tab); // made while the zoom is read
+  const zoom = zoomOf(tab);
+  inTurn(tab, async () => {
+    const opts = { label: LABEL, from: states.get(tab)?.last ?? null, zoom: await zoom };
+    if (!capturing.get(tab)) await call(tab, `cue(${JSON.stringify(kind)}, ${JSON.stringify(opts)})`);
+  }, 'cursor: cue failed');
 }
 
 // While on, the overlay shows clicks a page script makes (an agent's evaluate) as cursor travel and clicks, and in
@@ -155,7 +180,7 @@ export function follow(tab, on) {
 
 export function cueEnd(tab) {
   if (!world(tab, { create: false })) return;
-  call(tab, 'cueEnd()', { create: false }).catch((error) => debug('cursor: cue end failed', tab.id, error.message));
+  inTurn(tab, () => call(tab, 'cueEnd()', { create: false }), 'cursor: cue end failed');
 }
 
 // Click feedback where the cursor was last sent (it jumps there if it hasn't arrived). Fire and forget.
@@ -186,8 +211,9 @@ async function hideDuring(tab, fn) {
   try {
     return await fn();
   } finally {
-    // Also after a late hide: it lands before this call, so the cursor never stays hidden.
-    if (hidden !== false) call(tab, 'capture(false)', { create: false }).catch((error) => debug('cursor: show after capture failed', tab.id, error.message));
+    // Also after a late hide: it lands before this call, so the cursor never stays hidden. Not while another capture
+    // of this tab still runs (one held by a dialog, then the next call's): the last one shows it.
+    if (hidden !== false && !(capturing.get(tab) > 1)) call(tab, 'capture(false)', { create: false }).catch((error) => debug('cursor: show after capture failed', tab.id, error.message));
   }
 }
 

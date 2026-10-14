@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Article with an embed</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* An article with a large embed from another site (a map, a video) under the viewport centre, with nothing of its own
+     to scroll: a wheel over it moves the article. */
+  #embed { display: block; width: 90vw; height: 80vh; margin: 5vh auto; border: 0; }
+  #filler { height: 3000px; }
+</style>
+<h1>Article with an embed</h1>
+<iframe id="embed" title="Embedded map"></iframe>
+<div id="filler"></div>
+<script>
+  const crossHost = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+  document.getElementById('embed').src = `http://${crossHost}:${Number(location.port) + 1}/frame-form.html?frame=embed`;
+</script>

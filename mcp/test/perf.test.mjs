@@ -5,7 +5,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { Tab } from '../src/browsers.mjs';
 import { privateDir, readStream, startTracing, tracingSlot, waitForTracing } from '../src/perf.mjs';
+import { registerTools } from '../src/tools.mjs';
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -130,4 +132,32 @@ test('privateDir: made 0700; a symlink or a folder others can write to is refuse
   fs.mkdirSync(path.join(root, 'old'));
   fs.chmodSync(path.join(root, 'old'), 0o755);
   assert.equal(mode(privateDir(path.join(root, 'old'))), 0o700);
+});
+
+// --- memory ---
+
+test('memory with a page dialog open says so at once (the page answers no reads until it is resolved)', async () => {
+  const page = Object.assign(new EventEmitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, isClosed: () => false,
+  });
+  const sent = [];
+  const host = {
+    async request(method, params) {
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'App' } };
+      sent.push(params?.[1] ?? method);
+      return new Promise(() => {}); // Performance.getMetrics and Runtime.getHeapUsage wait while an alert blocks the page
+    },
+  };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  const tab = new Tab(browser, 11, page);
+  browser.tabs.set(11, tab);
+  tab.dialog = { type: () => 'alert', message: () => 'Session expiring', defaultValue: () => '' };
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  const result = await Promise.race([tools.memory({ tab: tab.id }), new Promise((r) => setTimeout(() => r('still waiting'), 1000))]);
+  assert.notEqual(result, 'still waiting');
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /A dialog is open on this tab; resolve it with the dialog tool first\./);
+  assert.deepEqual(sent, []);
 });

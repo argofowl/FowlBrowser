@@ -1,25 +1,74 @@
 // Connected browsers: one host socket + one CDP relay + one lazy Playwright connection per browser.
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { cdp, isOwnBinding } from './cdp.mjs';
 import { watchClosedShadow } from './closedShadow.mjs';
 import { prepare as prepareCursor } from './cursor/index.mjs';
 import { debug } from './debug.mjs';
-import { HostClient, listSockets } from './hostClient.mjs';
+import { HostClient, listSockets, SOCKET_DIR } from './hostClient.mjs';
 import { installPopups } from './popups.mjs';
 import { downloadDone, record } from './record.mjs';
 import { currentCall, heldBack, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
-import { isLocalUrl, tabInfo } from './util.mjs';
+import { isLocalUrl, sleep, tabInfo, within } from './util.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
+import { keepViewportSize } from './viewport.mjs';
 
 export const LABEL = process.env.FOWLBROWSER_LABEL || 'Claude';
 const RESCAN_MS = 5000;
 const BUFFER_LIMIT = 1000;
 const NAMES = { chrome: 'Chrome', helium: 'Helium', chromium: 'Chromium', brave: 'Brave', edge: 'Edge' };
+const REVIVE_WAIT_MS = 5000; // a reopened browser's host is listening about a second later
+const REVIVE_AGAIN_MS = 60_000; // a reopen that brought no host back (the extension is off) is not repeated sooner
+
+// Browsers FowlBrowser can be installed in: the socket name its host takes (host.mjs browserNameFrom), its app and its
+// folder in Application Support (host/install.sh).
+const APPS = [
+  ['chrome', 'Google Chrome', 'Google/Chrome'], ['chrome-beta', 'Google Chrome Beta', 'Google/Chrome Beta'],
+  ['chrome-canary', 'Google Chrome Canary', 'Google/Chrome Canary'], ['chromium', 'Chromium', 'Chromium'],
+  ['helium', 'Helium', 'net.imput.helium'], ['brave', 'Brave Browser', 'BraveSoftware/Brave-Browser'],
+  ['edge', 'Microsoft Edge', 'Microsoft Edge'], ['arc', 'Arc', 'Arc/User Data'], ['vivaldi', 'Vivaldi', 'Vivaldi'],
+].map(([key, app, dir]) => ({ key, app, dir }));
+const baseKey = (key) => key.split(/-(?=\d+$)/)[0]; // "chrome-2" (a second profile) is Chrome's
+
+// The Mac's view of those browsers. A browser whose last window closed keeps running but unloads the profile, and
+// FowlBrowser's extension and host with it, until a window opens again.
+const SUPPORT = path.join(os.homedir(), 'Library', 'Application Support');
+export const macOS = {
+  // FowlBrowser's native host is registered for it and has run under it (its log): install.sh registers the host in
+  // every browser it finds, used with FowlBrowser or not.
+  installed: ({ key, dir }) => fs.existsSync(path.join(SUPPORT, dir, 'NativeMessagingHosts', 'com.fowl.browser.json'))
+    && fs.existsSync(path.join(SOCKET_DIR, 'logs', `${key}.log`)),
+  // Every process's executable path.
+  processes: () => {
+    try { return execFileSync('ps', ['-axo', 'comm='], { encoding: 'utf8' }).split('\n').map((line) => line.trim()); } catch { return []; }
+  },
+  // What a click on its Dock icon sends, without bringing it to the front (-g): a browser with no window opens one.
+  reopen: (bundle) => execFile('open', ['-g', bundle], () => {}),
+};
+
+// The bundle of the app's running main process, or null (its helpers are .apps of other names inside it).
+function runningBundle(app, processes) {
+  const main = new RegExp(`^(.*/${app}\\.app)/Contents/MacOS/[^/]+$`);
+  for (const executable of processes) {
+    const bundle = main.exec(executable)?.[1];
+    if (bundle) return bundle;
+  }
+  return null;
+}
 
 export const ACTION_TIMEOUT_MS = 10_000;
 export const NAVIGATION_TIMEOUT_MS = 30_000;
+// A page whose main thread never yields (a script stuck in a loop: a broken dev build) answers no read, so a call on it
+// would wait for the host's 120 s and every later call on the tab behind it. Bounding each read would fail a merely busy
+// page instead; liveness decides (Tab.run): a call with no answer after STUCK_AFTER_MS, and every STUCK_AFTER_MS after
+// that, gets the page asked for '1'. An answer within PROBE_MS means it is alive (a long legitimate call: lighthouse, a
+// trace, a long wait); none means it is stuck.
+export const STUCK_AFTER_MS = 15_000;
+const PROBE_MS = 3000;
+const RECHECK_MS = 1000; // a call on a tab found stuck asks again this long before failing at once
 
 function appVersion(browserPath) {
   const app = browserPath?.match(/^(.*?\.app)\//)?.[1];
@@ -51,6 +100,7 @@ export class Tab extends EventEmitter {
     this._queue = Promise.resolve();
     this._calls = 0; // run() calls not yet settled
     this._busy = null;
+    this.stuckAt = null; // since when the page has not answered, once a call found its main thread stuck (run)
     // Set by other modules:
     this.refs = null; // ref numbering across snapshots (snapshots.mjs newRefState)
     this.snapshotBaseline = null; // the last whole-page snapshot, for changes-only results (tools.mjs snapshotText)
@@ -58,6 +108,11 @@ export class Tab extends EventEmitter {
     this.viewport = null; // the viewport tool's override (viewport.mjs)
     this.trace = null; // the recording and the last parsed trace (trace.mjs)
     this.memory = null; // the last memory reading (perf.mjs)
+    // Requests of the current document that render the page (document, script, stylesheet, fetch, xhr) still in flight,
+    // and when the last one started or ended: wait_for's settled wait reads them (tools.mjs pageSettled). A fetch or XHR
+    // ends with its response (Chrome never reports an unread body as finished; streams and long polls never finish).
+    this.inflight = new Set();
+    this.requestAt = 0;
     this.ending = false; // this session is closing or releasing it: its page closing is ours (record mode)
     this.closedByPageAt = null; // when the page called window.close() (popups.mjs)
     page.setDefaultTimeout(ACTION_TIMEOUT_MS);
@@ -68,32 +123,93 @@ export class Tab extends EventEmitter {
     });
     // Answered by the user in the browser, or by the dialog tool: actions are no longer blocked.
     page.on('dialogclosed', (dialog) => { if (this.dialog === dialog) this.dialog = null; });
-    // Nothing a local file page logs or loads is kept: it could be read back after the tab leaves it.
+    // Nothing a local file page logs or loads is kept: it could be read back after the tab leaves it. Each entry names
+    // its page (documentGeneration), so console and network show the current page's unless asked for older ones.
     const local = () => isLocalUrl(page.url());
     page.on('console', (message) => local() || push(this.console, {
-      time: Date.now(), level: message.type(), text: message.text(), url: message.location()?.url,
+      time: Date.now(), page: this.documentGeneration, level: message.type(), text: message.text(), url: message.location()?.url,
     }));
-    page.on('pageerror', (error) => local() || push(this.console, { time: Date.now(), level: 'error', text: `Uncaught ${error.message}` }));
+    page.on('pageerror', (error) => local() || push(this.console, { time: Date.now(), page: this.documentGeneration, level: 'error', text: `Uncaught ${error.message}` }));
+    // A request belongs to the page that made it, even when its answer comes after the next one committed.
+    const madeBy = new WeakMap(); // request -> documentGeneration when it started
+    const pageOf = (request) => madeBy.get(request) ?? this.documentGeneration;
     page.on('response', (response) => {
       const request = response.request();
       if (local() || isLocalUrl(request.url())) return;
-      push(this.network, { time: Date.now(), method: request.method(), url: request.url(), status: response.status(), type: request.resourceType() });
+      push(this.network, { time: Date.now(), page: pageOf(request), method: request.method(), url: request.url(), status: response.status(), type: request.resourceType(),
+        main: request.frame() === page.mainFrame() });
     });
     page.on('requestfailed', (request) => local() || isLocalUrl(request.url()) || push(this.network, {
-      time: Date.now(), method: request.method(), url: request.url(), status: 'failed', type: request.resourceType(), failure: request.failure()?.errorText,
+      time: Date.now(), page: pageOf(request), method: request.method(), url: request.url(), status: 'failed', type: request.resourceType(), failure: request.failure()?.errorText,
     }));
+    const RENDERING = new Set(['document', 'script', 'stylesheet', 'fetch', 'xhr']);
+    const ended = (request) => { if (this.inflight.delete(request)) this.requestAt = Date.now(); };
+    page.on('request', (request) => {
+      madeBy.set(request, this.documentGeneration);
+      if (!RENDERING.has(request.resourceType())) return;
+      this.inflight.add(request);
+      this.requestAt = Date.now();
+    });
+    page.on('response', (response) => { if (/^(xhr|fetch)$/.test(response.request().resourceType())) ended(response.request()); });
+    page.on('requestfinished', ended);
+    page.on('requestfailed', ended);
   }
 
   // The next call starts once this one, and any work it left running (keepBusy), has finished. The check runs
   // right before each call starts, so work that resumes after its dialog is answered still holds the tab.
   // A tool call queued before the tab was parked (taken over, handed off) fails with the notice when its turn comes.
   // Neither a running nor a queued call makes input in the page the agent's (only the input the agent sends does, takeover.mjs).
-  run(fn) {
+  // A call on a page found stuck (stuckAt) asks it again first and fails at once if it still doesn't answer, unless it
+  // is a way out (escape: navigate, closing, releasing, keeping, handing off, muting, turn end).
+  run(fn, { escape = false } = {}) {
     this._calls++;
     const call = currentCall();
-    const result = this._queue.then(() => this._idle()).then(() => { refuseParked(this, call); return fn(); }).finally(() => { this._calls--; });
+    const result = this._queue.then(() => this._watched(async (failed) => {
+      await this._idle();
+      // Failed as stuck while it waited (behind an action held by a dialog): it never starts once the page answers again.
+      if (failed()) return undefined;
+      refuseParked(this, call);
+      // A new document meanwhile (stuckAt cleared) is not stuck, whatever the probe of the old one said.
+      if (this.stuckAt && !escape && !(await this._answers(RECHECK_MS)) && this.stuckAt) throw this._stuckError();
+      return fn();
+    })).finally(() => { this._calls--; });
     this._queue = result.catch(() => {});
     return result;
+  }
+
+  // The call's own outcome, unless the page stops answering while it runs (STUCK_AFTER_MS): then it fails with the stuck
+  // message, the tab's queue goes on (work left over from a dialog too), and the hung call is left to settle on its own
+  // (the page answering at last, a navigation or the tab closing ends it), its outcome ignored. A call that ends first
+  // stops the watch: one that answers costs nothing but a timer.
+  _watched(start) {
+    const began = Date.now();
+    let timer, done = false, failed = false;
+    const stuck = new Promise((_, reject) => {
+      const check = async () => {
+        if (await this._answers(PROBE_MS)) { if (!done) timer = setTimeout(check, STUCK_AFTER_MS); return; }
+        if (done) return;
+        this.stuckAt ??= began;
+        this._busy = null;
+        failed = true;
+        reject(this._stuckError());
+      };
+      timer = setTimeout(check, STUCK_AFTER_MS);
+    });
+    return Promise.race([start(() => failed), stuck]).finally(() => { done = true; clearTimeout(timer); });
+  }
+
+  // Does the page's main thread answer within ms? Raw CDP to the tab's own session, not through Playwright. Any reply
+  // counts, an error too (the tab closing, a document going away: the browser answered for it). A JS dialog holds every
+  // evaluation until it is answered, but that waits on the user, not on a loop: the page counts as answering.
+  async _answers(ms) {
+    const answered = !!this.dialog || await within(cdp(this, 'Runtime.evaluate', { expression: '1' }).then(() => true, () => true), ms, false) || !!this.dialog;
+    if (answered) this.stuckAt = null;
+    return answered;
+  }
+
+  _stuckError() {
+    return new Error(`The page in ${this.id} has not answered for ${Math.round((Date.now() - this.stuckAt) / 1000)} s: a script on it seems stuck in a loop ` +
+      '(a broken build?). Navigate it (reload, or another URL) or close it with tab_close; other calls on this tab fail at once until it answers again.');
   }
 
   // A call is running or queued, or an action still runs behind an open dialog.
@@ -101,12 +217,18 @@ export class Tab extends EventEmitter {
     return this._calls > 0 || !!this._busy;
   }
 
-  // A new document in the main frame (not same-document history): any dialog of the old one is gone.
+  // A new document in the main frame (not same-document history): any dialog of the old one is gone, and so is a stuck script.
   // url: the new document's, when known; a local file one is noted (localPageAt) so no result read meanwhile is kept.
   _newDocument(url) {
     if (isLocalUrl(url)) this.localPageAt = Date.now();
     this.documentGeneration++;
     this.dialog = null;
+    this.stuckAt = null;
+    // The new document's own response came in before it committed, under the old page's number: it is this page's.
+    const own = this.network.findLast((e) => e.type === 'document' && e.main);
+    if (own && own.url === url && own.page === this.documentGeneration - 1) own.page = this.documentGeneration;
+    // The old document's requests are gone with it (the new one's own request has its response by now).
+    for (const request of this.inflight) if (request.resourceType() !== 'document' || request.frame() !== this.page.mainFrame()) this.inflight.delete(request);
   }
 
   // An action returned early (a dialog opened) but is still running: once the dialog is resolved it goes on,
@@ -159,6 +281,7 @@ export class Browser {
     this._pages = new WeakMap(); // Playwright page -> Promise<Tab | null>
     this._waiters = new Map(); // chrome tab id -> resolve functions of waitForTab calls
     this.adopting = new Map(); // chrome tab id -> its _adopt still setting up (settles once it is done)
+    this._settingUp = new Map(); // chrome tab id -> its Tab while _adopt sets it up, before it is published
   }
 
   // The app's version, read once when first asked (browser_list), not at connect.
@@ -187,13 +310,14 @@ export class Browser {
   // main frame's new documents, 'windowopen' (url) when the page asks for a new tab or window, and 'binding' (name,
   // payload) when one of FowlBrowser's page scripts reports.
   _onDebuggerEvent([source, method, params] = []) {
-    const tab = this.tabs.get(source?.tabId);
+    const tab = this.tabs.get(source?.tabId) ?? this._settingUp.get(source?.tabId);
     if (!tab) return;
     if (method === 'Page.frameNavigated' && (source.sessionId || params?.frame?.parentId)) tab.frameGeneration++;
     else if (source.sessionId) return;
     else if (method === 'Page.frameNavigated') {
       tab._newDocument(params?.frame?.url);
       prepareCursor(tab);
+      if (tab.viewport && !tab.viewport.mobile) keepViewportSize(tab).catch((error) => debug('viewport: keeping its size failed', tab.id, error.message));
     } else if (method === 'Page.windowOpen') tab.emit('windowopen', params?.url ?? '');
     else if (isOwnBinding(method, params)) tab.emit('binding', params.name, params.payload);
   }
@@ -250,6 +374,7 @@ export class Browser {
       const { tabId } = await session.send('FowlBrowser.getTabId');
       session.detach().catch(() => {});
       tab = new Tab(this, tabId, page);
+      this._settingUp.set(tabId, tab); // its page's new documents count while it is set up (_onDebuggerEvent)
       // keep and release wait for this (adopting) to take out the popup scripts it installs; it sees one that came first.
       let adopted;
       this.adopting.set(tabId, new Promise((resolve) => { adopted = resolve; }));
@@ -272,6 +397,8 @@ export class Browser {
     } catch (error) {
       if (!page.isClosed()) process.stderr.write(`[fowlbrowser] could not map a page to its tab: ${error.message}\n`);
       return null;
+    } finally {
+      if (tab && this._settingUp.get(tab.tabId) === tab) this._settingUp.delete(tab.tabId);
     }
   }
 
@@ -299,9 +426,13 @@ export class Browser {
 }
 
 export class BrowserManager {
-  constructor() {
+  // system: the installed and running browsers (macOS). Real browsers' hosts listen in ~/.fowlbrowser only, so with
+  // another FOWLBROWSER_DIR (tests, the fake extension) none of them is looked at or reopened.
+  constructor({ system = SOCKET_DIR === path.join(os.homedir(), '.fowlbrowser') ? macOS : null } = {}) {
     this.browsers = new Map(); // key -> Browser
     this._connecting = new Map(); // socket path -> promise
+    this._system = system;
+    this._revives = new Map(); // key -> { at, done } of its last reopen
     this.ready = this.scan();
     setInterval(() => this.scan(), RESCAN_MS).unref();
   }
@@ -338,10 +469,20 @@ export class BrowserManager {
   async get(key) {
     await this.ready;
     if (!this.browsers.has(key)) await this.scan();
+    const [asleep] = this.browsers.has(key) ? [] : this.asleep(key);
+    if (asleep?.bundle) await this._revive(key, asleep.bundle);
     const browser = this.browsers.get(key);
     if (!browser) {
       const known = [...this.browsers.keys()];
-      throw new Error(`Browser "${key}" is not connected. Connected: ${known.length ? known.join(', ') : 'none'}. Use browser_list.`);
+      const others = `Connected: ${known.length ? known.join(', ') : 'none'}.`;
+      if (asleep && !asleep.bundle) {
+        throw new Error(`${asleep.name} isn't running, so FowlBrowser can't reach it (it never starts a browser). Ask the user to open ${asleep.name}. ${others}`);
+      }
+      if (asleep) {
+        throw new Error(`${asleep.name} is running but FowlBrowser didn't come up in it, even after opening a window there in the background ` +
+          `(its FowlBrowser extension may be off). Ask the user to check ${asleep.name}. ${others}`);
+      }
+      throw new Error(`Browser "${key}" is not connected. ${others} Use browser_list.`);
     }
     return browser;
   }
@@ -349,5 +490,36 @@ export class BrowserManager {
   async all() {
     await this.ready;
     return [...this.browsers.values()];
+  }
+
+  // Browsers with FowlBrowser installed and no profile connected (every one, or the one `key` names): { key, name,
+  // bundle } (bundle: the running app, null when it isn't running).
+  asleep(key) {
+    if (!this._system) return [];
+    const awake = new Set([...this.browsers.keys()].map(baseKey));
+    const apps = APPS.filter((b) => (key === undefined || b.key === baseKey(key)) && !awake.has(b.key) && this._system.installed(b));
+    const processes = apps.length ? this._system.processes() : [];
+    return apps.map((b) => ({ key: b.key, name: NAMES[b.key] ?? b.app, bundle: runningBundle(b.app, processes) }));
+  }
+
+  // A browser that is running with FowlBrowser installed but not connected has most likely closed its last window: it
+  // gets a window again in the background, and the call goes on once its host is here (up to 5 s). Calls naming it
+  // meanwhile share one reopen; one that brought nothing back is not repeated for a minute.
+  _revive(key, bundle) {
+    const last = this._revives.get(key);
+    if (last && (!last.settled || Date.now() - last.at < REVIVE_AGAIN_MS)) return last.done;
+    const revive = { at: Date.now(), settled: false };
+    revive.done = (async () => {
+      debug('revive', key, bundle);
+      this._system.reopen(bundle);
+      for (const end = Date.now() + REVIVE_WAIT_MS; !this.browsers.has(key) && Date.now() < end;) {
+        await sleep(200);
+        await this.scan();
+      }
+      revive.settled = true;
+      if (this.browsers.has(key)) this._revives.delete(key);
+    })();
+    this._revives.set(key, revive);
+    return revive.done;
   }
 }

@@ -261,6 +261,21 @@ export async function loadScenarios(only) {
 let tagCounter = 0;
 
 // Runs one scenario in one browser on its own tabs, then checks it only saw its own tabs and closes them.
+// Tabs this server controls that no job opened, after the same grace as the ownership check; they are closed and
+// remembered as seen.
+async function foreignTabs(server, t) {
+  let foreign = (await t.listMine()).map(x => x.tab).filter(tab => !server.everOpened.has(tab));
+  if (!foreign.length) return [];
+  for (let i = 0; i < 40 && server.pendingOpens > 0; i++) await sleep(250);
+  await sleep(1000);
+  foreign = foreign.filter(tab => !server.everOpened.has(tab));
+  for (const tab of foreign) {
+    server.everOpened.add(tab);
+    await server.call('tab_close', { tab, confirm_close_users_tab: true }).catch(() => {});
+  }
+  return foreign;
+}
+
 export async function runJob(server, scenario, browser) {
   const tag = `${scenario.name}-${browser}-${process.pid}-${++tagCounter}`;
   const t = makeContext({ server, browser, tag });
@@ -285,6 +300,10 @@ export async function runJob(server, scenario, browser) {
     if (foreign.length) throw new AssertionError(`tab_list mine shows tabs this server never opened: ${foreign.join(', ')}`);
   } catch (e) {
     error = `[${t.stepName}] ${e.message}`;
+    // A scenario that fails midway can leave a tab its own action opened (an adopted popup) that it never tracked. It is
+    // this job's: closed and counted here, so it doesn't fail every later scenario's ownership check.
+    const strays = await foreignTabs(server, t).catch(() => []);
+    if (strays.length) error += ` (it left ${strays.join(', ')}, closed now)`;
   }
   await t.cleanup();
   return { scenario: scenario.name, browser, ok: !error, ms: Date.now() - started, error };

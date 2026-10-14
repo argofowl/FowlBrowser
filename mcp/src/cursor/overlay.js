@@ -99,7 +99,9 @@
   let action = ''; // the action word shown in place of the label, '' for the label
   let badgeWidth = 0;
   let pos = { x: 0, y: 0 }; // where the tip is drawn
-  let rot = 0; // the arrow's turn away from its rest pose, radians
+  let rot = 0; // the arrow's turn away from its upright rest, radians (its pose plus the lean of travel)
+  let pose = 0; // the turn it rests in: 0, or a quarter or half turn where the window's edge would cut it off
+  let placed = ''; // which side of the arrow the label is on
   let travel = null; // the planned move: bezier, arc-length table, duration
   let frame = 0;
   let frameAt = 0;
@@ -205,7 +207,8 @@
     following = 0;
     stopFrames();
     travel = null;
-    rot = 0;
+    rot = pose = 0;
+    placed = '';
     settle(false);
   }
 
@@ -306,15 +309,26 @@
   // The viewport's size and the page scale, read once and kept until the window or the visual viewport changes, so a
   // frame never forces a layout.
   let view = null;
+  // The browser's zoom for the site (the server reads it, move opts.zoom; 0.8 at 80%). An unpinched page draws the
+  // cursor by its inverse, so it keeps its size on screen; a pinched or zoomed-out mobile page by its page scale.
+  let browserZoom = 1;
   function viewport() {
     if (view) return view;
     // In quirks mode <html>'s client size is the content's, not the viewport's.
     const el = document.compatMode === 'BackCompat' ? null : document.documentElement;
-    view = { w: el?.clientWidth || innerWidth, h: el?.clientHeight || innerHeight, zoom: 1 / (globalThis.visualViewport?.scale || 1) };
+    const scale = globalThis.visualViewport?.scale || 1;
+    view = { w: el?.clientWidth || innerWidth, h: el?.clientHeight || innerHeight, zoom: 1 / (scale === 1 ? browserZoom : scale) };
     return view;
   }
   const forget = () => { view = null; };
-  addEventListener('resize', forget);
+  // A resize at rest can leave the arrow or its label where they no longer fit (or the arrow outside a narrower
+  // window): placed again, inside it.
+  addEventListener('resize', () => {
+    forget();
+    if (!parts || travel) return;
+    pos = inside(pos);
+    render();
+  });
   globalThis.visualViewport?.addEventListener('resize', forget);
   globalThis.visualViewport?.addEventListener('scroll', forget);
 
@@ -331,19 +345,62 @@
     if (!parts) return;
     // A page zoomed out (a mobile viewport without a viewport meta) would shrink the cursor with it: undo the page scale.
     const k = zoom();
+    // At rest, a window resize can leave the arrow where its pose no longer fits: it turns again.
+    if (!travel && !frame && poseAt(pos) !== pose) {
+      pose = poseAt(pos);
+      if (still) rot = pose;
+      else startFrames();
+    }
     parts.cursor.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0)${k === 1 ? '' : ` scale(${k})`}`;
     parts.art.style.transform = rot ? `rotate(${rot}rad)` : '';
-    parts.badge.style.transform = badgeAt();
+    const [side, at] = badgePlace();
+    // The label gliding to its other side (the arrow turned near an edge, or met one) rather than jumping there.
+    if (placed && side !== placed && !still && !parts.badge.getAnimations().length) {
+      parts.badge.animate([{ transform: parts.badge.style.transform }, { transform: at }], { duration: WORD_MS, easing: CURVE });
+    }
+    placed = side;
+    parts.badge.style.transform = at;
   }
 
-  // The label sits below and to the right of the pointer, kept inside the viewport.
-  function badgeAt() {
+  // The arrow's body runs down and to the right of its tip (CSS px, rim and shadow included). Near the window's bottom or
+  // right edge it would be cut off (a chat box at the foot of a page, a button in a corner): there it turns a quarter or
+  // half turn around its tip, so all of it shows and it still points at the target. The turns tried, in order.
+  const BODY = [[-2, -2], [16, -2], [-2, 22], [16, 22]];
+  const POSES = [0, -Math.PI / 2, Math.PI / 2, Math.PI];
+  function poseAt(p) {
+    const { w, h } = viewport();
+    const k = zoom();
+    // How far the turned body's corners stick out of the window, in px (0: it fits).
+    const out = (angle) => BODY.reduce((sum, [bx, by]) => {
+      const x = p.x + (bx * Math.cos(angle) - by * Math.sin(angle)) * k;
+      const y = p.y + (bx * Math.sin(angle) + by * Math.cos(angle)) * k;
+      return sum + Math.max(0, -x, x - w) + Math.max(0, -y, y - h);
+    }, 0);
+    // The first that fits, else (a page zoomed far out scales the cursor up) the one least cut off.
+    return POSES.find((angle) => !out(angle)) ?? POSES.reduce((best, angle) => (out(angle) < out(best) ? angle : best));
+  }
+
+  // The label: below and to the right of the arrow; where that doesn't fit, beside the arrow at the tip's height, on the
+  // side away from its body when it is turned; always inside the window. [side, transform].
+  function badgePlace() {
     const k = zoom();
     const { w, h } = viewport();
-    const bx = Math.min(BADGE.x, (w - 2 - pos.x) / k - badgeWidth);
-    const by = Math.min(BADGE.y, (h - pos.y) / k - 19);
-    return `translate(${bx}px, ${by}px)`;
+    const bh = 17;
+    const right = [BADGE.x + 2, -bh / 2];
+    const left = (gap) => [-badgeWidth - gap, -bh / 2];
+    const sides = {
+      [0]: [['below', [BADGE.x, BADGE.y]], ['right', right], ['left', left(6)]],
+      [-Math.PI / 2]: [['right', [24, -bh / 2]], ['left', left(6)]],
+      [Math.PI / 2]: [['left', left(24)], ['right', [6, -bh / 2]]],
+      [Math.PI]: [['left', left(20)], ['right', [6, -bh / 2]]],
+    }[pose] ?? [['below', [BADGE.x, BADGE.y]]];
+    const inside = ([bx, by]) => pos.x + bx * k >= 2 && pos.y + by * k >= 2 && pos.x + (bx + badgeWidth) * k <= w - 2 && pos.y + (by + bh) * k <= h - 2;
+    const [side, [bx, by]] = sides.find(([, at]) => inside(at)) ?? sides[0];
+    const x = Math.min(Math.max(bx, (2 - pos.x) / k), (w - 2 - pos.x) / k - badgeWidth);
+    const y = Math.min(Math.max(by, (2 - pos.y) / k), (h - 2 - pos.y) / k - bh);
+    return [side, `translate(${x}px, ${y}px)`];
   }
+  const badgeAt = () => badgePlace()[1];
 
   // Current opacity and scale of an element, so a new animation starts where the running one is.
   function current(el) {
@@ -385,12 +442,17 @@
       const { w, h } = viewport();
       const from = opts.from && Number.isFinite(opts.from.x) && Number.isFinite(opts.from.y) ? opts.from : null;
       pos = inside(last ?? (from ? { x: Number(from.x), y: Number(from.y) } : { x: w * 0.58, y: h * 0.55 }));
-      rot = 0;
+      rot = pose = poseAt(pos);
       travel = null;
     } else if (!host.isConnected && document.documentElement) {
       attach(); // the page replaced its document element (document.open, a rebuilt <html>)
     }
     setLabel(opts.label);
+    const z = Number(opts.zoom);
+    if (Number.isFinite(z) && z >= 0.25 && z <= 5 && z !== browserZoom) {
+      browserZoom = z;
+      view = null;
+    }
     if (fresh || exiting) {
       exiting = null;
       animateBody(1, 1, 220, fresh ? { opacity: 0, scale: still ? 1 : 0.85 } : undefined);
@@ -512,20 +574,22 @@
         settle(true);
       }
     }
-    // The tip leans a little into the direction of travel once it moves fast enough, and settles back after.
-    const toward = Math.min(Math.max(wrap(Math.atan2(vy, vx) - TIP_ANGLE), -LEAN), LEAN);
-    const want = speed > 0 ? toward * Math.min(Math.max((speed - 40) / 260, 0), 1) : 0;
+    // The tip leans a little into the direction of travel once it moves fast enough, and settles back after, into the
+    // pose that fits where it is (turned near the window's bottom or right edge).
+    pose = poseAt(pos);
+    const toward = Math.min(Math.max(wrap(Math.atan2(vy, vx) - TIP_ANGLE - pose), -LEAN), LEAN);
+    const want = pose + (speed > 0 ? toward * Math.min(Math.max((speed - 40) / 260, 0), 1) : 0);
     rot += wrap(want - rot) * (1 - Math.exp(-dt * 22));
-    if (!travel && Math.abs(rot) < 0.002) rot = 0;
+    if (!travel && Math.abs(wrap(rot - pose)) < 0.002) rot = pose;
+    frame = travel || rot !== pose ? requestAnimationFrame(tick) : 0;
     render();
-    frame = travel || rot ? requestAnimationFrame(tick) : 0;
   }
 
   // Reduced motion: no travel, the pointer crossfades from where it was to the target in 120 ms.
   function jump(to) {
     stopFrames();
     travel = null;
-    rot = 0;
+    rot = pose = poseAt(to);
     // The ghost starts as visible as the cursor is (a cursor still fading in leaves no flash where it was).
     const { opacity } = current(parts.body);
     const ghost = parts.cursor.cloneNode(true);
@@ -624,8 +688,12 @@
   function snap(to) {
     stopFrames();
     travel = null;
-    rot = 0;
+    rot = pose = poseAt(to);
     pos = { ...to };
+    // The label goes with it at once, at its new width: a glide from where it sat by the old point (or toward it) would
+    // start it off the window's edge.
+    for (const a of [...parts?.badge.getAnimations() ?? [], ...parts?.pill.getAnimations() ?? []]) a.cancel();
+    placed = '';
     render();
     settle(true);
   }

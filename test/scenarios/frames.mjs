@@ -9,6 +9,13 @@ export default {
       return (snap.match(/textbox "Frame text"/g) || []).length === 2 && snap;
     }, 'both frame forms in snapshot');
 
+    t.step('wait_for text only the iframes show');
+    await t.call('wait_for', { tab, text: 'Frame agree', timeout_ms: 3000, snapshot: false });
+
+    t.step('text mode takes in the iframes');
+    const text = (await t.call('snapshot', { tab, mode: 'text' })).text;
+    t.ok((text.match(/^\[iframe: [\w.:]+\]\nFrame text\nFrame agree\nFrame save$/gm) ?? []).length === 2, `both iframes' text: ${text}`);
+
     t.step('same-origin frame');
     await t.call('type', { tab, ref: t.ref(s, 'textbox', 'Frame text', 0), text: `same ${t.tag}`, snapshot: false });
     await t.call('click', { tab, ref: t.ref(s, 'button', 'Frame save', 0), snapshot: false });

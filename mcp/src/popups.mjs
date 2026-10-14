@@ -1,4 +1,5 @@
-// Popups from agent tabs open without taking the user's eyes or focus (SPEC "Popups (session 5)").
+// Popups from agent tabs open without taking the user's eyes or focus (SPEC "Popups (session 5)"), and the page can't put
+// the browser's or the Mac's own UI (colour picker, file panels, full screen, share and passkey sheets...) in front of them.
 // Two page scripts, in every same-process frame of an agent tab and every new document, before page scripts:
 // - MAIN world: decides. Opens that need no opener (target=_blank links without rel=opener, links with rel=noopener
 //   or noreferrer to a name no frame or window has, window.open with noopener/noreferrer) are handed to the isolated
@@ -18,6 +19,7 @@ import crypto from 'node:crypto';
 import { cdp } from './cdp.mjs';
 import { debug } from './debug.mjs';
 import { userSettled } from './takeover.mjs';
+import { within } from './util.mjs';
 
 export const POPUP_WORLD = 'fowlbrowser-popups';
 const WORLD = POPUP_WORLD;
@@ -155,7 +157,62 @@ function main(event) {
       if (on && (self === undefined || self === window) && window === window.top) dispatch({ type: 'close' });
     },
   });
-  const fakes = new Map([[open, nativeOpen], [close, nativeClose], [modifierState, nativeModifierState], ...keyGetters.map(([, native, fake]) => [fake.get, native.get])]);
+  // Page calls that would put the browser's or the Mac's own UI in front of the user from an agent's tab: the screen
+  // colour picker (it takes over the mouse), file and folder panels, full screen, pointer lock, printing, the share
+  // sheet, passkey and payment sheets, the camera, microphone and screen pickers, and picture-in-picture windows (they
+  // float over every app). Refused as a person declining would be (the page sees the error a cancel gives) and
+  // reported, so the agent hears what the page wanted. [owner, method, what it shows, error, when (default: always)]
+  const Abort = 'AbortError';
+  const Denied = 'NotAllowedError';
+  const InputElement = window.HTMLInputElement;
+  // [owner, method, what it shows, error (none: returns nothing), when (default: always), sync: throws instead of
+  // returning a rejected promise (showPicker)]. A file input's showPicker is left alone: an agent's own action holds
+  // the chooser it opens (the server intercepts choosers then).
+  const declined = [
+    [window.EyeDropper?.prototype, 'open', 'the screen colour picker (eyedropper)', Abort],
+    [window, 'showOpenFilePicker', 'a file panel', Abort], [window, 'showSaveFilePicker', 'a save panel', Abort],
+    [window, 'showDirectoryPicker', 'a folder panel', Abort],
+    [window.Element?.prototype, 'requestFullscreen', 'full screen', 'TypeError'], [window.Element?.prototype, 'webkitRequestFullscreen', 'full screen'],
+    [window.Element?.prototype, 'webkitRequestFullScreen', 'full screen'], [window.HTMLVideoElement?.prototype, 'webkitEnterFullscreen', 'full screen'],
+    [window.Element?.prototype, 'requestPointerLock', 'pointer lock (it hides the mouse pointer)', Denied],
+    [window, 'print', 'the print dialog'], [window.Navigator?.prototype, 'share', 'the share sheet', Abort],
+    [window.CredentialsContainer?.prototype, 'get', 'a passkey or security key prompt', Denied, (options) => !!options?.publicKey],
+    [window.CredentialsContainer?.prototype, 'create', 'a passkey or security key prompt', Denied, (options) => !!options?.publicKey],
+    [window.PaymentRequest?.prototype, 'show', 'a payment sheet', Abort],
+    [window.MediaDevices?.prototype, 'getUserMedia', 'the camera or microphone', Denied],
+    [window.MediaDevices?.prototype, 'getDisplayMedia', 'the screen sharing picker', Denied],
+    [window.HTMLVideoElement?.prototype, 'requestPictureInPicture', 'a picture-in-picture window', Denied],
+    [window.DocumentPictureInPicture?.prototype, 'requestWindow', 'a picture-in-picture window', Denied],
+    [window.HTMLInputElement?.prototype, 'showPicker', 'the colour window', Denied, function () { return this.type === 'color'; }, true],
+    // A script's click on a colour input inside a closed shadow root, which the click listener below can't see (on
+    // HTMLElement, where click() lives, so calling it from there is refused too).
+    [window.HTMLElement?.prototype, 'click', 'the colour window', null, function () { return this instanceof InputElement && this.type === 'color' && !this.disabled; }, true],
+    [window.HTMLSelectElement?.prototype, 'showPicker', 'a dropdown menu', Denied, null, true],
+  ].filter(([owner, method]) => typeof owner?.[method] === 'function').map(([owner, method, what, error, when, sync]) => {
+    const native = owner[method];
+    const fake = new Proxy(native, {
+      apply(target, self, args) {
+        // Refused only while the debugger is attached (send: after a detach, a takeover, the wrappers switch off and the
+        // page gets what it asked for).
+        if (!on || (when && !apply(when, self, args)) || !send({ type: 'blocked', what })) return apply(target, self, args);
+        if (!error) return undefined;
+        const refusal = error === 'TypeError' ? new TypeError(`${what} was refused`) : new DOMException(`${what} was refused`, error);
+        if (sync) throw refusal;
+        return Promise.reject(refusal);
+      },
+    });
+    return { owner, method, native, fake };
+  });
+  // A page script's click on a colour input (input.click(), label.click(), a dispatched click) opens the colour window
+  // too when the page has the agent's user activation: its default action is prevented. Trusted clicks are the user's
+  // (an agent's own click on one is refused by the server before it is sent).
+  apply(listen, window, ['click', (e) => {
+    const target = apply(composedPath, e, [])[0];
+    if (!on || e.isTrusted || !InputElement || !(target instanceof InputElement) || target.type !== 'color' || target.disabled) return;
+    if (send({ type: 'blocked', what: 'the colour window' })) e.preventDefault();
+  }, true]);
+  const fakes = new Map([[open, nativeOpen], [close, nativeClose], [modifierState, nativeModifierState], ...keyGetters.map(([, native, fake]) => [fake.get, native.get]),
+    ...declined.map(({ native, fake }) => [fake, native])]);
   const toString = new Proxy(nativeToString, { apply: (target, self, args) => apply(target, fakes.get(self) ?? self, args) });
   fakes.set(toString, nativeToString);
 
@@ -187,6 +244,7 @@ function main(event) {
       Function.prototype.toString = toString;
       for (const [key, , fake] of keyGetters) Object.defineProperty(mouse, key, fake);
       mouse.getModifierState = modifierState;
+      for (const { owner, method, fake } of declined) owner[method] = fake;
     },
     off() {
       on = false;
@@ -196,6 +254,7 @@ function main(event) {
       if (Function.prototype.toString === toString) Function.prototype.toString = nativeToString;
       for (const [key, native, fake] of keyGetters) if (Object.getOwnPropertyDescriptor(mouse, key)?.get === fake.get) Object.defineProperty(mouse, key, native);
       if (mouse.getModifierState === modifierState) mouse.getModifierState = nativeModifierState;
+      for (const { owner, method, native, fake } of declined) if (owner[method] === fake) owner[method] = native;
     },
     hide(capMs, element, token) {
       if (!on || closedTokens.includes(token)) return false;
@@ -260,6 +319,9 @@ function isolated(event, binding) {
       report({ type: 'open', url });
     } else if (data?.type === 'close' && window.closed && window === window.top) {
       report({ type: 'close' });
+    } else if (data?.type === 'blocked' && typeof data.what === 'string' && attached()) {
+      e.preventDefault(); // taken: the page's call is refused
+      report({ type: 'blocked', what: data.what.slice(0, 80) });
     }
   });
 }
@@ -320,6 +382,7 @@ export async function installPopups(tab) {
       let data;
       try { data = JSON.parse(payload); } catch { return; }
       if (data?.type === 'close') tab.closedByPageAt = Date.now();
+      else if (data?.type === 'blocked' && typeof data.what === 'string') tab.emit('blocked', data.what);
       else if (data?.type === 'open' && typeof data.url === 'string') {
         const created = userSettled(tab).then(() => tab.browser.host.request('tabs.openChild', { tabId: tab.tabId, url: data.url }));
         const opening = created.then((child) => (child.user ? { ...child, url: data.url } : navigateChild(tab, child.tabId, data.url)));
@@ -399,7 +462,8 @@ export async function backgroundClick(tab, loc, capMs, click) {
   const token = crypto.randomUUID();
   // In the main frame's current document (after a navigation the new one never had it).
   const close = () => capped(cdp(tab, 'Runtime.evaluate', { expression: `window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(token)})` }).catch(() => {}));
-  const background = await loc.evaluate(BACKGROUND_CLICK_FN, { capMs, token }, { timeout: PROBE_MS }).then((yes) => yes === true, () => null);
+  // Bounded here too: the locator's timeout covers finding the element, not a page that stalls after.
+  const background = await within(loc.evaluate(BACKGROUND_CLICK_FN, { capMs, token }, { timeout: PROBE_MS }).then((yes) => yes === true), PROBE_MS, null);
   if (background === null) await close();
   if (!background) return click();
   try {

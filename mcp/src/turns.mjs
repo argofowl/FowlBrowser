@@ -9,8 +9,8 @@ import * as cursor from './cursor/index.mjs';
 import { SOCKET_DIR } from './hostClient.mjs';
 import { uninstallPopups } from './popups.mjs';
 import { record, tabEvent } from './record.mjs';
-import { markEnding, parked } from './takeover.mjs';
-import { tabInfo } from './util.mjs';
+import { hasParked, markEnding, parked, recoveries } from './takeover.mjs';
+import { tabInfo, within } from './util.mjs';
 import { clearViewport } from './viewport.mjs';
 
 // In the FowlBrowser folder (0700; its own subfolder, as *.sock there are browsers), not the shared /tmp. When that
@@ -27,6 +27,7 @@ let subagents = 0; // SubagentStart minus SubagentStop hooks seen (never below 0
 let subagentsChanged = 0; // when that count last changed (Date.now())
 // A count unchanged this long is taken as a lost SubagentStop (Claude interrupted mid-subagent), not a running one.
 export const SUBAGENTS_STALE_MS = 30 * 60_000;
+const RECOVERIES_MS = 3000; // a turn end waits at most this long for tabs being attached again (takeover.mjs recoveries)
 
 function countSubagents(delta) {
   subagents = Math.max(0, subagents + delta);
@@ -44,7 +45,23 @@ export async function endTurn(manager) {
     record({ type: 'turnEnded', ...result, deferred: true });
     return { ...result, deferred: true };
   }
-  const plans = [...manager.browsers.values()].map((browser) => ({ browser, tabs: new Map(browser.tabs) }));
+  // A tab being attached again after a link for another app is this turn's work tab: looked at once it is mapped again
+  // (the only wait, and only while one is under way). The other tabs are taken before it, so a tab the next turn opens
+  // meanwhile is never touched.
+  const before = [...manager.browsers.values()].map((browser) => ({ browser, tabs: new Map(browser.tabs) }));
+  const recovered = recoveries();
+  if (recovered) {
+    await within(recovered.done, RECOVERIES_MS, null);
+    for (const { browser, tabs } of before) {
+      for (const key of recovered.keys) {
+        const tabId = Number(key.split(':')[1]);
+        if (key.startsWith(`${browser.key}:`) && browser.tabs.has(tabId)) tabs.set(tabId, browser.tabs.get(tabId));
+      }
+    }
+  }
+  // A browser this session has no tabs in (none mapped, none parked) is not asked at all: most sessions never use one,
+  // and a busy browser's tab list held their turn ends for seconds.
+  const plans = before.filter(({ browser, tabs }) => tabs.size || hasParked(browser.key));
   const errors = [];
   await Promise.all(plans.map(async ({ browser, tabs }) => {
     const all = await browser.host.request('tabs.listAll', {}).catch(() => []);
@@ -76,7 +93,7 @@ export async function endTurn(manager) {
         return true;
       };
       try {
-        if (!(await tab.run(work))) return result.skipped.push(id);
+        if (!(await tab.run(work, { escape: true }))) return result.skipped.push(id); // also a page stuck in a script
         if (same()) browser.forget(info.id);
         tabEvent(close ? 'close' : 'release', id, info.url);
         (close ? result.closed : result.released).push(id);

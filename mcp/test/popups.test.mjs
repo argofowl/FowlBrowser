@@ -13,7 +13,7 @@ import { registerTools } from '../src/tools.mjs';
 
 // A window with a native-looking open/close, and an isolated world that takes every open it is handed (unless
 // `take` is false). Returns the vm context plus what reached the isolated world and the native functions.
-function page({ active = true, take = true, frames = [], origin = 'https://site.example' } = {}) {
+function page({ active = true, take = true, frames = [], origin = 'https://site.example', before = '' } = {}) {
   const handed = [];
   const native = [];
   const order = []; // both, in turn
@@ -63,6 +63,7 @@ function page({ active = true, take = true, frames = [], origin = 'https://site.
     globalThis.close = function close() { record('close'); };
     globalThis.nativeOpen = open; globalThis.nativeClose = close; globalThis.realToString = Function.prototype.toString;
   `, context);
+  vm.runInContext(before, context);
   vm.runInContext(`(${pageScripts.main})('fowlbrowser-test')`, context);
   const run = (code) => vm.runInContext(code, context);
   // A trusted click on a link: the capture listener arms the bubble one, which decides.
@@ -140,6 +141,16 @@ test('window.open that may need its opener runs for real, as a tab: popup featur
   // The window it named now exists, so a noopener open of that name navigates it natively.
   p.run(`window.open('b.html', 'idp', 'noopener')`);
   assert.deepEqual(p.native.at(-1), ['open', 'b.html', 'idp', 'noopener']);
+});
+
+test('a script\'s click on a colour input is refused wherever the input is (a closed shadow root too); other inputs click', () => {
+  const p = page({ before: `globalThis.HTMLElement = class extends EventTarget { click() { record('click', this.type); } };
+    globalThis.HTMLInputElement = class extends HTMLElement {};` });
+  p.run(`const c = new HTMLInputElement(); c.type = 'color'; c.click(); HTMLElement.prototype.click.call(c);`);
+  assert.deepEqual(p.native, []);
+  assert.deepEqual(p.handed.map((h) => h.what), ['the colour window', 'the colour window']);
+  p.run(`const t = new HTMLInputElement(); t.type = 'checkbox'; t.click(); const d = new HTMLInputElement(); d.type = 'color'; d.disabled = true; d.click();`);
+  assert.deepEqual(p.native, [['click', 'checkbox'], ['click', 'color']]);
 });
 
 test('everything else is left to the browser untouched', () => {

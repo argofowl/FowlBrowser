@@ -226,6 +226,74 @@ test('detaches: Cancel and a browser page are takeovers; a crash and a closing t
   assert.match(text, /\(opened a browser page \(chrome:\/\/settings\/\)\)/);
 });
 
+// Measured on a test Mac (Chrome 155, Helium 0.19, 2026-10-14): a page navigating to zoommtg:, mailto: or a scheme no app
+// handles sends Page.frameRequestedNavigation with that URL, then its debugger detaches (target_closed) as the
+// navigation starts, though the tab never leaves its page.
+test('a link for another app (mailto:, zoommtg:) is no takeover: the tab is attached again and the agent hears it once', async () => {
+  const page = 'https://shop.example/checkout';
+  const listed = () => [1, 2, 3, 4].map((id) => ({ id, owner: 'you', url: id === 3 ? 'https://chromewebstore.google.com/detail/x' : page }));
+  const browser = await fakeBrowser({ ids: [1, 2, 3, 4], listed });
+  const again = [];
+  browser.relay.model.reattach = async (tabId) => { again.push(tabId); if (tabId === 4) throw new Error('Cannot access a chrome:// URL'); };
+  const asks = (tabId, url) => browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId }, 'Page.frameRequestedNavigation', { frameId: 'MAIN', reason: 'anchorClick', url, disposition: 'currentTab' }]);
+  asks(1, 'zoommtg://zoom.us/join?confno=1');
+  detach(browser, 1, 'target_closed');
+  // Not when the user's input came first, the tab went elsewhere (a page the debugger may not stay on), or it does not come back.
+  report(browser.tabs.get(2), 'pointerdown', Date.now());
+  await sleep(10);
+  asks(2, 'mailto:someone@example.com');
+  detach(browser, 2, 'target_closed');
+  asks(3, 'mailto:someone@example.com');
+  detach(browser, 3, 'target_closed');
+  asks(4, 'slack://open');
+  detach(browser, 4, 'target_closed');
+  await sleep(400);
+  assert.deepEqual(again, [1, 4]);
+  assert.deepEqual(parks(browser).map((p) => p.tabId).sort(), [2, 3, 4]);
+
+  const call = toolsFor(browser);
+  const first = await call('tab_list', { scope: 'mine' });
+  assert.match(first.text, new RegExp(`The page in ${browser.key}:1 opened zoommtg://zoom\\.us/join\\?confno=1, a link for another app \\(if one is installed\\), ` +
+    'and the browser let go of the tab for it\\. FowlBrowser attached again: the tab is still yours, on the same page, but refs from before are void, so call snapshot\\.'));
+  assert.ok(!(await call('tab_list', { scope: 'mine' })).text.includes('a link for another app'), 'told once');
+  assert.equal((await call('console', { tab: `${browser.key}:1` })).error, false, 'the tab works');
+});
+
+test('a link for another app right after input still being judged (a slow tabs.isShown) is no reattach: the tab is taken over', async () => {
+  let shown;
+  const page = 'https://shop.example/checkout';
+  const browser = await fakeBrowser({ ids: [1], listed: () => [{ id: 1, owner: 'you', url: page }], hold: { 'tabs.isShown': new Promise((resolve) => { shown = resolve; }) } });
+  const again = [];
+  browser.relay.model.reattach = async (tabId) => { again.push(tabId); };
+  report(browser.tabs.get(1), 'pointerdown', Date.now()); // the user's click on a mailto: link; its check is slow
+  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 1 }, 'Page.frameRequestedNavigation', { frameId: 'MAIN', reason: 'anchorClick', url: 'mailto:a@example.com' }]);
+  detach(browser, 1, 'target_closed');
+  await sleep(1000);
+  shown();
+  await sleep(10);
+  assert.deepEqual(again, [], 'not attached again');
+  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }]);
+});
+
+test('the user\'s click on an app link just before it is still theirs when the tab\'s checks are slow (a busy browser)', async () => {
+  let answer;
+  const page = 'https://shop.example/checkout';
+  const browser = await fakeBrowser({ ids: [1], listed: () => [{ id: 1, owner: 'you', url: page }] });
+  const again = [];
+  browser.relay.model.reattach = async (tabId) => { again.push(tabId); };
+  report(browser.tabs.get(1), 'pointerdown', Date.now() - 4900); // judged at once, nearly 5 s before the link
+  await sleep(10);
+  const request = browser.host.request.bind(browser.host);
+  browser.host.request = (method, params) => (method === 'tabs.info' ? new Promise((resolve) => { answer = () => resolve(request(method, params)); }) : request(method, params));
+  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 1 }, 'Page.frameRequestedNavigation', { frameId: 'MAIN', reason: 'anchorClick', url: 'mailto:a@example.com' }]);
+  detach(browser, 1, 'target_closed');
+  await sleep(600);
+  answer();
+  await sleep(50);
+  assert.deepEqual(again, [], 'not attached again');
+  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }]);
+});
+
 test('closing: the user closing a tab is a takeover with no resume; our own closes, the page closing itself, swaps and popups given back to the user are not', async () => {
   const browser = await fakeBrowser({ ids: [1, 2, 3, 4, 5] });
   const removed = (tabId, info = {}) => browser.host.emit('event', 'chrome.tabs.onRemoved', [tabId, { windowId: 1, isWindowClosing: false, ...info }]);
@@ -632,4 +700,43 @@ test('a popup announced but not yet controlled that closes (Chrome closing it fo
   const result = await toolsFor(browser)('console', { tab: `${browser.key}:1` });
   assert.equal(result.error, false, result.text);
   assert.doesNotMatch(result.text, /took over/);
+});
+
+test('a turn that ends while a tab is attached again after a link for another app waits for it, and closes it as its work tab', async () => {
+  const page = 'https://shop.example/checkout';
+  const browser = await fakeBrowser({ ids: [1], listed: () => [{ ...agentTab(1), url: page }, agentTab(2)] });
+  // The detach closes the tab's Playwright page (it leaves the mapped tabs); attached again, a new Tab is mapped a moment later.
+  browser.relay.model.reattach = async (tabId) => {
+    await sleep(50);
+    setTimeout(() => browser.tabs.set(tabId, new Tab(browser, tabId, fakePage(page))), 50);
+  };
+  browser.waitForTab = async (id) => { while (!browser.tabs.has(id)) await sleep(10); return browser.tabs.get(id); };
+  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 1 }, 'Page.frameRequestedNavigation', { frameId: 'MAIN', reason: 'anchorClick', url: 'zoommtg://zoom.us/join?confno=1' }]);
+  detach(browser, 1, 'target_closed');
+  browser.tabs.delete(1);
+  await sleep(50);
+  // The next turn opens a tab while this one's end waits: never this turn's to close.
+  setTimeout(() => browser.tabs.set(2, new Tab(browser, 2, fakePage('https://next.example/'))), 20);
+  const result = await endTurn({ browsers: new Map([[browser.key, browser]]) });
+  assert.deepEqual(result.closed, [`${browser.key}:1`], JSON.stringify(result));
+  assert.ok(browser.requests.some(([m, p]) => m === 'chrome.tabs.remove' && p[0] === 1));
+  assert.ok(!browser.requests.some(([m, p]) => m === 'chrome.tabs.remove' && p[0] === 2), 'the next turn\'s tab stays');
+});
+
+test('a tab attached again after a link for another app keeps what its page logged and loaded before (the same page)', async () => {
+  const page = 'https://shop.example/checkout';
+  const browser = await fakeBrowser({ ids: [1], listed: () => [{ ...agentTab(1), url: page }] });
+  const old = browser.tabs.get(1);
+  old.console.push({ time: Date.now(), page: old.documentGeneration, level: 'error', text: 'Uncaught TypeError: cart is undefined' });
+  old.network.push({ time: Date.now(), page: old.documentGeneration, method: 'POST', url: 'https://shop.example/api/cart', status: 'failed', type: 'fetch', failure: 'net::ERR_FAILED' });
+  browser.relay.model.reattach = async (tabId) => { setTimeout(() => browser.tabs.set(tabId, new Tab(browser, tabId, fakePage(page))), 20); };
+  browser.waitForTab = async (id) => { while (browser.tabs.get(id) === old || !browser.tabs.has(id)) await sleep(10); return browser.tabs.get(id); };
+  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 1 }, 'Page.frameRequestedNavigation', { frameId: 'MAIN', reason: 'anchorClick', url: 'mailto:support@shop.example' }]);
+  detach(browser, 1, 'target_closed');
+  browser.tabs.delete(1);
+  await sleep(500);
+  assert.notEqual(browser.tabs.get(1), old, 'attached again');
+  const call = toolsFor(browser);
+  assert.match((await call('console', { tab: `${browser.key}:1` })).text, /\[error\] Uncaught TypeError: cart is undefined/);
+  assert.match((await call('network', { tab: `${browser.key}:1` })).text, /POST failed net::ERR_FAILED fetch https:\/\/shop\.example\/api\/cart/);
 });

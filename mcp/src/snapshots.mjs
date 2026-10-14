@@ -1,7 +1,10 @@
 // Pure text helpers for what agents read: size caps, ref numbering, changes-only snapshots, page text, evaluate source, URL patterns.
 
 export const SNAPSHOT_MAX_CHARS = 12_000; // default cap of every snapshot an agent receives
-export const SNAPSHOT_MAX_CHARS_LIMIT = 100_000;
+// Claude Code takes an MCP result of up to 50,000 characters without counting it (it estimates characters / 4) and counts
+// a larger one against 25,000 tokens, which a snapshot (under 2.4 characters per token) passes at about 58,000: so the
+// largest snapshot, with its header lines, stays under 50,000.
+export const SNAPSHOT_MAX_CHARS_LIMIT = 40_000;
 const DIFF_SHARE = 0.6; // a changes-only result larger than this share of the full snapshot is replaced by the full one
 const REMOVED_SHOWN = 40;
 
@@ -189,4 +192,36 @@ export function urlMatcher(pattern) {
   if (!pattern.includes('*')) return (url) => url.includes(pattern);
   const regex = new RegExp(`^${pattern.split('*').map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`);
   return (url) => regex.test(url);
+}
+
+// The lines of a snapshot that contain `query` (any case), each with the lines it sits in (its ancestors, for
+// context) and what it holds (up to `subtree` lines below it), in snapshot order; "# …" marks lines left out.
+// { text, matches }. For finding a control on a big page without reading all of it (snapshot find).
+export function findInSnapshot(text, query, { subtree = 12 } = {}) {
+  const lines = text.split('\n');
+  const indent = (line) => line.length - line.trimStart().length;
+  const q = query.toLowerCase();
+  const keep = new Set();
+  let matches = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].toLowerCase().includes(q)) continue;
+    matches++;
+    keep.add(i);
+    for (let j = i - 1, level = indent(lines[i]); j >= 0 && level > 0; j--) {
+      if (lines[j].trim() && indent(lines[j]) < level) {
+        keep.add(j);
+        level = indent(lines[j]);
+      }
+    }
+    for (let j = i + 1, n = 0; j < lines.length && indent(lines[j]) > indent(lines[i]) && n < subtree; j++, n++) keep.add(j);
+  }
+  const out = [];
+  let last = -1;
+  for (const i of [...keep].sort((a, b) => a - b)) {
+    if (i > last + 1) out.push(`${' '.repeat(indent(lines[i]))}# …`);
+    out.push(lines[i]);
+    last = i;
+  }
+  if (out.length && last < lines.length - 1) out.push('# …');
+  return { text: out.join('\n'), matches };
 }

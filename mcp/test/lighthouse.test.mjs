@@ -332,3 +332,35 @@ test('a stream read that ends after the run closed: completion with no events, I
   assert.deepEqual(seen, [], 'no events for a run that ended');
   assert.deepEqual(tab.browser.host.calls.map((c) => c.method), ['IO.read', 'IO.close']);
 });
+
+test('lighthouse with a page dialog open says so at once instead of auditing a page that answers nothing', async () => {
+  const { EventEmitter: Emitter } = await import('node:events');
+  const { Tab } = await import('../src/browsers.mjs');
+  const { registerTools } = await import('../src/tools.mjs');
+  const page = Object.assign(new Emitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, isClosed: () => false,
+  });
+  const sent = [];
+  const host = {
+    async request(method, params) {
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'App' } };
+      if (method === 'tabs.info') return { id: 12, owner: 'you', origin: 'agent' };
+      sent.push(params?.[1] ?? method);
+      return new Promise(() => {}); // the page under an alert answers nothing
+    },
+  };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  const tab = new Tab(browser, 12, page);
+  browser.tabs.set(12, tab);
+  tab.dialog = { type: () => 'alert', message: () => 'Session expiring', defaultValue: () => '' };
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  for (const mode of ['snapshot', 'navigation']) {
+    const result = await Promise.race([tools.lighthouse({ tab: tab.id, mode }), new Promise((r) => setTimeout(() => r('still waiting'), 1000))]);
+    assert.notEqual(result, 'still waiting', mode);
+    assert.equal(result.isError, true, mode);
+    assert.match(result.content[0].text, /A dialog is open on this tab; resolve it with the dialog tool first\./, mode);
+  }
+  assert.deepEqual(sent, []);
+});

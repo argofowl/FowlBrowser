@@ -54,8 +54,21 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
   brown `#ac8e68`, so parallel sessions are told apart. White rim 1.7 px, an ink hairline (`#131110`, 30%) at the
   edge, and a soft drop shadow (0 1px 1.2px, 32% black).
 - Label: a flat pill in the same colour, 17 px tall, 10.5 px semibold system font, white text (ink on light fills,
-  relative luminance over 0.4), a 1.5 px white ring and a small shadow; 16 px right of and 24 px below the tip, kept
-  inside the viewport. Max 200 px with ellipsis.
+  relative luminance over 0.4), a 1.5 px white ring and a small shadow; 16 px right of and 24 px below the tip. Where
+  that doesn't fit, beside the arrow at the tip's height (right, else left; for a turned arrow, the side away from its
+  body), always inside the viewport; moving to another side it glides there (180 ms). Max 200 px with ellipsis.
+- Size on screen: the same at any browser zoom. The server reads the site's zoom (`Page.getLayoutMetrics`
+  `cssVisualViewport.zoom`, at most every 2 s per tab, alongside the target lookup) and passes it with each move and
+  cue (a cue's end waits for its cue); on an
+  unpinched page the overlay draws by its inverse (at 80% the cursor is 1.25 times as many CSS px). A pinched or
+  zoomed-out mobile page is drawn by its page scale instead, as before.
+- Edges: the arrow's body runs down and to the right of its tip (about 16 x 22 px with rim and shadow). Where the window's
+  bottom or right edge would cut it off (a chat box at the foot of a page, a button in a corner), it rests turned around
+  its tip, the first that fits of a quarter turn left (body up and right), a quarter turn right (body down and left) and
+  a half turn, so all of it shows and it still points at the target. It turns as it travels into such a spot (with the
+  lean's smoothing) and when a resize changes what fits (a window made narrower than where it rests brings it back
+  inside, 2 px from the edge); with reduced motion it is set at once. A jump (a click far from where it was) takes the
+  label along at once, at its new width, without a glide.
 - Action words: what the agent is doing takes the name's place in the pill ("Claude" becomes "Typing", then "Claude"
   again): Reading, Scrolling, Typing, Dragging and Uploading stay while the action runs (at least 0.6 s); Pressing keys
   and Loading show for 1.2 s. An action word is drawn at 80% (ink 65%) with a light sweeping over it once as it
@@ -109,7 +122,8 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
 - Then one land call (overlay `land`, capped at 150 ms): the page's main thread runs it before it handles the
   action's input events, so the tip and the action paint together.
 - Target box of a main-frame ref: one page-side evaluate on the locator (Chromium's `scrollIntoViewIfNeeded`, the
-  alignment the action's own scroll uses, then `getBoundingClientRect`). Iframe refs use Playwright's scroll and
+  alignment the action's own scroll uses, then `getBoundingClientRect`), allowed as long as the action (a page whose
+  thread stalls past the budget holds the action up too: its target lands late, and the click shows there). Iframe refs use Playwright's scroll and
   `boundingBox` (frame offsets); closed-shadow (s) refs the debugger's box model.
 - Late target: a lookup that ends after the budget while the action is still running lands the cursor there at once
   (appears at the target, no travel). Record mode: the point line keeps the state from before the action, plus

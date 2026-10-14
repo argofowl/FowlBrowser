@@ -24,6 +24,10 @@ const BLOCKED_CDP = [
 ];
 const CHILD_ONLY_CDP = /^Target\.attachToTarget$/;
 const isBlockedCommand = (method) => BLOCKED_CDP.some((rule) => rule.test(String(method)));
+// Commands that wait on the page (a promise it settles, a navigation's response) take as long as their caller allows
+// (evaluate's timeout_ms, a navigation's timeout; Playwright reads any error of an evaluation as "Execution context was
+// destroyed", so a cut here reads as a navigation that never happened): only the host's 120 s limit is theirs.
+const waitsOnPage = (method, params) => method === 'Page.navigate' || (/^Runtime\.(evaluate|callFunctionOn)$/.test(method) && params?.awaitPromise === true);
 const EXPECT_CHILD_MAX_MS = 5000;     // also how long the user's turn of a tab lasts (a page's transient activation)
 const LAST_OWNED_MS = 5000; // how long a closed owned tab can still open the popup it asked for (tabs.openChild)
 const CLEANUP_RETRY_MS = [200, 1000];
@@ -142,12 +146,16 @@ export function createCore({ chrome, send, timers = globalThis }) {
     if (!owner.releasing) emit(owner.client, method, params);
   }
 
+  // Errors agents read (the MCP server puts the browser before the id): what happened, and what to do.
   function requireOwner(client, tabId) {
     const owner = owners.get(tabId);
-    if (!owner || owner.client !== client) throw new Error(`Tab ${tabId} is not owned by this client`);
+    if (owner && owner.client !== client) throw ownedByOther(tabId);
+    if (!owner) throw new Error(`Tab ${tabId} is not controlled by this session (released or closed since, or never opened or claimed by it)`);
     if (owner.releasing) throw new Error(`Tab ${tabId} is being released`);
     return owner;
   }
+
+  const ownedByOther = (tabId) => new Error(`Tab ${tabId} is controlled by another agent session: leave it alone (to work on the same page, open its URL in a tab of your own)`);
 
   // Claim, release and close of one tab run one at a time.
   function serialize(tabId, fn) {
@@ -203,9 +211,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
   }
 
   // Anything failing after the tab exists closes it again: the client never has an open tab it wasn't told about.
-  // A tab `forUser` is the user's from the start (handed over: not grouped, discardable, kept), though the client still
-  // drives it until it disconnects. It stays muted while driven (focus emulation lets background pages autoplay) and
-  // is unmuted when control ends, unless the agent set its mute itself or the user changed it meanwhile.
+  // A tab `forUser` is the user's from the start (handed over: out of the client's group, discardable, kept), though the
+  // client still drives it until it disconnects. It stays muted while driven (focus emulation lets background pages
+  // autoplay) and is unmuted when control ends, unless the agent set its mute itself or the user changed it meanwhile.
+  // Several given to the user at once share a group of their own (groupForUser).
   async function openTab({ client, live }, { url = 'about:blank', group, muted = true, forUser = false } = {}) {
     if (isLocalFile(url)) throw new Error(`${url} can't be opened: local files and view-source: pages are never opened`);
     const label = group || labelFor(client);
@@ -225,6 +234,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         await persist();
         if (forUser) {
           await chrome.tabs.update(tab.id, { muted: true });
+          await groupForUser(client, tab.id);
           return await chrome.tabs.get(tab.id);
         }
         await chrome.tabs.update(tab.id, { muted, autoDiscardable: false });
@@ -257,7 +267,93 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function closeAgentTab(tabId, owner) {
     await ungroup(tabId);
     if (owner?.givenBack) return; // the user's own popup after all (giveBack): theirs, never closed
-    await chrome.tabs.remove(tabId);
+    await removeTab(tabId);
+  }
+
+  // A browser whose last window closes keeps running but unloads the profile, and this extension and its host with it,
+  // until the user opens a window again: agents lose the browser. So a tab this extension closes never takes the last
+  // window with it: a New Tab page stays in its place (in the background, as the window's only tab it shows once the
+  // closed one is gone). Decided one tab at a time, counting the tabs closing meanwhile (a turn end closes them at once,
+  // also an agent tab and its popup's window).
+  const leaving = new Set();
+  let lastWindowCheck = Promise.resolve();
+  async function removeTab(tabId) {
+    const decided = lastWindowCheck.then(async () => {
+      leaving.add(tabId);
+      const { windowId } = await chrome.tabs.get(tabId);
+      // A DevTools window keeps nothing: it closes with the tab it inspects (an undocked one of this very tab too).
+      const windows = await chrome.windows.getAll({ populate: true, windowTypes: ['normal', 'popup', 'app'] });
+      const stays = (w) => (w.tabs ?? []).some((t) => !leaving.has(t.id));
+      if (!windows.some(stays)) await chrome.tabs.create({ windowId, active: false });
+    });
+    lastWindowCheck = decided.catch(() => {});
+    try {
+      await decided;
+      await showUsersPrevious(tabId);
+      await chrome.tabs.remove(tabId);
+    } finally {
+      leaving.delete(tabId);
+    }
+  }
+
+  // Closing the tab the user has in front: the browser would show the tab next to it, which may be another agent's work
+  // tab. The tab they had in front before comes back instead, when it is theirs (or one given to them) and still in
+  // that window; otherwise the browser picks as usual. Best effort.
+  async function showUsersPrevious(tabId) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab?.active) return;
+    const previous = activeByWindow.get(tab.windowId)?.previous;
+    const theirs = () => {
+      const owner = owners.get(previous);
+      return previous !== undefined && previous !== tabId && !leaving.has(previous) && !(owner?.origin === 'agent' && !owner.handedOver);
+    };
+    if (!theirs()) return;
+    const before = await chrome.tabs.get(previous).catch(() => null);
+    // Asked again: the user may have picked another tab meanwhile (it stays), or an agent's session taken that one.
+    if (before?.windowId === tab.windowId && activeByWindow.get(tab.windowId)?.current === tabId && theirs()) {
+      await chrome.tabs.update(previous, { active: true }).catch(() => {});
+    }
+  }
+
+  // Tabs a client gives the user while it controls them (forUser, tabs.keep; so each turn of an agent starts afresh)
+  // share a tab group once there are two or more, say one per prototype; a lone one stays ungrouped like the user's own
+  // tabs. Titled like the client's group (the tab_open group, else its label). The group is the user's: it stays when
+  // the client lets the tabs go. Only tabs in the same window join, never one the user moved out of the group or into
+  // another. One client at a time, so tabs opened at once make one group. Best effort: the tab is the user's either way.
+  async function groupForUser(client, tabId) {
+    await serialize(`given:${client}`, async () => {
+      const owner = owners.get(tabId);
+      // Still this client's tab given to the user, under the same title: asked again right before grouping, since a
+      // release, claim, park or disconnect can come while tabs are looked up.
+      const given = (id, record) => owners.get(id) === record && record.client === client && record.origin === 'agent'
+        && record.handedOver && !record.parked && !record.releasing && record.group === owner.group;
+      // chrome.tabs.group takes a tab's Split View partner along (the user's own tab, maybe) and unpins a pinned tab, so
+      // a split or pinned tab never joins.
+      const split = (t) => (t.splitViewId ?? -1) !== -1 || !!t.pinned;
+      if (!owner || !given(tabId, owner) || owner.givenGroup !== undefined) return; // grouped once already: the user's call since
+      const { windowId } = await chrome.tabs.get(tabId);
+      // One read of the window, then nothing awaited until the group call: the user may group, split or move tabs meanwhile.
+      const inWindow = new Map((await chrome.tabs.query({ windowId })).map((t) => [t.id, t]));
+      const tab = inWindow.get(tabId);
+      if (!tab || tab.groupId !== -1 || split(tab) || !given(tabId, owner)) return;
+      const peers = [...owners].filter(([id, other]) => id !== tabId && inWindow.has(id) && given(id, other)).map(([id, other]) => {
+        const t = inWindow.get(id);
+        return (other.givenGroup === undefined ? t.groupId === -1 && !split(t) : t.groupId === other.givenGroup) ? t : null;
+      }).filter(Boolean);
+      if (!peers.length) return;
+      const existing = peers.find((t) => t.groupId !== -1)?.groupId;
+      const tabIds = [tabId, ...peers.filter((t) => t.groupId === -1).map((t) => t.id)];
+      const members = tabIds.map((id) => owners.get(id));
+      const groupId = existing === undefined
+        ? await chrome.tabs.group({ tabIds, createProperties: { windowId } })
+        : await chrome.tabs.group({ groupId: existing, tabIds });
+      for (const member of members) member.givenGroup = groupId;
+      await persist();
+      if (existing === undefined) {
+        await chrome.tabGroups.update(groupId, { title: owner.group, color: colorFor(owner.group), collapsed: false })
+          .catch((e) => log('group for user: title failed', groupId, e.message));
+      }
+    }).catch((e) => log('group for user failed', tabId, e.message));
   }
 
   // An agent tab the user gets to keep (kept or released) leaves its group and behaves like their own tabs again.
@@ -284,7 +380,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // them and never closes it. What it was is remembered for unpark. The client hears a detach with reason "parked".
   async function park(tabId, owner, kind) {
     const tab = await chrome.tabs.get(tabId);
-    const grouped = owner.origin === 'agent' && tab.groupId !== -1; // a claimed tab's group is the user's own
+    const grouped = owner.origin === 'agent' && !owner.handedOver && tab.groupId !== -1; // a claimed or handed-over tab's group is the user's own
     owner.parked = { kind, at: Date.now(), grouped, groupId: tab.groupId, folded: grouped && await groupFolded(tab), muted: ownMute(tab), agentMuted: !!owner.agentMuted, kept: !!owner.kept, handedOver: !!owner.handedOver };
     owner.detached = true;
     owner.kept = owner.handedOver = true;
@@ -451,12 +547,16 @@ export function createCore({ chrome, send, timers = globalThis }) {
     // A parked tab is the user's for now: it closes only with usersTab (they asked for it: tab_close confirm_close_users_tab).
     async 'chrome.tabs.remove'([tabIds, { usersTab = false } = {}], { client }) {
       const ids = [tabIds].flat();
-      for (const id of ids) requireOwner(client, id);
+      for (const id of ids) {
+        // A tab that is gone (an agent tab closed at the end of an earlier turn, the user closed it): say so.
+        if (!owners.has(id) && !(await chrome.tabs.get(id).then(() => true, () => false))) throw new Error(`Tab ${id} is closed already`);
+        requireOwner(client, id);
+      }
       await Promise.all(ids.map((id) => serialize(id, async () => {
         const owner = requireOwner(client, id);
         if (owner.parked && !usersTab) throw new Error(`Tab ${id} is the user's for now (parked), so it was not closed`);
         if (owner.origin === 'agent') await closeAgentTab(id, owner);
-        else await chrome.tabs.remove(id);
+        else await removeTab(id);
       })));
     },
 
@@ -465,7 +565,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
       return tracked(() => serialize(tabId, async () => {
         const owner = owners.get(tabId);
         if (owner?.releasing) throw new Error(`Tab ${tabId} is being released`);
-        if (owner && owner.client !== client) throw new Error(`Tab ${tabId} is owned by another client`);
+        if (owner && owner.client !== client) throw ownedByOther(tabId);
         let tab = await chrome.tabs.get(tabId);
         if (tab.incognito) throw new Error(`Tab ${tabId} is in an incognito window, which is left alone`);
         if (owner) {
@@ -479,7 +579,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         const url = tab.pendingUrl || tab.url || '';
         if (isNewTabPage(url)) tab = await navigateBlank(tabId);
         else if (isRestricted(url)) throw new Error(`Tab ${tabId} shows ${url}, which can't be controlled`);
-        if (owners.has(tabId)) throw new Error(`Tab ${tabId} is owned by another client`);
+        if (owners.has(tabId)) throw ownedByOther(tabId);
         if (!live()) throw new Error('Client disconnected');
         owners.set(tabId, { client, origin: 'user', group: null, kept: false });
         await persist();
@@ -536,7 +636,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
       };
       const asked = ownership();
       const [owner] = asked;
-      if (!owner || owner.client !== client) throw new Error(`Tab ${tabId} is not owned by this client`);
+      if (owner?.client !== client) requireOwner(client, tabId); // throws: another session's, or nobody's
       if (!passesOn(owner, tabId)) throw new Error(`Tab ${tabId} passes no children on`);
       const unchanged = () => live() && ownership().every((value, i) => value === asked[i]);
       return tracked(async () => {
@@ -560,8 +660,9 @@ export function createCore({ chrome, send, timers = globalThis }) {
       });
     },
 
-    // Hands an agent tab to the user now (ungrouped, discardable); the client drives it until it disconnects. Muted by
-    // us, it stays muted till then like a forUser tab (focus emulation lets a driven background page autoplay).
+    // Hands an agent tab to the user now (out of the client's group, discardable; groupForUser); the client drives it
+    // until it disconnects. Muted by us, it stays muted till then like a forUser tab (focus emulation lets a driven
+    // background page autoplay).
     async 'tabs.keep'({ tabId }, { client }) {
       return serialize(tabId, async () => {
         const owner = requireOwner(client, tabId);
@@ -575,6 +676,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
           } else await handOver(tabId);
           owner.handedOver = true;
           await persist();
+          await groupForUser(client, tabId);
         }
         return { ok: true };
       });
@@ -596,12 +698,12 @@ export function createCore({ chrome, send, timers = globalThis }) {
     async 'tabs.closeUnowned'({ tabId }, { client }) {
       return serialize(tabId, async () => {
         const owner = owners.get(tabId);
-        if (owner) throw new Error(owner.client === client ? `Tab ${tabId} is controlled by this client; close it with chrome.tabs.remove` : `Tab ${tabId} is owned by another client`);
+        if (owner) throw new Error(owner.client === client ? `Tab ${tabId} is controlled by this client; close it with chrome.tabs.remove` : ownedByOther(tabId).message);
         closing.add(tabId); // a popup adoption racing this close must not hand the tab to anyone
         try {
           if ((await chrome.tabs.get(tabId)).incognito) throw new Error(`Tab ${tabId} is in an incognito window`);
-          if (owners.has(tabId)) throw new Error(`Tab ${tabId} is owned by another client`);
-          await chrome.tabs.remove(tabId);
+          if (owners.has(tabId)) throw ownedByOther(tabId);
+          await removeTab(tabId);
         } finally {
           closing.delete(tabId);
         }
@@ -709,6 +811,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         throw new Error(`${method} to ${params.url} is blocked: local files and view-source: pages can't be opened`);
       }
       if (String(method).startsWith('Input.')) agentInputAt.set(target.tabId, Date.now()); // the agent's input (usersTurn)
+      if (waitsOnPage(method, params)) return chrome.debugger.sendCommand(target, method, params);
       let timer;
       const timeout = new Promise((_, reject) => {
         timer = timers.setTimeout(() => reject(new Error(`${method} timed out after 30 s`)), COMMAND_TIMEOUT_MS);

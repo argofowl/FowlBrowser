@@ -372,5 +372,5 @@ process.on('uncaughtException', (error) => { log('uncaught', error.stack); shutd
 listening = await listen();
 listening.ino = fs.statSync(listening.socketPath).ino;
 // The extension's popup shows this: the host is installed and agents reach this browser as <socket name>.
-sendToExtension({ method: 'host.listening', params: { browser, key: path.basename(listening.socketPath, '.sock') } });
+sendToExtension({ method: 'host.listening', params: { browser, key: path.basename(listening.socketPath, '.sock'), silentDebugger } });
 log('listening', listening.socketPath, 'browser', browser, browserPath, 'pid', browserPid, 'silent', silentDebugger);

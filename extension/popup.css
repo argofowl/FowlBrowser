@@ -213,3 +213,12 @@ details[open] summary { margin-bottom: 10px; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* The debugging bar note: shown only while this browser runs without --silent-debugger-extension-api. */
+.bar {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.bar .hint { margin: 0 0 8px; }
+.bar .word { white-space: nowrap; }

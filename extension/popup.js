@@ -2,6 +2,8 @@
 import { AGENTS } from './setup-prompts.js';
 
 const NAMES = { chrome: 'Chrome', helium: 'Helium', chromium: 'Chromium', brave: 'Brave', edge: 'Edge' };
+// The app to reopen without the debugging bar (`open -a`), by browser.
+const APPS = { chrome: 'Google Chrome', helium: 'Helium', chromium: 'Chromium', brave: 'Brave Browser', edge: 'Microsoft Edge', vivaldi: 'Vivaldi' };
 const SAVE_DELAY_MS = 300;
 const COPIED_MS = 1500;
 
@@ -40,7 +42,25 @@ function render() {
   }
   $('prompt-text').textContent = AGENTS[agent].prompt;
   $('prompt-hint').textContent = AGENTS[agent].hint;
+  // Started without the flag (a Dock launch or an update relaunch drops it): the browser shows its debugging bar while
+  // an agent works, and Cancel there takes the tab from the agent. Said only when the helper knows (newer hosts).
+  const app = APPS[status.browser];
+  $('bar').hidden = !(status.state === 'connected' && status.silentDebugger === false && app);
+  if (app) {
+    const name = NAMES[status.browser] ?? app;
+    $('bar-text').textContent = `While an agent works, ${name} shows a “started debugging this browser” bar, and Cancel there stops the agent. ` +
+      `To hide it, quit ${name} (⌘Q), then run this in Terminal (your tabs come back):`;
+    // Lines break between words only, never inside a flag or the quoted app name.
+    $('bar-command-text').replaceChildren(...barCommand(app).match(/"[^"]*"|\S+/g).flatMap((word, i) => {
+      const span = document.createElement('span');
+      span.className = 'word';
+      span.textContent = word;
+      return i ? [' ', span] : [span];
+    }));
+  }
 }
+
+const barCommand = (app) => `open -a "${app}" --args --silent-debugger-extension-api --restore-last-session`;
 
 let saveTimer = null;
 function saveLabel() {
@@ -77,19 +97,26 @@ $('setup').querySelector('.agents').addEventListener('keydown', (event) => {
   next.click();
 });
 
-let copiedTimer = null;
-promptEl.addEventListener('click', async () => {
-  try {
-    await navigator.clipboard.writeText(AGENTS[agent].prompt);
-  } catch {
-    $('prompt-hint').textContent = 'Could not copy. Select the text and press ⌘C.';
-    return;
-  }
-  promptEl.classList.add('copied');
-  $('prompt-hint').textContent = 'Copied.';
-  clearTimeout(copiedTimer);
-  copiedTimer = setTimeout(() => { promptEl.classList.remove('copied'); render(); }, COPIED_MS);
-});
+// A copy button: its text to the clipboard and a check mark for a moment, plus "Copied." in its hint when it has one.
+// The debugging-bar note's has none: its paragraph would shrink to that one word and the popup jump up and back.
+function copies(button, text, hint) {
+  let timer = null;
+  button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(text());
+    } catch {
+      if (hint) hint.textContent = 'Could not copy. Select the text and press ⌘C.';
+      return;
+    }
+    button.classList.add('copied');
+    const before = hint?.textContent;
+    if (hint) hint.textContent = 'Copied.';
+    clearTimeout(timer);
+    timer = setTimeout(() => { button.classList.remove('copied'); if (hint) hint.textContent = before; render(); }, COPIED_MS);
+  });
+}
+copies(promptEl, () => AGENTS[agent].prompt, $('prompt-hint'));
+copies($('bar-command'), () => barCommand(APPS[status.browser]));
 
 async function refreshStatus() {
   const next = await chrome.runtime.sendMessage({ type: 'status' }).catch(() => null);

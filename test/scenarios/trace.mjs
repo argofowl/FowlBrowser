@@ -12,8 +12,9 @@ export default {
     const load = (await t.call('trace_start', { tab, reload: true, seconds: 2 }, 120_000)).text;
     const sets = load.split('\n').filter((l) => /^(\w+_\d+|NO_NAVIGATION|Trace|LCP):/.test(l)).join(' | ');
     t.ok(/^NAVIGATION_0: /m.test(load), `insight set: ${sets}`);
-    t.ok(/^LCP: \d[\d,]* ms \(TTFB \d+ ms · .*render delay \d+ ms\)/m.test(load), `LCP with subparts: ${load}`);
-    t.ok(/^Long tasks: [1-9]\d* over 50 ms, longest \d+ ms/m.test(load), `long task: ${load}`);
+    // Numbers are printed with thousands separators: a background tab's render delay often passes 1,000 ms.
+    t.ok(/^LCP: \d[\d,]* ms \(TTFB [\d,]+ ms · .*render delay [\d,]+ ms\)/m.test(load), `LCP with subparts: ${load}`);
+    t.ok(/^Long tasks: [1-9][\d,]* over 50 ms, longest [\d,]+ ms/m.test(load), `long task: ${load}`);
     t.ok(/^- RenderBlocking \(/m.test(load), `RenderBlocking among the insights: ${load}`);
     t.ok(/^INP: n\/a \(no interactions\)/m.test(load), `no INP without interactions: ${load}`);
     const file = /^File: (\S+\.json\.gz)/m.exec(load)?.[1];
@@ -22,7 +23,7 @@ export default {
 
     t.step('trace_insight');
     const lcp = (await t.call('trace_insight', { tab, name: 'LCPBreakdown' })).text;
-    t.ok(/- TTFB: \d+ ms/.test(lcp) && /- render delay: \d+ ms/.test(lcp), `LCP subparts: ${lcp}`);
+    t.ok(/- TTFB: [\d,]+ ms/.test(lcp) && /- render delay: [\d,]+ ms/.test(lcp), `LCP subparts: ${lcp}`);
     const wrong = await t.call('trace_insight', { tab, name: 'NoSuchInsight' }).then(() => null, (e) => e.message);
     t.ok(/No insight "NoSuchInsight"\. Insights of the last trace: .*RenderBlocking/.test(wrong ?? ''), `unknown name lists names: ${wrong}`);
 
@@ -33,7 +34,7 @@ export default {
     await t.call('click', { tab, ref: await t.refOf(tab, 'button', 'Slow click'), snapshot: false, timeout_ms: 10_000 });
     t.eq(await t.eval(tab, `() => document.querySelector('#status').textContent`), 'slow:clicked', 'slow click ran while recording');
     const stopped = (await t.call('trace_stop', { tab }, 120_000)).text;
-    const inp = /^INP: (\d+) ms/m.exec(stopped)?.[1];
+    const inp = /^INP: ([\d,]+) ms/m.exec(stopped)?.[1]?.replace(/,/g, '');
     t.ok(inp && Number(inp) >= 150 && Number(inp) < 1000, `INP around 200 ms: ${stopped.split('\n').filter((l) => /^(INP|Trace|Long tasks):/.test(l)).join(' | ')}`);
 
     t.step('trace_stop without a recording');

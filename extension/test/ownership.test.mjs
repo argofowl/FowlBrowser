@@ -35,9 +35,12 @@ function fakeChrome({ session = {}, local = {} } = {}) {
     runtime: { id: 'fowlbrowser-ext', getManifest: () => ({ version: '0.1.0' }), reload: () => calls.push(['reload']) },
     windows: {
       async getLastFocused() { return { id: 1, type: 'normal', incognito: false }; },
-      async getAll({ windowTypes } = {}) {
-        const ids = new Set([1, ...[...tabs.values()].map((t) => t.windowId)]);
-        return [...ids].map((id) => ({ id, type: 'normal', incognito: false, ...hooks.windows?.[id] }))
+      // Window 1, those of the tabs, and another window of the user's (holding a tab of theirs) unless the test says the
+      // browser has one window.
+      async getAll({ windowTypes, populate } = {}) {
+        const ids = new Set([1, ...[...tabs.values()].map((t) => t.windowId), ...(hooks.oneWindow ? [] : [99])]);
+        return [...ids].map((id) => ({ id, type: 'normal', incognito: false, ...hooks.windows?.[id],
+          ...(populate && { tabs: id === 99 ? [{ id: 0, windowId: 99 }] : structuredClone([...tabs.values()].filter((t) => t.windowId === id)) }) }))
           .filter((w) => !windowTypes || windowTypes.includes(w.type));
       },
       async get(id) { return { id, type: 'normal', state: 'normal', incognito: false, ...hooks.windows?.[id] }; },
@@ -45,8 +48,12 @@ function fakeChrome({ session = {}, local = {} } = {}) {
       async update(id, props) { calls.push(['windows.update', id, props]); },
     },
     tabs: {
-      async query(q) { return [...tabs.values()].filter((t) => (!q.active || t.active) && (q.groupId === undefined || t.groupId === q.groupId)); },
-      async get(id) { await wait('tabs.get'); return structuredClone(getTab(id)); },
+      async query(q) {
+        await hooks.query?.(q);
+        return [...tabs.values()].filter((t) => (!q.active || t.active) && (q.groupId === undefined || t.groupId === q.groupId)
+          && (q.windowId === undefined || t.windowId === q.windowId));
+      },
+      async get(id) { await wait('tabs.get'); await hooks.get?.(id); return structuredClone(getTab(id)); },
       async create(props) {
         calls.push(['tabs.create', props]);
         await wait('tabs.create');
@@ -57,6 +64,7 @@ function fakeChrome({ session = {}, local = {} } = {}) {
       },
       async update(id, props) {
         calls.push(['tabs.update', id, props]);
+        await hooks.update?.(id, props);
         const tab = getTab(id);
         if ('muted' in props) tab.mutedInfo = { muted: props.muted, reason: 'extension', extensionId: chrome.runtime.id };
         if ('url' in props) tab.url = props.url;
@@ -79,7 +87,10 @@ function fakeChrome({ session = {}, local = {} } = {}) {
         if (groupId !== undefined && !groupsById.has(groupId)) throw new Error(`No group with id: ${groupId}.`);
         const id = groupId ?? nextGroupId++;
         if (groupId === undefined) groupsById.set(id, { id, title: '', collapsed: false });
-        for (const t of tabIds) getTab(t).groupId = id;
+        // Like Chrome: a tab in Split View takes its partner along.
+        const splits = new Set([tabIds].flat().map((t) => getTab(t).splitViewId).filter((v) => v !== undefined && v !== -1));
+        // Like Chrome too: a pinned tab is unpinned as it joins a group (TabStripModel: the states are mutually exclusive).
+        for (const t of [...[tabIds].flat(), ...[...tabs.values()].filter((t) => splits.has(t.splitViewId)).map((t) => t.id)]) Object.assign(getTab(t), { groupId: id, pinned: false });
         calls.push(['tabs.group', tabIds, id]);
         return id;
       },
@@ -94,7 +105,11 @@ function fakeChrome({ session = {}, local = {} } = {}) {
       },
     },
     tabGroups: {
-      async update(id, props) { calls.push(['tabGroups.update', id, props]); Object.assign(groupsById.get(id) ?? {}, props); },
+      async update(id, props) {
+        calls.push(['tabGroups.update', id, props]);
+        if (hooks.groupUpdateError) throw new Error(hooks.groupUpdateError);
+        Object.assign(groupsById.get(id) ?? {}, props);
+      },
       async get(id) { return structuredClone(groupsById.get(id)); },
       async query() { return structuredClone([...groupsById.values()]); },
     },
@@ -163,15 +178,48 @@ test('only the owner may drive a tab', async () => {
   const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
 
   assert.equal((await call(2, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error.message,
-    `Tab ${tab.id} is not owned by this client`);
+    `Tab ${tab.id} is controlled by another agent session: leave it alone (to work on the same page, open its URL in a tab of your own)`);
   assert.ok((await call(2, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.reload'])).error);
   assert.ok((await call(2, 'chrome.tabs.remove', [tab.id])).error);
   assert.ok((await call(2, 'tabs.release', { tabId: tab.id })).error);
-  assert.match((await call(2, 'tabs.claim', { tabId: tab.id })).error.message, /owned by another client/);
+  assert.match((await call(2, 'tabs.claim', { tabId: tab.id })).error.message, /controlled by another agent session/);
 
   assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
   assert.deepEqual((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.reload'])).result,
     { ok: 'Page.reload' });
+});
+
+// A real-use evaluate with a 1.5 s pause per click failed at 30.1 s with Playwright's "Execution context was destroyed,
+// most likely because of a navigation" (its reading of any protocol error of an evaluation): the page never navigated.
+test('CDP commands time out after 30 s, except those waiting on the page (an evaluation\'s promise, a navigation)', async () => {
+  const timers = manualTimers();
+  const { chrome, call, start } = setup({ timers });
+  const { result: tab } = await call(1, 'tabs.open', {});
+  let settle;
+  chrome.debugger.sendCommand = (target, method) => new Promise((resolve) => { settle = () => resolve({ ok: method }); });
+  const plain = start(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'DOM.getDocument', { depth: -1 }]);
+  await tick();
+  await timers.fire(30_000);
+  await plain.done;
+  assert.equal(plain.reply().error.message, 'DOM.getDocument timed out after 30 s');
+  for (const [method, params] of [['Runtime.callFunctionOn', { functionDeclaration: '() => {}', awaitPromise: true }], ['Page.navigate', { url: 'https://slow.example/' }]]) {
+    const waiting = start(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, method, params]);
+    await tick();
+    assert.equal(timers.pending.size, 0, `${method}: no 30 s timer`);
+    settle();
+    await waiting.done;
+    assert.deepEqual(waiting.reply().result, { ok: method });
+  }
+});
+
+test('errors say what happened: a tab nobody controls, and closing one that is gone (an agent tab closed when an earlier turn ended)', async () => {
+  const { chrome, call, core } = setup();
+  const usersTab = chrome.addTab({ url: 'https://user.example' });
+  assert.equal((await call(1, 'tabs.keep', { tabId: usersTab.id })).error.message,
+    `Tab ${usersTab.id} is not controlled by this session (released or closed since, or never opened or claimed by it)`);
+  const { result: tab } = await call(1, 'tabs.open', {});
+  await core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } }); // the turn's cleanup closes it
+  assert.equal((await call(2, 'chrome.tabs.remove', [tab.id])).error.message, `Tab ${tab.id} is closed already`);
 });
 
 test('tabs.open makes a muted background tab in an expanded group and tells the client', async () => {
@@ -359,7 +407,7 @@ test('tabs.openChild: a closed opener\'s reservation lasts 5 s, for its client o
   const now = Date.now;
   Date.now = () => now() + 6000;
   try {
-    assert.match((await late.ask()).error?.message ?? '', /not owned/, 'expired on lookup, with no other close to prune it');
+    assert.match((await late.ask()).error?.message ?? '', /not controlled by this session/, 'expired on lookup, with no other close to prune it');
   } finally {
     Date.now = now;
   }
@@ -663,7 +711,7 @@ test('a debugger taken away by the user stays owned and re-attaches only on an e
   await core.onDebuggerDetach({ tabId: tab.id }, 'canceled_by_user');
   assert.equal(core.owners.get(tab.id).detached, true);
   assert.ok(!chrome.calls.some((c) => c[0] === 'debugger.attach'), 'never re-attaches on its own');
-  assert.match((await call(2, 'tabs.claim', { tabId: tab.id })).error.message, /owned by another client/);
+  assert.match((await call(2, 'tabs.claim', { tabId: tab.id })).error.message, /controlled by another agent session/);
   assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id })).error);
   assert.equal(createdEvents(), 2);
   // The re-attach fails (DevTools still open): the tab stays detached, so a later claim can retry.
@@ -841,6 +889,202 @@ test('tabs.open forUser makes a tab like their own that stays after the session'
   assert.equal(core.owners.has(tab.id), false);
 });
 
+test('tabs given to the user in one go share a group of their own; a lone one stays ungrouped', async () => {
+  const { core, chrome, call } = setup();
+  await call(1, 'client.hello', { label: 'Ad prototypes' });
+  const groupOf = (tab) => chrome.tabsById.get(tab.id).groupId;
+  const { result: home } = await call(1, 'tabs.open', { url: 'http://localhost:5263/?variant=A', forUser: true });
+  assert.equal(groupOf(home), -1, 'a lone tab for the user is ungrouped');
+  const { result: work } = await call(1, 'tabs.open', { url: 'http://localhost:5263/' });
+  const { result: term } = await call(1, 'tabs.open', { url: 'http://localhost:5263/term?variant=A', forUser: true });
+  const given = groupOf(home);
+  assert.notEqual(given, -1);
+  assert.equal(groupOf(term), given, 'the second joins the first in one group');
+  assert.equal(term.groupId, given, 'tabs.open answers with the tab as grouped');
+  assert.notEqual(groupOf(work), given, 'never the work group');
+  assert.deepEqual(chrome.groupsById.get(given), { id: given, title: 'Ad prototypes', color: colorFor('Ad prototypes'), collapsed: false });
+  const { result: third } = await call(1, 'tabs.open', { url: 'http://localhost:5263/?variant=B', forUser: true });
+  assert.equal(groupOf(third), given, 'later ones join it');
+
+  // The turn ends: the tabs and their group are the user's and stay.
+  for (const tab of [home, term, third]) assert.ok(!(await call(1, 'tabs.release', { tabId: tab.id })).error);
+  assert.deepEqual([home, term, third].map(groupOf), [given, given, given]);
+  assert.ok(chrome.groupsById.has(given));
+  assert.equal(core.owners.size, 1, 'only the work tab is still owned');
+
+  // The next turn's tabs make a group of their own.
+  const { result: next } = await call(1, 'tabs.open', { url: 'http://localhost:5263/?variant=C', forUser: true });
+  assert.equal(groupOf(next), -1);
+  const { result: nextTerm } = await call(1, 'tabs.open', { url: 'http://localhost:5263/term?variant=C', forUser: true });
+  assert.notEqual(groupOf(next), -1);
+  assert.notEqual(groupOf(next), given);
+  assert.equal(groupOf(nextTerm), groupOf(next));
+});
+
+test('tabs given to the user at the same moment make one group; each client and group title has its own', async () => {
+  const { chrome, call, start } = setup();
+  const gateGroup = gate(chrome, 'tabs.get');
+  const opens = [1, 2, 3].map((n) => start(1, 'tabs.open', { url: `https://example.com/${n}`, forUser: true }));
+  const other = start(2, 'tabs.open', { url: 'https://example.com/other', forUser: true });
+  gateGroup();
+  await Promise.all([...opens, other].map((o) => o.done));
+  const ids = opens.map((o) => o.reply().result.id);
+  const groups = new Set(ids.map((id) => chrome.tabsById.get(id).groupId));
+  assert.equal(groups.size, 1);
+  assert.ok(!groups.has(-1));
+  assert.equal(chrome.tabsById.get(other.reply().result.id).groupId, -1, "another client's lone tab is not theirs to group");
+  const { result: named } = await call(1, 'tabs.open', { url: 'https://example.com/named', forUser: true, group: 'Results' });
+  assert.equal(chrome.tabsById.get(named.id).groupId, -1, 'another title starts its own batch');
+});
+
+test('a tab the user moved out of the given group, or into one of theirs, is left there', async () => {
+  const { chrome, call } = setup();
+  const { result: a } = await call(1, 'tabs.open', { url: 'https://example.com/a', forUser: true });
+  const { result: b } = await call(1, 'tabs.open', { url: 'https://example.com/b', forUser: true });
+  const given = chrome.tabsById.get(a.id).groupId;
+  await chrome.tabs.ungroup(a.id); // the user drags it out
+  const { result: c } = await call(1, 'tabs.open', { url: 'https://example.com/c', forUser: true });
+  assert.deepEqual([a, b, c].map((t) => chrome.tabsById.get(t.id).groupId), [-1, given, given]);
+
+  const { result: d } = await call(2, 'tabs.open', { url: 'https://example.com/d', forUser: true });
+  const theirs = await chrome.tabs.group({ tabIds: [d.id] }); // the user puts it in a group of their own
+  const { result: e } = await call(2, 'tabs.open', { url: 'https://example.com/e', forUser: true });
+  assert.deepEqual([d, e].map((t) => chrome.tabsById.get(t.id).groupId), [theirs, -1]);
+});
+
+test('a tab the user took out of the given group while its own open was still under way stays out', { timeout: 5000 }, async () => {
+  const { chrome, call, start } = setup();
+  const { result: a } = await call(1, 'tabs.open', { url: 'https://example.com/a', forUser: true });
+  let resume;
+  const paused = new Promise((resolve) => { resume = resolve; });
+  chrome.hooks.update = async (id, props) => { if (id !== a.id && props.muted === true && chrome.hooks.update) { chrome.hooks.update = null; await paused; } };
+  const b = start(1, 'tabs.open', { url: 'https://example.com/b', forUser: true }); // stops at its mute
+  await tick();
+  const { result: c } = await call(1, 'tabs.open', { url: 'https://example.com/c', forUser: true });
+  const given = chrome.tabsById.get(a.id).groupId;
+  const bId = [...chrome.tabsById.keys()].find((id) => ![a.id, c.id].includes(id));
+  assert.equal(chrome.tabsById.get(bId).groupId, given, "c's grouping took the still-opening b along");
+  await chrome.tabs.ungroup(bId); // the user takes it out
+  resume();
+  await b.done;
+  assert.deepEqual([a.id, bId, c.id].map((id) => chrome.tabsById.get(id).groupId), [given, -1, given]);
+});
+
+// Pauses the next tab open's grouping at its first read after looking up its own tab (tabs.get of another tab, or
+// tabs.query): what the user and other clients do meanwhile must be respected.
+function pauseGrouping(chrome) {
+  let target, stage = 0, reached, resume;
+  const atRead = new Promise((resolve) => { reached = resolve; });
+  const paused = new Promise((resolve) => { resume = resolve; });
+  chrome.hooks.created = (tab) => { target ??= tab.id; };
+  const read = async (kind, arg) => {
+    if (stage === 0 && kind === 'get' && arg === target) stage = 1;
+    else if (stage === 1) { stage = 2; reached(); await paused; }
+  };
+  chrome.hooks.get = (id) => read('get', id);
+  chrome.hooks.query = (q) => read('query', q);
+  return { atRead, resume, target: () => target };
+}
+
+test('a tab released and claimed by another client while the group is being made is left out', { timeout: 5000 }, async () => {
+  const { chrome, core, call, start } = setup();
+  const { result: a } = await call(1, 'tabs.open', { url: 'https://example.com/a', forUser: true });
+  const pause = pauseGrouping(chrome);
+  const b = start(1, 'tabs.open', { url: 'https://example.com/b', forUser: true });
+  await pause.atRead;
+  assert.ok(!(await call(1, 'tabs.release', { tabId: a.id })).error);
+  assert.ok(!(await call(2, 'tabs.claim', { tabId: a.id })).error);
+  pause.resume();
+  await b.done;
+  assert.equal(core.owners.get(a.id).client, 2);
+  assert.equal(chrome.tabsById.get(a.id).groupId, -1, "another client's tab is never grouped");
+  assert.equal(chrome.tabsById.get(pause.target()).groupId, -1, 'a lone one after all');
+});
+
+test('a split or a group the user makes while the given group is being made is respected', { timeout: 5000 }, async () => {
+  const { chrome, call, start } = setup();
+  const { result: a } = await call(1, 'tabs.open', { url: 'https://example.com/a', forUser: true });
+  const { result: e } = await call(1, 'tabs.open', { url: 'https://example.com/e', forUser: true });
+  const given = chrome.tabsById.get(e.id).groupId;
+  const partner = chrome.addTab({ url: 'https://user.example' });
+  const pause = pauseGrouping(chrome);
+  const b = start(1, 'tabs.open', { url: 'https://example.com/b', forUser: true });
+  await pause.atRead;
+  chrome.tabsById.get(pause.target()).splitViewId = 9; // the user pairs b with their own tab
+  partner.splitViewId = 9;
+  const theirs = await chrome.tabs.group({ tabIds: [a.id] }); // and puts a in a group of their own
+  pause.resume();
+  await b.done;
+  assert.deepEqual([pause.target(), partner.id].map((id) => chrome.tabsById.get(id).groupId), [-1, -1], 'the split pair is left alone');
+  assert.equal(chrome.tabsById.get(a.id).groupId, theirs, "a stays in the user's group");
+  assert.equal(chrome.tabsById.get(e.id).groupId, given);
+});
+
+test("a tab in Split View never joins a given group, so its partner (the user's own tab) is never moved", async () => {
+  const { chrome, call } = setup();
+  const { result: a } = await call(1, 'tabs.open', { url: 'https://example.com/a', forUser: true });
+  const partner = chrome.addTab({ url: 'https://user.example' });
+  chrome.tabsById.get(a.id).splitViewId = 7; // the user pairs a with their own tab
+  partner.splitViewId = 7;
+  const { result: b } = await call(1, 'tabs.open', { url: 'https://example.com/b', forUser: true });
+  const { result: c } = await call(1, 'tabs.open', { url: 'https://example.com/c', forUser: true });
+  assert.deepEqual([a.id, partner.id].map((id) => chrome.tabsById.get(id).groupId), [-1, -1], 'the split pair stays as it is');
+  const given = chrome.tabsById.get(b.id).groupId;
+  assert.notEqual(given, -1);
+  assert.equal(chrome.tabsById.get(c.id).groupId, given);
+});
+
+test('a given tab the user pinned never joins a given group, so it stays pinned (grouping unpins)', async () => {
+  const { chrome, call } = setup();
+  const { result: a } = await call(1, 'tabs.open', { url: 'https://example.com/a', forUser: true });
+  chrome.tabsById.get(a.id).pinned = true; // the user pins the result they were given
+  const { result: b } = await call(1, 'tabs.open', { url: 'https://example.com/b', forUser: true });
+  const { result: c } = await call(1, 'tabs.open', { url: 'https://example.com/c', forUser: true });
+  assert.deepEqual([chrome.tabsById.get(a.id).pinned, chrome.tabsById.get(a.id).groupId], [true, -1], 'still pinned, ungrouped');
+  const given = chrome.tabsById.get(b.id).groupId;
+  assert.ok(given !== -1 && chrome.tabsById.get(c.id).groupId === given);
+});
+
+test('a given group whose title could not be set is still the one later tabs join', async () => {
+  const { chrome, call } = setup();
+  chrome.hooks.groupUpdateError = 'Tabs cannot be edited right now (user may be dragging a tab).';
+  const { result: a } = await call(1, 'tabs.open', { url: 'https://example.com/a', forUser: true });
+  const { result: b } = await call(1, 'tabs.open', { url: 'https://example.com/b', forUser: true });
+  const given = chrome.tabsById.get(a.id).groupId;
+  assert.ok(given !== -1 && chrome.tabsById.get(b.id).groupId === given, 'grouped, untitled');
+  delete chrome.hooks.groupUpdateError;
+  const { result: c } = await call(1, 'tabs.open', { url: 'https://example.com/c', forUser: true });
+  assert.equal(chrome.tabsById.get(c.id).groupId, given, 'no second group');
+});
+
+test('tabs.keep moves kept work tabs out of the work group into one given to the user', async () => {
+  const { chrome, call } = setup();
+  const { result: one } = await call(1, 'tabs.open', { url: 'https://example.com/1' });
+  const { result: two } = await call(1, 'tabs.open', { url: 'https://example.com/2' });
+  const { result: scratch } = await call(1, 'tabs.open', { url: 'https://example.com/scratch' });
+  const work = chrome.tabsById.get(one.id).groupId;
+  await call(1, 'tabs.keep', { tabId: one.id });
+  assert.equal(chrome.tabsById.get(one.id).groupId, -1, 'a lone kept tab is ungrouped');
+  await call(1, 'tabs.keep', { tabId: two.id });
+  const given = chrome.tabsById.get(one.id).groupId;
+  assert.ok(given !== -1 && given !== work);
+  assert.equal(chrome.tabsById.get(two.id).groupId, given);
+  assert.equal(chrome.tabsById.get(scratch.id).groupId, work, 'the work tab stays in the work group');
+});
+
+test('a takeover of a tab given to the user leaves it in its group, and a resume never moves it to the work group', async () => {
+  const { chrome, call } = setup();
+  await call(1, 'tabs.open', { url: 'https://example.com/work' });
+  const { result: a } = await call(1, 'tabs.open', { url: 'https://example.com/a', forUser: true });
+  const { result: b } = await call(1, 'tabs.open', { url: 'https://example.com/b', forUser: true });
+  await call(1, 'chrome.debugger.attach', [{ tabId: a.id }, '1.3']);
+  const given = chrome.tabsById.get(a.id).groupId;
+  await call(1, 'tabs.park', { tabId: a.id, kind: 'takeover' });
+  assert.equal(chrome.tabsById.get(a.id).groupId, given, 'parked in place');
+  assert.ok(!(await call(1, 'tabs.claim', { tabId: a.id, resume: true })).error);
+  assert.deepEqual([a, b].map((t) => chrome.tabsById.get(t.id).groupId), [given, given], 'resumed in place');
+});
+
 test('a forUser tab is unmuted on release only while its agent mute is still on', async () => {
   const { core, chrome, call } = setup();
   const { result: plain } = await call(1, 'tabs.open', { forUser: true });
@@ -876,7 +1120,7 @@ test("tabs.closeUnowned closes the user's tab without attaching, and refuses own
   const userTab = chrome.addTab({ url: 'https://www.youtube.com/watch?v=1' });
   const { result: mine } = await call(1, 'tabs.open', {});
   const { result: theirs } = await call(2, 'tabs.open', {});
-  assert.match((await call(1, 'tabs.closeUnowned', { tabId: theirs.id })).error.message, /owned by another client/);
+  assert.match((await call(1, 'tabs.closeUnowned', { tabId: theirs.id })).error.message, /controlled by another agent session/);
   assert.match((await call(1, 'tabs.closeUnowned', { tabId: mine.id })).error.message, /controlled by this client/);
   assert.deepEqual((await call(1, 'tabs.closeUnowned', { tabId: userTab.id })).result, { ok: true });
   assert.equal(chrome.tabsById.has(userTab.id), false);
@@ -1012,6 +1256,94 @@ test('tabs.open that fails after creating the tab closes it and reports the erro
   assert.ok(!sent.some((m) => m.method === 'chrome.tabs.onCreated'));
 });
 
+// A browser whose last window closes unloads the profile, and FowlBrowser with it, until a window opens again.
+// Closing the tab the user has in front shows the tab they had before, not whatever the browser puts next (another
+// agent's work tab, maybe).
+test('closing the tab in front brings back the user\'s previous tab, never another agent\'s work tab', async () => {
+  const { core, chrome, call } = setup();
+  const usersTab = chrome.addTab({ url: 'https://user.example', active: true });
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://a.example' });
+  const { result: other } = await call(2, 'tabs.open', { url: 'https://b.example' });
+  await core.onTabActivated({ tabId: usersTab.id, windowId: 1 });
+  chrome.tabsById.get(tab.id).active = true; // the user clicks into the agent's tab
+  await core.onTabActivated({ tabId: tab.id, windowId: 1 });
+  await call(1, 'chrome.tabs.remove', [tab.id]);
+  const shown = chrome.calls.filter((c) => c[0] === 'tabs.update' && c[2]?.active === true).map((c) => c[1]);
+  assert.deepEqual(shown, [usersTab.id], 'the user\'s tab first, before the close');
+
+  // The one before was another agent's work tab: the browser picks, as usual.
+  chrome.tabsById.get(other.id).active = true;
+  await core.onTabActivated({ tabId: other.id, windowId: 1 });
+  const { result: third } = await call(1, 'tabs.open', { url: 'https://c.example' });
+  chrome.tabsById.get(third.id).active = true;
+  await core.onTabActivated({ tabId: third.id, windowId: 1 });
+  await call(1, 'chrome.tabs.remove', [third.id]);
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.update' && c[2]?.active === true).map((c) => c[1]), [usersTab.id]);
+
+  // The user picks another tab of theirs while the previous one is looked up: theirs stays in front.
+  const picked = chrome.addTab({ url: 'https://picked.example' });
+  await core.onTabActivated({ tabId: usersTab.id, windowId: 1 });
+  const { result: fourth } = await call(1, 'tabs.open', { url: 'https://d.example' });
+  chrome.tabsById.get(fourth.id).active = true;
+  await core.onTabActivated({ tabId: fourth.id, windowId: 1 });
+  chrome.hooks.get = async (id) => { if (id === usersTab.id) await core.onTabActivated({ tabId: picked.id, windowId: 1 }); };
+  await call(1, 'chrome.tabs.remove', [fourth.id]);
+  chrome.hooks.get = null;
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.update' && c[2]?.active === true).map((c) => c[1]), [usersTab.id], 'not brought back over the pick');
+});
+
+// An undocked DevTools window closes with the tab it inspects, so it keeps nothing open.
+test('a DevTools window does not count as a window that stays when the last tab closes', async () => {
+  const { chrome, call } = setup();
+  chrome.hooks.oneWindow = true;
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://a.example' });
+  chrome.addTab({ windowId: 7 }); // the DevTools window's own page
+  chrome.hooks.windows = { 7: { type: 'devtools' } };
+  await call(1, 'chrome.tabs.remove', [tab.id]);
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.create').at(-1)?.[1], { windowId: tab.windowId, active: false }, 'a New Tab page stays');
+});
+
+test('tabs the extension closes never close the browser\'s last window: a New Tab page stays', async () => {
+  const { core, chrome, call } = setup();
+  chrome.hooks.oneWindow = true;
+  const { result: a } = await call(1, 'tabs.open', { url: 'https://a.example' });
+  const { result: b } = await call(1, 'tabs.open', { url: 'https://b.example' });
+  await core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } }); // closes both at once (a turn end)
+  const left = [...chrome.tabsById.values()];
+  assert.equal(left.length, 1, 'one New Tab page, not one per closed tab');
+  assert.equal(left[0].windowId, 1);
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.create').at(-1)[1], { windowId: 1, active: false });
+  assert.ok(!core.owners.has(left[0].id), 'nobody\'s');
+  assert.ok(!chrome.tabsById.has(a.id) && !chrome.tabsById.has(b.id));
+
+  // The same for the user's last tab closed for them, and for a claimed one.
+  const users = left[0];
+  assert.deepEqual((await call(2, 'tabs.closeUnowned', { tabId: users.id })).result, { ok: true });
+  assert.equal(chrome.tabsById.size, 1);
+  const [another] = chrome.tabsById.values();
+  await call(2, 'tabs.claim', { tabId: another.id });
+  await call(2, 'chrome.tabs.remove', [another.id, { usersTab: true }]);
+  assert.equal(chrome.tabsById.size, 1);
+
+  // Two windows whose only tabs close at once (an agent tab and its popup's window): one New Tab page stays.
+  const { result: d } = await call(6, 'tabs.open', {});
+  const popup = chrome.addTab({ windowId: 3, openerTabId: d.id });
+  await core.onNavigationTarget({ sourceTabId: d.id, tabId: popup.id });
+  await call(5, 'tabs.closeUnowned', { tabId: [...chrome.tabsById.values()][0].id });
+  assert.deepEqual([...chrome.tabsById.values()].map((t) => t.id).sort(), [d.id, popup.id].sort(), 'the agent tab and its popup window, nothing else');
+  await core.handleMessage({ method: 'host.clientDisconnected', params: { client: 6 } });
+  assert.equal(chrome.tabsById.size, 1, 'a window stays');
+  assert.ok(!chrome.tabsById.has(d.id) && !chrome.tabsById.has(popup.id));
+
+  // With another window open, or other tabs in this one, nothing is added.
+  const kept = [...chrome.tabsById.values()][0];
+  const { result: c } = await call(3, 'tabs.open', {});
+  await call(3, 'chrome.tabs.remove', [c.id]);
+  chrome.hooks.oneWindow = false;
+  await call(4, 'tabs.closeUnowned', { tabId: kept.id });
+  assert.equal(chrome.tabsById.size, 0);
+});
+
 test('a release racing the tab closing still tells the client', async () => {
   const { core, chrome, call, start, sent } = setup();
   const userTab = chrome.addTab({ url: 'https://user.example' });
@@ -1061,7 +1393,7 @@ test('tabs.expectChild lets the agent own a tab its click opens from a claimed t
   const gmail = chrome.addTab({ url: 'https://mail.example', active: true });
   await core.onTabActivated({ tabId: gmail.id, windowId: 1 });
   await call(1, 'tabs.claim', { tabId: gmail.id });
-  assert.match((await call(2, 'tabs.expectChild', { tabId: gmail.id, ms: 1000 })).error.message, /not owned/);
+  assert.match((await call(2, 'tabs.expectChild', { tabId: gmail.id, ms: 1000 })).error.message, /controlled by another agent session/);
   assert.deepEqual((await call(1, 'tabs.expectChild', { tabId: gmail.id, ms: 1000 })).result, { ok: true });
   sent.length = 0;
 
@@ -1148,7 +1480,7 @@ test('tabs.isShown: only an active tab in a normal, app or popup window that is 
   assert.equal((await shown()).shown, true, 'app window');
   chrome.hooks.windows = { 1: { type: 'devtools', focused: true } };
   assert.deepEqual(await shown(), { shown: false, focused: false }, 'devtools window');
-  assert.match((await call(2, 'tabs.isShown', { tabId: tab.id })).error.message, /not owned by this client/);
+  assert.match((await call(2, 'tabs.isShown', { tabId: tab.id })).error.message, /controlled by another agent session/);
 });
 
 test('tabs.listAll: kept and windowType per tab, tabs of popup and app windows, never DevTools or incognito ones', async () => {
@@ -1237,7 +1569,7 @@ test('tabs.park hands the tab to the user for now; tabs.claim resumes it as it w
   const groupId = chrome.tabsById.get(tab.id).groupId;
   assert.notEqual(groupId, -1);
   sent.length = 0;
-  assert.match((await call(2, 'tabs.park', { tabId: tab.id, kind: 'handoff' })).error.message, /not owned/);
+  assert.match((await call(2, 'tabs.park', { tabId: tab.id, kind: 'handoff' })).error.message, /controlled by another agent session/);
   assert.deepEqual((await call(1, 'tabs.park', { tabId: tab.id, kind: 'handoff' })).result, { ok: true });
 
   const parked = chrome.tabsById.get(tab.id);
@@ -1316,7 +1648,7 @@ test('the user\'s turn: a tab their own input opens from an agent tab is theirs,
   await core.onTabActivated({ tabId: userTab.id, windowId: 1 });
   const { result: opener } = await call(1, 'tabs.open', { url: 'https://shop.example' });
   assert.deepEqual((await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() })).result, { ok: true });
-  assert.match((await call(2, 'tabs.userInput', { tabId: opener.id, at: Date.now() })).error.message, /not owned/);
+  assert.match((await call(2, 'tabs.userInput', { tabId: opener.id, at: Date.now() })).error.message, /controlled by another agent session/);
   sent.length = 0;
 
   // Chrome opened it in front, for the user's click: it stays in front and nobody owns it.
@@ -1389,7 +1721,7 @@ test('tabs.openChild during the user\'s turn opens the tab for them: in front, r
   const group = chrome.tabsById.get(opener.id).groupId;
   await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() });
   assert.match((await call(1, 'tabs.openChild', { tabId: opener.id, url: 'javascript:alert(1)' })).error.message, /http/);
-  assert.match((await call(2, 'tabs.openChild', { tabId: opener.id, url: 'https://shop.example/terms' })).error.message, /not owned/);
+  assert.match((await call(2, 'tabs.openChild', { tabId: opener.id, url: 'https://shop.example/terms' })).error.message, /controlled by another agent session/);
   sent.length = 0;
   chrome.hooks.created = (tab) => { tab.groupId = group; }; // Chrome put it inside the agent's group
   const { result, error } = await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://shop.example/terms' });
@@ -1778,7 +2110,10 @@ function orderedChrome() {
     get waiting() { return pending.length; },
     runtime: { id: 'fowlbrowser-ext', getManifest: () => ({ version: '0.1.0' }) },
     storage: { session: store, local: store },
-    windows: { getLastFocused: () => handle(() => ({ id: 1, type: 'normal', incognito: false })) },
+    windows: {
+      getLastFocused: () => handle(() => ({ id: 1, type: 'normal', incognito: false })),
+      getAll: () => handle(() => [{ id: 2, type: 'normal', tabs: [{ id: 1 }] }]), // the user's window, with a tab of theirs
+    },
     tabGroups: { update: (id) => handle(() => { if (!groups.has(id)) throw new Error(`No group with id: ${id}`); return {}; }) },
     debugger: { detach: () => handle(() => ({})) },
     tabs: {

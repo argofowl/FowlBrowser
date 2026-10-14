@@ -1,8 +1,11 @@
 // Pointer actions that can't happen: the reason read from Playwright's call log, and which box a scroll by ref moves.
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
-import { blockedState, describeCover, onRef, performed, quickly, REF_POINT_FN, SCROLL_TARGET_FN, selectOnce } from '../src/tools.mjs';
+import { Tab } from '../src/browsers.mjs';
+import { blockedState, describeCover, NATIVE_UI_FN, onRef, performed, quickly, REF_POINT_FN, registerTools, SCROLL_TARGET_FN, selectOnce } from '../src/tools.mjs';
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const log = (...lines) => `locator.click: Timeout 1000ms exceeded.\nCall log:\n${lines.map((l) => `\x1b[2m  - ${l}\x1b[22m`).join('\n')}`;
 
 test('blockedState: a cover, disabled or hidden element is named from the last matching log line', () => {
@@ -142,4 +145,203 @@ test('REF_POINT_FN: scrolls the element into view if needed and returns its box 
   assert.deepEqual(REF_POINT_FN(el), { x: 60, y: 40, w: 100, h: 40 });
   assert.equal(scrolled, 1);
   assert.equal(REF_POINT_FN({ getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 0 }) }), null);
+});
+
+test('REF_POINT_FN: on a page with smooth scrolling the element still out of view goes there at once, centred', () => {
+  globalThis.innerWidth = 1200;
+  globalThis.innerHeight = 780;
+  try {
+    let top = 1020; // smooth scrolling: scrollIntoViewIfNeeded only starts the scroll
+    const calls = [];
+    const el = {
+      scrollIntoViewIfNeeded() { calls.push('ifNeeded'); },
+      scrollIntoView(options) { calls.push(options); top = 370; },
+      getBoundingClientRect: () => ({ left: 1000, top, right: 1064, bottom: top + 40, width: 64, height: 40 }),
+    };
+    assert.deepEqual(REF_POINT_FN(el), { x: 1032, y: 390, w: 64, h: 40 });
+    assert.deepEqual(calls, ['ifNeeded', { block: 'center', inline: 'center', behavior: 'instant' }]);
+  } finally {
+    delete globalThis.innerWidth;
+    delete globalThis.innerHeight;
+  }
+});
+
+// fn(classes) with stand-ins for the DOM classes NATIVE_UI_FN checks (elements with no links or labels around them).
+function withDom(fn) {
+  const classes = { Node: class {}, Element: null, HTMLInputElement: null, HTMLSelectElement: null };
+  classes.Element = class extends classes.Node {
+    closest() { return null; }
+    querySelectorAll() { return []; }
+    getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 30, width: 100, height: 30 }; }
+  };
+  classes.HTMLInputElement = class extends classes.Element {};
+  classes.HTMLSelectElement = class extends classes.Element {};
+  Object.assign(globalThis, classes);
+  try {
+    return fn(classes);
+  } finally {
+    for (const name of Object.keys(classes)) delete globalThis[name];
+  }
+}
+const classify = (make) => withDom((classes) => NATIVE_UI_FN(make(classes)));
+
+test('NATIVE_UI_FN: a colour input or dropdown is refused while disabled too (the click waits for it to be enabled)', () => {
+  const colour = (disabled) => classify(({ HTMLInputElement }) => Object.assign(new HTMLInputElement(), { type: 'color', value: '#3366ff', disabled }));
+  const select = (disabled) => classify(({ HTMLSelectElement }) => Object.assign(new HTMLSelectElement(), { multiple: false, size: 0, disabled,
+    options: [{ label: 'Free' }, { label: 'Pro' }] }));
+  assert.deepEqual(colour(false), { kind: 'color', value: '#3366ff' });
+  assert.deepEqual(colour(true), { kind: 'color', value: '#3366ff' });
+  assert.deepEqual(select(true), { kind: 'select', options: ['Free', 'Pro'], more: 0 });
+  assert.equal(classify(({ HTMLInputElement }) => Object.assign(new HTMLInputElement(), { type: 'text', disabled: true })), null);
+});
+
+test('a click on a page whose script hangs fails within its timeout, saying the page does not answer', async () => {
+  let hung = false; // the page's main thread stuck in a script: nothing evaluated in it answers
+  const page = Object.assign(new EventEmitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, isClosed: () => false,
+    ariaSnapshot: async () => '- button "Save" [ref=e1]',
+    getByRef: () => ({ count: () => (hung ? new Promise(() => {}) : Promise.resolve(1)) }),
+  });
+  const host = {
+    async request(method, params) {
+      if (method === 'tabs.isShown') return { shown: false };
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'App' } };
+      throw new Error(`not in this double: ${method}`);
+    },
+  };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  const tab = new Tab(browser, 9, page);
+  browser.tabs.set(9, tab);
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  await tools.snapshot({ tab: tab.id });
+  hung = true;
+  const started = Date.now();
+  const result = await Promise.race([tools.click({ tab: tab.id, ref: 'e1', timeout_ms: 1000 }), new Promise((resolve) => setTimeout(resolve, 3000, null).unref())]);
+  assert.ok(result, 'the call was still waiting after 3 s');
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /The page did not answer within 1 s \(its script is busy or stuck\)/);
+});
+
+test('a dropdown inside a closed shadow root (an s ref) is refused like any other: click and its opening keys', async () => {
+  const clicks = [];
+  const keys = [];
+  const page = Object.assign(new EventEmitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://travel.example/', mainFrame: () => page, isClosed: () => false,
+    ariaSnapshot: async () => '- heading "Book" [level=1] [ref=e1]',
+    mouse: { click: async (x, y) => { clicks.push([x, y]); } },
+    keyboard: { press: async (key) => { keys.push(key); } },
+  });
+  // The page as the debugger sees it: host 10 holds a closed root with a <select> (backend node 101).
+  const cdp = {
+    'Target.getTargetInfo': () => ({ targetInfo: { title: 'Book' } }),
+    'DOM.getDocument': () => ({ root: { backendNodeId: 1, children: [{ backendNodeId: 10, shadowRoots: [{ backendNodeId: 11, shadowRootType: 'closed', children: [{ backendNodeId: 101 }] }] }] } }),
+    'Accessibility.queryAXTree': () => ({ nodes: [{ backendDOMNodeId: 101, role: { value: 'combobox' }, name: { value: 'Cabin' } }] }),
+    'DOM.resolveNode': () => ({ object: { objectId: 'select-101' } }),
+    // Runs the page function on a stand-in <select>, as Chrome would on the node.
+    'Runtime.callFunctionOn': ({ functionDeclaration }) => withDom((classes) => {
+      const select = Object.assign(new classes.HTMLSelectElement(), { multiple: false, size: 0, options: [{ label: 'Economy' }, { label: 'Business' }] });
+      // eslint-disable-next-line no-new-func
+      return { result: { value: new Function(`return (${functionDeclaration})`)().call(select) } };
+    }),
+    'Page.getLayoutMetrics': () => ({ cssLayoutViewport: { pageX: 0, pageY: 0 } }),
+    'DOM.getBoxModel': () => ({ model: { border: [90, 40, 110, 40, 110, 60, 90, 60] } }),
+    'DOM.getNodeForLocation': () => ({ backendNodeId: 101 }),
+  };
+  const host = {
+    async request(method, params) {
+      if (method === 'tabs.isShown') return { shown: false };
+      if (method === 'tabs.expectChild') return {};
+      if (method === 'chrome.debugger.sendCommand') return cdp[params[1]]?.(params[2]) ?? {};
+      throw new Error(`not in this double: ${method}`);
+    },
+  };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  const tab = new Tab(browser, 12, page);
+  browser.tabs.set(12, tab);
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  const text = async (name, args) => (await tools[name]({ tab: tab.id, ...args })).content.map((c) => c.text).join('\n');
+  assert.match(await text('snapshot', {}), /combobox "Cabin" \[ref=s1\]/);
+  assert.match(await text('click', { ref: 's1', snapshot: false }), /Error: Ref s1 is a dropdown \(<select>\)\. A click opens its menu .*options: Economy, Business/);
+  assert.match(await text('press_key', { ref: 's1', key: 'Space', snapshot: false }), /Error: .* is a dropdown .*Pressing Space on it opens its menu/);
+  assert.deepEqual([clicks, keys], [[], []], 'nothing reached the page');
+});
+
+test('a click x,y on a dropdown in an iframe shown scaled (a zoomed preview) is refused: the point is mapped by the scale too', async () => {
+  const clicks = [];
+  // The iframe: 800x600 inside, shown at half size from (50, 50). Its <select> is at (200, 100) in its own page.
+  const child = {
+    evaluate: async (fn, at) => (at && Math.abs(at.x - 200) < 20 && Math.abs(at.y - 100) < 10
+      ? { kind: 'select', options: ['Small', 'Large'], more: 0 } : null),
+  };
+  const iframe = (classes) => Object.assign(new classes.Element(), { localName: 'iframe', offsetWidth: 800, offsetHeight: 600, clientLeft: 0, clientTop: 0,
+    getBoundingClientRect: () => ({ left: 50, top: 50, width: 400, height: 300 }) });
+  const main = {
+    evaluate: async (fn, at) => withDom((classes) => {
+      globalThis.document = { elementFromPoint: () => iframe(classes) };
+      try { return fn(at); } finally { delete globalThis.document; }
+    }),
+    evaluateHandle: async () => ({ asElement: () => ({ contentFrame: async () => child }), dispose: async () => {} }),
+  };
+  const page = Object.assign(new EventEmitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://storybook.example/', mainFrame: () => main, isClosed: () => false,
+    mouse: { click: async (x, y) => { clicks.push([x, y]); } },
+  });
+  const host = {
+    async request(method, params) {
+      if (method === 'tabs.isShown') return { shown: false };
+      if (method === 'tabs.expectChild') return {};
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'Preview' } };
+      throw new Error(`not in this double: ${method}`);
+    },
+  };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  const tab = new Tab(browser, 13, page);
+  browser.tabs.set(13, tab);
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  const result = await tools.click({ tab: tab.id, x: 150, y: 100, snapshot: false });
+  assert.match(result.content[0].text, /Error: The element at 150,100 is a dropdown \(<select>\)/);
+  assert.deepEqual(clicks, []);
+});
+
+test('a click on a dropdown while the page stalls past a second is still refused: the check waits as the click would', async () => {
+  const clicks = [];
+  const page = Object.assign(new EventEmitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://plans.example/', mainFrame: () => page, isClosed: () => false,
+    ariaSnapshot: async () => '- combobox "Plan" [ref=e1]',
+    getByRef: () => ({
+      count: async () => 1,
+      // The page's thread is stuck for 1.5 s: an evaluate answers then, or fails at its own timeout.
+      async evaluate(fn, arg, { timeout } = {}) {
+        await sleep(Math.min(1500, timeout));
+        if (timeout < 1500) throw new Error(`locator.evaluate: Timeout ${timeout}ms exceeded.`);
+        return withDom((classes) => fn(Object.assign(new classes.HTMLSelectElement(), { multiple: false, size: 0, options: [{ label: 'Free' }, { label: 'Pro' }] })));
+      },
+      async click() { clicks.push('click'); },
+    }),
+  });
+  const host = {
+    async request(method, params) {
+      if (method === 'tabs.isShown') return { shown: false };
+      if (method === 'tabs.expectChild') return {};
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'Plans' } };
+      throw new Error(`not in this double: ${method}`);
+    },
+  };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  const tab = new Tab(browser, 15, page);
+  browser.tabs.set(15, tab);
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  await tools.snapshot({ tab: tab.id });
+  const result = await tools.click({ tab: tab.id, ref: 'e1', snapshot: false });
+  assert.match(result.content[0].text, /Error: Ref e1 is a dropdown/);
+  assert.deepEqual(clicks, []);
 });

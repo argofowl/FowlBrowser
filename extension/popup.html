@@ -18,6 +18,17 @@
     <p class="hint" id="preview">Agents see this browser as <b>this browser</b>.</p>
   </section>
 
+  <section class="bar" id="bar" hidden>
+    <p class="hint" id="bar-text"></p>
+    <button type="button" id="bar-command" class="prompt" title="Copy">
+      <span id="bar-command-text"></span>
+      <span class="copy" aria-hidden="true">
+        <svg class="icon-copy" viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="2"/><path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5"/></svg>
+        <svg class="icon-done" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7"/></svg>
+      </span>
+    </button>
+  </section>
+
   <details id="setup">
     <summary>Set up an agent</summary>
     <div class="agents" role="tablist" aria-label="Agent">

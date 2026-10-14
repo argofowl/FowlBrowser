@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Dashboard</title>
+<div id="root"></div>
+<script>
+  // Renders only after its data arrives, like a single-page app: the load event fires on an empty shell.
+  setTimeout(async () => {
+    await fetch('/index.html?delay=900');
+    document.getElementById('root').innerHTML = '<h1>Revenue this month</h1><p>Total revenue was 12,345 dollars across 67 orders.</p><button>Export report</button>';
+  }, 50);
+</script>

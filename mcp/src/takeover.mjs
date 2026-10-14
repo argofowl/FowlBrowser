@@ -21,6 +21,7 @@ const SETTLE_MS = 300; // a target_closed detach is judged this much later (a cl
 const USER_SETTLED_MS = 500; // a popup waits at most this long for the user's input to be judged (userSettled)
 const KEEP_MS = 5000; // finished agent windows kept this long
 const CLOSED_BY_PAGE_MS = 3000;
+const APP_LINK_MS = 1000; // a link for another app the page asked for this shortly before a detach explains it
 const CRASH_MS = 5000;
 const ENDING_MS = 30_000;
 const THROTTLE_MS = 250;
@@ -80,6 +81,10 @@ const lastTabs = new Map(); // "chrome:52" -> the Tab it was when its debugger w
 const parking = new Map(); // "chrome:52" -> its takeover's park, or its handoff's cleanup and park, until done
 const judging = new WeakMap(); // Tab -> reports of input in it still being judged (onReport), for userSettled
 const givenBack = new Set(); // "chrome:52" popups the extension gave back to the user who opened them, for KEEP_MS
+const usersInput = new Map(); // "chrome:52" -> when the user's latest input in it was (onReport)
+const appLinks = new Map(); // "chrome:52" -> { url, at } of the page's latest navigation to a link for another app
+const reattached = new Map(); // "chrome:52" -> notice: attached again after a link for another app, not told yet
+const recovering = new Map(); // "chrome:52" -> a detach after a link for another app, until judged and attached again
 const calls = new AsyncLocalStorage(); // the tool call code runs for: { tabKey, onParked } (see inCall)
 
 const keyOf = (browser, tabId) => `${browser.key}:${tabId}`;
@@ -119,6 +124,9 @@ export function notice(key) {
 
 export const parked = (key) => records.get(key) ?? null;
 
+// Whether this session has a tab in that browser parked, or being parked.
+export const hasParked = (browserKey) => [...records.keys(), ...parking.keys()].some((key) => key.startsWith(`${browserKey}:`));
+
 // A takeover of this tab that happened after `since` (a call running on it then gets the notice instead of its result).
 export function takenOverSince(key, since) {
   const record = records.get(key);
@@ -126,18 +134,26 @@ export function takenOverSince(key, since) {
 }
 
 // The start of the next result of any other tool tells the agent about takeovers it has not heard of, once each
-// (calls naming the taken-over tab get its notice anyway, every time).
+// (calls naming the taken-over tab get its notice anyway, every time). A tab attached again after a link for another
+// app is told about once, in the next result of any tool.
 export function withNotices(result, tabKey) {
   const keys = [...unseen].filter((key) => key !== tabKey);
-  if (!keys.length) return result;
+  if (!keys.length && !reattached.size) return result;
   for (const key of keys) unseen.delete(key);
   const first = result.content?.find((c) => c.type === 'text');
-  const lines = keys.map(notice).filter(Boolean);
+  const lines = [...keys.map(notice), ...reattached.values()].filter(Boolean);
+  reattached.clear();
   if (!lines.length) return result;
   if (first) first.text = `${lines.join('\n')}\n${first.text}`;
   else result.content = [{ type: 'text', text: lines.join('\n') }, ...(result.content ?? [])];
   return result;
 }
+
+// Resolves once every detach after a link for another app is judged and its tab attached and mapped again (or taken
+// over): a turn end waits for them, else it would find the tab unmapped and leave this turn's work tab open. Null when
+// none is under way.
+// { keys, done } of the app-link recoveries under way now, or null.
+export const recoveries = () => (recovering.size ? { keys: [...recovering.keys()], done: Promise.allSettled([...recovering.values()]) } : null);
 
 // Waits for a park in progress (a resume must not reach the extension before it).
 export async function settled(key) {
@@ -258,6 +274,7 @@ async function onReport(tab, payload) {
   // Agent input is trusted too; only input in the tab the user is looking at, in the window they are in, can be theirs.
   const seen = await browser.host.request('tabs.isShown', { tabId }).catch(() => null);
   if (!seen?.shown || !seen.focused || agentInput(browser, tabId, report.at)) return;
+  usersInput.set(tab.id, Math.max(usersInput.get(tab.id) ?? 0, Math.min(Number(report.at) || Date.now(), Date.now())));
   await browser.host.request('tabs.userInput', { tabId, at: report.at }).catch((error) => {
     if (!/unknown method/i.test(error.message)) debug('tabs.userInput failed', error.message); // an older extension
   });
@@ -278,37 +295,90 @@ export function watchTakeovers(browser) {
     if (method === 'chrome.debugger.onDetach') onDetach(browser, params?.[0]?.tabId, params?.[1]).catch((e) => debug('takeover: detach', e.message));
     else if (method === 'chrome.tabs.onRemoved') onRemoved(browser, params?.[0], params?.[1]).catch((e) => debug('takeover: removed', e.message));
     else if (method === 'chrome.debugger.onEvent') {
-      const [source, cdpMethod] = params ?? [];
+      const [source, cdpMethod, cdpParams] = params ?? [];
       if (!source?.sessionId && cdpMethod === 'Inspector.targetCrashed') crashed.set(keyOf(browser, source?.tabId), Date.now());
       else if (!source?.sessionId && cdpMethod === 'Page.downloadWillBegin') downloaded.set(keyOf(browser, source?.tabId), Date.now());
+      else if (!source?.sessionId && cdpMethod === 'Page.frameRequestedNavigation' && appLink(cdpParams?.url)) {
+        appLinks.set(keyOf(browser, source?.tabId), { url: cdpParams.url, at: Date.now() });
+      }
     }
   });
   // The connection ended (the browser quit, the extension reloaded): none of its tabs is this session's any more, and a
   // browser restart numbers tabs from the start again, so its records must not hold a new tab of the same id.
   browser.host.on('close', () => {
-    for (const map of [records, unseen, parking, ending, inputs, crashed, downloaded, lastTabs, givenBack]) {
+    for (const map of [records, unseen, parking, ending, inputs, crashed, downloaded, lastTabs, givenBack, usersInput, appLinks, reattached]) {
       for (const key of map.keys()) if (key.startsWith(`${browser.key}:`)) map.delete(key);
     }
   });
 }
 
 const BROWSER_PAGE = /^(chrome|chrome-extension|chrome-search|chrome-untrusted|devtools|edge|brave|about):/;
+// A link the browser hands to another app (mailto:, tel:, zoommtg:, slack:...): neither a web page nor a browser page.
+const appLink = (url) => /^[a-z][a-z0-9+.-]*:/i.test(url ?? '') && !BROWSER_PAGE.test(url)
+  && !/^(https?|data|blob|javascript|file|filesystem|view-source|wss?):/i.test(url);
 
 async function onDetach(browser, tabId, reason) {
   const key = keyOf(browser, tabId);
   if (reason === 'parked' || records.has(key)) return;
+  const detachedAt = Date.now();
   const tab = browser.tabs.get(tabId);
+  const url = tab?.page.url();
+  const link = Date.now() - (appLinks.get(key)?.at ?? -Infinity) <= APP_LINK_MS ? appLinks.get(key).url : null;
+  appLinks.delete(key);
   lastTabs.set(key, tab);
   setTimeout(() => lastTabs.delete(key), CLOSED_BY_PAGE_MS).unref();
   if (reason === 'canceled_by_user') return takeOver(browser, tabId, 'pressed Cancel on the browser\'s debugging bar', { tab });
-  // target_closed: the tab closed (onRemoved follows), its renderer died, or it went to a page the debugger may not stay on.
+  // target_closed: the tab closed (onRemoved follows), its renderer died, it went to a page the debugger may not stay
+  // on, or its page asked for a link for another app (the browser lets the debugger go as that navigation starts,
+  // though it never leaves the page).
   if (reason !== 'target_closed' || recently(crashed, key, CRASH_MS)) return;
-  await sleep(SETTLE_MS);
-  if (records.has(key)) return;
-  const info = await tabInfo(browser, tabId).catch(() => null);
-  if (info?.owner !== 'you' || info.parked) return;
-  const how = BROWSER_PAGE.test(info.url) && info.url !== 'about:blank' ? `opened a browser page (${info.url.slice(0, 60)})` : 'took the tab out of the agent\'s control';
-  await takeOver(browser, tabId, how, { tab });
+  const judged = (async () => {
+    await sleep(SETTLE_MS);
+    if (records.has(key)) return;
+    const info = await tabInfo(browser, tabId).catch(() => null);
+    if (info?.owner !== 'you' || info.parked) return;
+    // The page's link for another app, on the same page, with no input of the user's behind it: still the agent's tab.
+    // Input reports still being judged (their tabs.isShown can be slow) are waited for; one still unjudged then counts
+    // as the user's.
+    if (link && url && info.url === url) {
+      await userSettled(tab);
+      if (records.has(key)) return;
+      // The user's input near the detach, however long the checks above took.
+      if (!judging.get(tab)?.size && !((usersInput.get(key) ?? -Infinity) >= detachedAt - KEEP_MS) && await reattach(browser, tabId, link, url, tab)) return;
+    }
+    const how = BROWSER_PAGE.test(info.url) && info.url !== 'about:blank' ? `opened a browser page (${info.url.slice(0, 60)})` : 'took the tab out of the agent\'s control';
+    await takeOver(browser, tabId, how, { tab });
+  })();
+  if (link) {
+    recovering.set(key, judged);
+    judged.catch(() => {}).finally(() => { if (recovering.get(key) === judged) recovering.delete(key); });
+  }
+  await judged;
+}
+
+// Attached again (a new page for Playwright, so refs start over), told once in the next result. False when it does
+// not come back: then it is a takeover as any other detach.
+// old: the Tab from before the detach, whose page log carries over.
+async function reattach(browser, tabId, link, url, old) {
+  const key = keyOf(browser, tabId);
+  try {
+    await browser.relay.model.reattach(tabId);
+  } catch (error) {
+    debug('reattach failed', key, error.message);
+    return false;
+  }
+  debug('reattached', key, link);
+  reattached.set(key, `The page in ${key} opened ${link.slice(0, 80)}, a link for another app (if one is installed), and the browser let go ` +
+    'of the tab for it. FowlBrowser attached again: the tab is still yours, on the same page, but refs from before are void, so call snapshot.');
+  tabEvent('reattach', key, url, { link });
+  const next = await browser.waitForTab(tabId).catch(() => null); // mapped again (recoveries)
+  // The same page: what it logged and loaded before is still this page's (console, network), and older pages' stay older.
+  if (old && next && next !== old) {
+    const restamp = (entries) => entries.map((e) => ({ ...e, page: e.page === old.documentGeneration ? next.documentGeneration : -1 }));
+    next.console = [...restamp(old.console), ...next.console];
+    next.network = [...restamp(old.network), ...next.network];
+  }
+  return true;
 }
 
 async function onRemoved(browser, tabId, removeInfo) {
@@ -321,7 +391,7 @@ async function onRemoved(browser, tabId, removeInfo) {
   // Chrome closes a new tab whose first navigation became a download (it never showed a page), and the extension a
   // tabs.openChild child likewise.
   const download = recently(downloaded, key, CLOSED_BY_PAGE_MS) && ['', 'about:blank'].includes(tab?.page.url());
-  for (const map of [inputs, ending, crashed, downloaded]) map.delete(key);
+  for (const map of [inputs, ending, crashed, downloaded, usersInput, appLinks, reattached]) map.delete(key);
   if (removeInfo?.usersPopup) { // still open: a popup the extension gave back to the user who opened it
     givenBack.add(key);
     setTimeout(() => givenBack.delete(key), KEEP_MS).unref();

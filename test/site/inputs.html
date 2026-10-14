@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Inputs</title>
+<style>
+  body { font: 15px system-ui; margin: 24px; }
+  #card-anchor { display: inline-block; padding: 8px 12px; background: #eef; margin: 12px 0; }
+  #card { display: none; padding: 8px; background: #333; color: #fff; }
+  #pad { width: 300px; height: 120px; border: 1px solid #999; display: block; margin: 12px 0; touch-action: none; }
+  li.on { background: #ffd; }
+  #scheme::after { content: 'light'; } @media (prefers-color-scheme: dark) { #scheme::after { content: 'dark'; } }
+  #motion::after { content: 'full'; } @media (prefers-reduced-motion: reduce) { #motion::after { content: 'reduced'; } }
+</style>
+<h1>Inputs</h1>
+<p>Scheme: <span id="scheme"></span>, motion: <span id="motion"></span></p>
+<div id="card-anchor">Hover for the profile card</div>
+<div id="card" role="tooltip">Ada Lovelace, analyst</div>
+<label>Volume <input id="volume" type="range" min="0" max="100" value="0" style="width: 300px"></label>
+<canvas id="pad" width="300" height="120" aria-label="Signature pad"></canvas>
+<ul id="list" tabindex="0" aria-label="Fruit list"><li>Apple</li><li>Banana</li><li>Cherry</li><li>Date</li><li>Elderberry</li></ul>
+<nav><a href="/results.html?q=one">First result</a> <a href="/results.html?q=two">Second result</a> <a href="/results.html?q=one">First again</a> <a href="#top">Top</a></nav>
+<script>
+  window.__log = [];
+  const note = (what) => window.__log.push(what);
+  const anchor = document.getElementById('card-anchor');
+  anchor.addEventListener('mouseenter', () => { document.getElementById('card').style.display = 'block'; note('hover'); });
+  const volume = document.getElementById('volume');
+  volume.addEventListener('input', () => note(`volume ${volume.value}`));
+  const pad = document.getElementById('pad');
+  let drawing = false; let points = 0;
+  pad.addEventListener('pointerdown', () => { drawing = true; points = 0; });
+  pad.addEventListener('pointermove', () => { if (drawing) points++; });
+  pad.addEventListener('pointerup', () => { drawing = false; note(`stroke ${points}`); });
+  let index = 0;
+  const items = [...document.querySelectorAll('#list li')];
+  const show = () => items.forEach((li, i) => li.classList.toggle('on', i === index));
+  document.getElementById('list').addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') index = Math.min(items.length - 1, index + 1);
+    if (e.key === 'ArrowUp') index = Math.max(0, index - 1);
+    show(); note(`list ${index}`);
+  });
+  show();
+  console.error(`inputs page loaded ${location.search}`);
+</script>

@@ -18,8 +18,8 @@
 // FowlBrowser changes: `tabIdForTarget()` so the relay can tell Playwright which chrome tab a page is,
 // `hasTab()`/`isAttached()` for the server, `disconnectCDP()` returns the attached tab ids and the attachments
 // still in flight, a CDP generation fences attachments that land after a disconnect (they detach again instead
-// of installing a session), a tab removed while attaching is not installed, `forgetTab()` for the server,
-// and errors are logged to stderr instead of Playwright's debug logger.
+// of installing a session), a tab removed while attaching is not installed, `forgetTab()` and `reattach()` for the
+// server, and errors are logged to stderr instead of Playwright's debug logger.
 
 const logUnhandledError = (error) => process.stderr.write(`[fowlbrowser] ${error?.stack ?? error}\n`);
 
@@ -41,6 +41,7 @@ export class BrowserModel {
   _nextSessionId = 1;
   _generation = 0;           // bumped on every CDP disconnect
   _attaching = new Map();    // tabId -> Promise<tabSession> of an attachment in flight
+  gestures = new Map();      // tabId -> calls running now whose evaluations act for the user (FowlBrowser)
 
   constructor(sendToExtension) {
     this._sendToExtension = sendToExtension;
@@ -89,6 +90,14 @@ export class BrowserModel {
   onTabRemoved(tabId) {
     this._knownTabs.delete(tabId);
     this._detachTab(tabId);
+  }
+
+  // The server attaches a tab of ours again whose debugger let go while it stayed ours (takeover.mjs: a link for
+  // another app); a new session, so Playwright gets a new page.
+  async reattach(tabId) {
+    if (!this._knownTabs.has(tabId))
+      throw new Error(`Tab ${tabId} is not known`);
+    return await this._attachTab(tabId);
   }
 
   // The server learned the tab is no longer ours (released or closed) even if no event says so.
@@ -177,6 +186,11 @@ export class BrowserModel {
     }
     if (!tabSession)
       throw new Error(`No tab found for sessionId: ${sessionId}`);
+    // FowlBrowser: Playwright runs every evaluation as if the user had just clicked (userGesture), which leaves the page
+    // a user activation for 5 s after a mere snapshot or ref check: a page timer could then open a file chooser (the
+    // Mac's panel on the user's screen) or start sound with it. Only calls that ask for it keep it (gestures).
+    if ((method === 'Runtime.callFunctionOn' || method === 'Runtime.evaluate') && params?.userGesture && !this.gestures.get(tabSession.tabId))
+      params = { ...params, userGesture: false };
     return await this._sendToExtension('chrome.debugger.sendCommand', [
       { tabId: tabSession.tabId, sessionId: cdpSessionId },
       method,

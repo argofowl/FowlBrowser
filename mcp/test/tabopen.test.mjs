@@ -6,12 +6,13 @@ import { test } from 'node:test';
 import { Tab } from '../src/browsers.mjs';
 import { registerTools } from '../src/tools.mjs';
 
-function setup() {
+function setup({ alerts = true } = {}) {
   let loadedPage = false;
   const page = Object.assign(new EventEmitter(), {
     setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://intranet.example/', mainFrame: () => page, isClosed: () => false,
     // The page's first script calls alert(): the document can't finish parsing until it is answered.
     goto(url, { timeout }) {
+      if (!alerts) { loadedPage = true; return Promise.resolve(null); }
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error(`page.goto: Timeout ${timeout}ms exceeded.`)), timeout);
         const dialog = { type: () => 'alert', message: () => 'Please log in with your badge', defaultValue: () => '',
@@ -22,6 +23,7 @@ function setup() {
     evaluate: async () => loadedPage,
     waitForLoadState: async () => {},
     ariaSnapshot: async () => '- heading "Intranet" [level=1]',
+    screenshot: async () => Buffer.from('jpeg'),
   });
   const host = {
     async request(method, params) {
@@ -39,7 +41,7 @@ function setup() {
   registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
   const call = async (name, args) => {
     const result = await tools[name](args);
-    return { error: !!result.isError, text: result.content.map((c) => c.text).join('\n') };
+    return { error: !!result.isError, text: result.content.map((c) => c.text).join('\n'), images: result.content.filter((c) => c.type === 'image').length };
   };
   return { call, loaded: () => loadedPage };
 }
@@ -56,4 +58,11 @@ test('tab_open reports a dialog the page opens while it loads at once; once it i
   const after = await call('snapshot', { tab: 'chrome:5' });
   assert.ok(loaded(), 'the load went on');
   assert.match(after.text, /heading "Intranet"/);
+});
+
+test('tab_open with screenshot: true returns the page\'s picture too, as actions do', async () => {
+  const { call } = setup({ alerts: false });
+  const opened = await call('tab_open', { browser: 'chrome', url: 'https://intranet.example/', screenshot: true });
+  assert.equal(opened.error, false, opened.text);
+  assert.equal(opened.images, 1);
 });

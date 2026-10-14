@@ -12,6 +12,7 @@ process.env.FOWLBROWSER_RECORD = dir;
 const { Tab } = await import('../src/browsers.mjs');
 const { registerTools } = await import('../src/tools.mjs');
 const { endTurn } = await import('../src/turns.mjs');
+const { keepViewportSize } = await import('../src/viewport.mjs');
 test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
 const viewportLines = () => fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
@@ -19,8 +20,11 @@ const viewportLines = () => fs.readFileSync(path.join(dir, 'journal.jsonl'), 'ut
 
 let nextId = 1;
 // One browser with one controlled tab of the given origin. cdp lists the CDP methods sent (and their params), sent
-// every host request in order; a CDP method put in `failing` fails once.
-function setup({ origin = 'agent', kept = false } = {}) {
+// every host request in order; a CDP method put in `failing` fails once. zoom: the browser's zoom for the site, which
+// Page.getLayoutMetrics reports (that read is not listed in cdp), as 1 while a mobile override is on (as Chromium does).
+function setup({ origin = 'agent', kept = false, zoom } = {}) {
+  let override = null;
+  const zoomOf = { now: zoom };
   const tabId = nextId++;
   const cdp = [];
   const sent = [];
@@ -40,6 +44,9 @@ function setup({ origin = 'agent', kept = false } = {}) {
       if (method !== 'chrome.debugger.sendCommand') throw new Error(`unexpected ${method}`);
       const [, name, args] = params;
       if (name === 'Target.getTargetInfo') return { targetInfo: { title: 'Mobile' } };
+      if (name === 'Page.getLayoutMetrics') return { cssVisualViewport: { zoom: override?.mobile ? 1 : zoomOf.now } };
+      if (name === 'Emulation.setDeviceMetricsOverride') override = args;
+      if (name === 'Emulation.clearDeviceMetricsOverride') override = null;
       cdp.push([name, args]);
       if (failing.delete(name)) throw new Error(`${name} failed`);
       return {};
@@ -56,7 +63,7 @@ function setup({ origin = 'agent', kept = false } = {}) {
     const result = await handlers[name]({ tab: tab.id, snapshot: false, ...args });
     return { ...result, text: result.content.map((c) => c.text).join('\n') };
   };
-  return { tab, cdp, sent, call, browser, failing };
+  return { tab, cdp, sent, call, browser, failing, zoomOf };
 }
 
 test('mobile: metrics override with the given scale and touch on, remembered and journaled', async () => {
@@ -84,9 +91,32 @@ test('desktop keeps the real scale (0) and sends no touch; from mobile it turns 
   await call('viewport', { width: 800, height: 600 });
   assert.deepEqual(cdp.map(([m, p]) => `${m} ${p.enabled ?? p.width}`), [
     'Emulation.setDeviceMetricsOverride 390', 'Emulation.setTouchEmulationEnabled true',
-    'Emulation.setDeviceMetricsOverride 800', 'Emulation.setTouchEmulationEnabled false',
+    'Emulation.clearDeviceMetricsOverride undefined', 'Emulation.setDeviceMetricsOverride 800', 'Emulation.setTouchEmulationEnabled false',
   ]);
   assert.ok(!cdp.some(([m]) => m === 'Emulation.setEmitTouchEventsForMouse'));
+});
+
+test('a site the browser zooms (the user\'s Cmd-minus) still gets the CSS px and scale asked for; mobile emulation ignores the zoom', async () => {
+  const { tab, cdp, call } = setup({ zoom: 0.8 });
+  await call('viewport', { width: 1100, height: 1000 });
+  await call('viewport', { width: 390, height: 844, mobile: true, device_scale_factor: 3 });
+  assert.deepEqual(tab.viewport, { width: 390, height: 844, mobile: true, deviceScaleFactor: 3 }, 'what was asked for is remembered');
+  await call('viewport', { width: 800, height: 600, device_scale_factor: 2 });
+  assert.deepEqual(cdp.filter(([m]) => m.startsWith('Emulation.') && m.endsWith('MetricsOverride')).map(([m, p]) => (m.startsWith('Emulation.clear') ? 'clear' : p)), [
+    { width: 880, height: 800, deviceScaleFactor: 0, mobile: false },
+    { width: 390, height: 844, deviceScaleFactor: 3, mobile: true },
+    'clear', // the zoom is read without the mobile override, which hides it
+    { width: 640, height: 480, deviceScaleFactor: 2.5, mobile: false },
+  ]);
+});
+
+test('a desktop size is sent again for a new page with another browser zoom (the user\'s per-site Cmd-minus)', async () => {
+  const { tab, cdp, call, zoomOf } = setup({ zoom: 0.8 });
+  await call('viewport', { width: 1100, height: 1000 });
+  zoomOf.now = 1; // the next site is at 100%
+  await keepViewportSize(tab);
+  await keepViewportSize(tab); // the same zoom again: nothing to send
+  assert.deepEqual(cdp.filter(([m]) => m === 'Emulation.setDeviceMetricsOverride').map(([, p]) => [p.width, p.height]), [[880, 800], [1100, 1000]]);
 });
 
 test('reset clears the override and touch; a second reset says nothing was set and sends nothing', async () => {
@@ -120,8 +150,26 @@ test('a reset that fails keeps what is left to clear, so another reset finishes 
 
 test('a missing height is refused before anything is sent', async () => {
   const { cdp, call } = setup();
-  assert.match((await call('viewport', { width: 390 })).text, /Pass width and height, or reset: true/);
+  assert.match((await call('viewport', { width: 390 })).text, /Pass both width and height/);
+  assert.match((await call('viewport', {})).text, /Pass width and height, color_scheme or reduced_motion, or reset: true/);
   assert.deepEqual(cdp, []);
+});
+
+test('colour scheme and reduced motion: set alone or with a size, kept together, cleared by reset and at release', async () => {
+  const { tab, cdp, call } = setup();
+  await call('viewport', { color_scheme: 'dark' });
+  assert.deepEqual(cdp.splice(0), [['Emulation.setEmulatedMedia', { media: '', features: [{ name: 'prefers-color-scheme', value: 'dark' }] }]]);
+  await call('viewport', { width: 390, height: 844, reduced_motion: true });
+  assert.deepEqual(cdp.splice(0).map(([name, args]) => (name === 'Emulation.setEmulatedMedia' ? [name, args] : name)), ['Emulation.setDeviceMetricsOverride',
+    ['Emulation.setEmulatedMedia', { media: '', features: [{ name: 'prefers-color-scheme', value: 'dark' }, { name: 'prefers-reduced-motion', value: 'reduce' }] }]]);
+  assert.match((await call('viewport', { reset: true })).text, /back at the tab's real size, colour scheme and motion/);
+  assert.deepEqual(cdp.splice(0).map(([name, args]) => (name === 'Emulation.setEmulatedMedia' ? [name, args] : name)),
+    [['Emulation.setEmulatedMedia', { media: '', features: [] }], 'Emulation.clearDeviceMetricsOverride']);
+  assert.equal(tab.media, null);
+  await call('viewport', { color_scheme: 'light' });
+  cdp.splice(0);
+  await call('tab_release', {});
+  assert.deepEqual(cdp.map(([name, args]) => [name, args]), [['Emulation.setEmulatedMedia', { media: '', features: [] }]]);
 });
 
 test('on a claimed or kept tab it works, with the warning that the user sees it resized', async () => {
@@ -161,4 +209,15 @@ test('turn end clears it before closing or releasing; a failed clear does not st
     return request(method, params);
   };
   assert.deepEqual((await endTurn({ browsers: new Map([['chrome', second.browser]]) })).released, [second.tab.id]);
+});
+
+test('with a dialog open (the page is blocked) it says so at once instead of waiting on the page', async () => {
+  const { tab, cdp, call } = setup();
+  tab.dialog = { type: () => 'alert', message: () => 'Your session is about to expire', defaultValue: () => '' };
+  tab.page.evaluate = () => new Promise(() => {}); // a page under an open alert never answers
+  const result = await Promise.race([call('viewport', { width: 390, height: 844 }), new Promise((r) => setTimeout(() => r('still waiting'), 1000))]);
+  assert.notEqual(result, 'still waiting');
+  assert.equal(result.isError, true);
+  assert.match(result.text, /Dialog open: alert "Your session is about to expire"\. The page is blocked until you resolve it with the dialog tool\./);
+  assert.deepEqual(cdp, [], 'nothing sent');
 });

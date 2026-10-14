@@ -298,7 +298,7 @@ const onRemote = (command) => sh('ssh', [...remote.ssh, command]);
 
 // What runs from the remote test bed for a surface (the extension and host the monitor reads, the sites, and the MCP
 // server or the tee): every file under these paths but tests, notes and node_modules (its lockfile stands for those).
-const BED_PATHS = { common: ['extension', 'host/host.mjs', 'host/install.sh', 'test/demo', 'test/forms', 'test/site', 'test/serve.mjs', 'test/package-lock.json'],
+const BED_PATHS = { common: ['extension', 'host/host.mjs', 'host/install.sh', 'test/demo', 'test/forms', 'test/jobs', 'test/site', 'test/serve.mjs', 'test/package-lock.json'],
   fowlbrowser: ['mcp/bin', 'mcp/src', 'mcp/package.json', 'mcp/package-lock.json'], codex: ['tools/mcp-tee.mjs'], 'codex-agent': [] };
 
 // The bed manifest of a surface: relative path -> md5 of the file in <root>.

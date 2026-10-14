@@ -12,7 +12,7 @@ import { debug } from './debug.mjs';
 import { POPUP_BINDING, POPUP_WORLD, popupsInstalled } from './popups.mjs';
 import { notice, USER_BINDING, USER_WORLD } from './takeover.mjs';
 import { resetEngine } from './trace.mjs';
-import { clearViewport, setViewport } from './viewport.mjs';
+import { clearViewport, setMedia, setViewport } from './viewport.mjs';
 
 const CATEGORIES = ['performance', 'accessibility', 'best-practices', 'seo', 'agentic-browsing'];
 // bf-cache navigates to chrome://terms (refused), unused-javascript and script-treemap-data need the Profiler domain.
@@ -197,6 +197,7 @@ async function run(tab, lh, { device, mode, categories }) {
   // A viewport the agent set (viewport tool) is set again after the run in both modes (the clean-up clears every
   // override); in navigation mode it first makes way for Lighthouse's emulation, a snapshot audits the page at it.
   const viewport = tab.viewport;
+  const media = tab.media; // the colour scheme and motion the agent set, put back the same way
   const warnings = [];
   // The slot, the wait below and the set-up can take a while: a user who took the tab over meanwhile keeps it as it is.
   const takenOver = () => { const n = notice(tab.id); if (n) throw new Error(n); };
@@ -219,7 +220,7 @@ async function run(tab, lh, { device, mode, categories }) {
   const root = rootSession(tab);
   const page = { url: async () => (await root.send('Target.getTargetInfo')).targetInfo.url, target: () => ({ createCDPSession: async () => root }) };
   try {
-    if (viewport && mode === 'navigation') await clearViewport(tab, 'lighthouse');
+    if ((viewport || media) && mode === 'navigation') await clearViewport(tab, 'lighthouse');
     const url = await page.url();
     await root.send('Network.enable');
     await root.send('Network.setCacheDisabled', { cacheDisabled: true });
@@ -248,6 +249,7 @@ async function run(tab, lh, { device, mode, categories }) {
     // now, and nothing more is done to its page (the takeover parks the tab, and the session's overrides end with it).
     if (!notice(tab.id)) await restore(tab, root.scripts);
     if (viewport && !notice(tab.id)) await setViewport(tab, viewport).catch((error) => warnings.push(`The viewport you had set (${viewport.width}x${viewport.height}) could not be put back: ${error.message}. Set it again with viewport.`));
+    if (media && !notice(tab.id)) await setMedia(tab, media).catch((error) => warnings.push(`The colour scheme or motion you had set could not be put back: ${error.message}. Set it again with viewport.`));
     // Lighthouse's init scripts ran in the audited document and its frames (one wraps requestIdleCallback): after a
     // navigation run, whatever its outcome, the page loads once more, so the agent goes on with a clean document
     // (Playwright's reload: refs start over).
@@ -320,6 +322,8 @@ export function registerLighthouse(tool, manager, { withTab, header, text, tabAr
       categories: z.array(z.enum(CATEGORIES)).min(1).optional().describe('Only these categories (default all five).'),
     },
     withTab(async (tab, { device = 'mobile', mode = 'navigation', categories }) => {
+      // The page answers none of the audit's reads while a dialog blocks it.
+      if (tab.dialog) throw new Error('A dialog is open on this tab; resolve it with the dialog tool first.');
       if (mode === 'navigation' && await isUsersTab(tab)) {
         throw new Error(`Tab ${tab.id} is the user's own tab (you claimed it, or it is kept or handed over to them): mode "navigation" reloads the page, so it was not run. ` +
           'Audit a tab_open of the URL instead, or use mode "snapshot" to audit the page as it is.');

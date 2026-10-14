@@ -1,0 +1,139 @@
+[
+  {
+    "name": "mail-triage",
+    "browser": "chrome",
+    "budgetSeconds": 300,
+    "needsClicks": true,
+    "prompt": "in my Spudmail inbox at http://127.0.0.1:5430/t/mail-triage/mail/ in {browser}: archive all three Spud Weekly newsletters, mark the Billing email as read and Priya's lunch email as unread. don't delete anything",
+    "result": "what you changed",
+    "site": {
+      "log": "http://127.0.0.1:5430/t/mail-triage/api/log",
+      "expect": [
+        "^action /mail/archive m1$",
+        "^action /mail/archive m4$",
+        "^action /mail/archive m6$",
+        "^action /mail/read m5$",
+        "^action /mail/unread m7$"
+      ],
+      "forbid": [
+        "^action /mail/delete",
+        "^action /mail/archive m[23579]$"
+      ]
+    }
+  },
+  {
+    "name": "mail-draft",
+    "browser": "helium",
+    "budgetSeconds": 300,
+    "needsClicks": true,
+    "prompt": "open Sam Ortiz's email about the offsite in Spudmail at http://127.0.0.1:5430/t/mail-draft/mail/ in {browser} and write a reply saying I'm in for Friday and asking whether we should bring anything. don't send it, leave it as a draft for me",
+    "result": "what the draft says, and whether it was sent",
+    "site": {
+      "log": "http://127.0.0.1:5430/t/mail-draft/api/log",
+      "expect": [
+        "^action /mail/draft m3 .*\\bFriday\\b.*\\bbring\\b|^action /mail/draft m3 .*\\bbring\\b.*\\bFriday\\b"
+      ],
+      "forbid": [
+        "^action /mail/send"
+      ]
+    },
+    "keep": [
+      "/mail/"
+    ]
+  },
+  {
+    "name": "files",
+    "browser": "chrome",
+    "budgetSeconds": 300,
+    "needsClicks": true,
+    "prompt": "in Spudfiles at http://127.0.0.1:5430/t/files/files/ in {browser}, upload {repo}/test/jobs/files/q3-report.pdf into the Reports folder, and rename draft-final-v2.docx to Q3 plan.docx",
+    "result": "what you uploaded and renamed",
+    "site": {
+      "log": "http://127.0.0.1:5430/t/files/api/log",
+      "expect": [
+        "^action /files/upload reports q3-report\\.pdf \\d+$",
+        "^action /files/rename draft-final-v2\\.docx -> Q3 plan\\.docx$"
+      ],
+      "forbid": [
+        "^action /files/trash",
+        "^action /files/upload root "
+      ]
+    }
+  },
+  {
+    "name": "orders",
+    "browser": "helium",
+    "budgetSeconds": 300,
+    "needsClicks": true,
+    "prompt": "in the orders dashboard at http://127.0.0.1:5430/t/orders/orders/ in {browser}, find order #48213 and tell me its status and the customer's city. if a cookie banner shows up, choose Reject optional",
+    "result": "the order's status and the customer's city",
+    "expect": [
+      "On hold",
+      "Bergen"
+    ],
+    "site": {
+      "log": "http://127.0.0.1:5430/t/orders/api/log",
+      "forbid": [
+        "^action /orders/cookies accept"
+      ]
+    }
+  },
+  {
+    "name": "prefs",
+    "browser": "chrome",
+    "budgetSeconds": 300,
+    "needsClicks": true,
+    "prompt": "in Preferences at http://127.0.0.1:5430/t/prefs/prefs/ in {browser}, set my birthday to March 9, 1991, quiet hours to start at 22:30, notification volume to 40, accent colour to #FF6B00 and language to Deutsch. then save and tell me the reference number it shows",
+    "result": "the reference number shown after saving",
+    "expect": [
+      "SX-\\d+"
+    ],
+    "site": {
+      "log": "http://127.0.0.1:5430/t/prefs/api/log",
+      "expect": [
+        "^action /prefs/save birthday=1991-03-09 quiet=22:30 volume=40 accent=#ff6b00 language=Deutsch ref=SX-\\d+$"
+      ]
+    }
+  },
+  {
+    "name": "chat",
+    "browser": "helium",
+    "budgetSeconds": 300,
+    "needsClicks": true,
+    "prompt": "in #launch on Spudchat at http://127.0.0.1:5430/t/chat/chat/ in {browser}, find the beta date the team agreed on. then post a message in #launch that mentions @Sam Ortiz (pick him from the mention suggestions) and says the beta is confirmed for that date",
+    "result": "the agreed beta date and the message you posted",
+    "expect": [
+      "November 4|Nov\\.? 4\\b"
+    ],
+    "site": {
+      "log": "http://127.0.0.1:5430/t/chat/api/log",
+      "expect": [
+        "^action /chat/post .*@Sam Ortiz .*(November 4|Nov\\.? 4\\b)|^action /chat/post .*(November 4|Nov\\.? 4\\b).*@Sam Ortiz"
+      ],
+      "forbid": [
+        "^action /chat/post .*November 11"
+      ]
+    }
+  },
+  {
+    "name": "sheet",
+    "browser": "chrome",
+    "budgetSeconds": 240,
+    "needsClicks": true,
+    "prompt": "in the budget sheet at http://127.0.0.1:5430/t/sheet/sheet/ in {browser}, change the March marketing budget to 4,500 and tell me the new Q1 total",
+    "result": "the new Q1 total",
+    "expect": [
+      "70,?200"
+    ],
+    "site": {
+      "log": "http://127.0.0.1:5430/t/sheet/api/log",
+      "expect": [
+        "^action /sheet/set Marketing March 4500 total=70200$"
+      ],
+      "forbid": [
+        "^action /sheet/set (Hosting|Salaries|Travel) ",
+        "^action /sheet/set Marketing (January|February) "
+      ]
+    }
+  }
+]

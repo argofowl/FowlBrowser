@@ -274,11 +274,11 @@ export async function shadowRefCenter(tab, ref) {
 
 export const focusShadowRef = (tab, ref) => onNode(tab, ref, 'DOM.focus');
 
-// Calls fn(el) on the node behind an s ref (fn must be self-contained, it runs in the page).
+// Calls fn(el) on the node behind an s ref (fn must be self-contained, it runs in the page); returns its JSON value.
 export async function callOnShadowRef(tab, ref, fn) {
   const { object } = await onNode(tab, ref, 'DOM.resolveNode');
   try {
-    await cdp(tab, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: String(fn) });
+    return (await cdp(tab, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: String(fn), returnByValue: true }))?.result?.value;
   } finally {
     cdp(tab, 'Runtime.releaseObject', { objectId: object.objectId }).catch(() => {});
   }

@@ -86,7 +86,7 @@ export default {
     await t.close(sheet);
     const doc = await t.open(DOC);
     const pdf = await t.call('export', { tab: doc, format: 'pdf' });
-    t.ok(/as pdf \(\d+ KB\)/.test(pdf.text) && fs.readFileSync(savedPath(pdf.text)).subarray(0, 5).toString() === '%PDF-', `pdf: ${pdf.text}`);
+    t.ok(/as pdf \([\d,]+ KB\)/.test(pdf.text) && fs.readFileSync(savedPath(pdf.text)).subarray(0, 5).toString() === '%PDF-', `pdf: ${pdf.text}`);
     const wrong = await t.call('export', { tab: doc, format: 'xlsx' }).then(() => null, (e) => e.message);
     t.ok(/exports as md, txt, pdf, docx, html, not "xlsx"/.test(wrong ?? ''), `wrong format refused: ${wrong}`);
 

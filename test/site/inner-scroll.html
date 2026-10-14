@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Inner scroll</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* An app shell like Stripe's dashboard: the window never scrolls, the content area beside the sidebar does.
+     ?phone: a phone mock-up in the middle of the page instead, whose screen scrolls on its own (prototypes). */
+  html, body { height: 100%; margin: 0; overflow: hidden; }
+  #shell { display: flex; height: 100%; }
+  #sidebar { width: 200px; flex: none; background: #f4f4f6; padding: 12px; }
+  #content { flex: 1; overflow-y: auto; padding: 0 24px; }
+  #content li { height: 40px; }
+  body.phone #shell { align-items: center; justify-content: center; background: #ddd; }
+  body.phone #sidebar { display: none; }
+  body.phone #content { flex: none; width: 360px; height: 600px; background: #fff; border-radius: 32px; }
+</style>
+<div id="shell">
+  <nav id="sidebar" aria-label="Sidebar"><a href="#">Home</a></nav>
+  <main id="content">
+    <h1>Payments</h1>
+    <ul id="rows" aria-label="Payments"></ul>
+  </main>
+</div>
+<script>
+  if (location.search.includes('phone')) document.body.classList.add('phone');
+  const rows = document.getElementById('rows');
+  for (let i = 1; i <= 200; i++) {
+    const li = document.createElement('li');
+    li.textContent = `Payment ${i}`;
+    rows.append(li);
+  }
+</script>

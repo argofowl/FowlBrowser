@@ -9,6 +9,9 @@ import { debug, debugging } from './debug.mjs';
 export const SOCKET_DIR = process.env.FOWLBROWSER_DIR || path.join(os.homedir(), '.fowlbrowser');
 const CONNECT_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 40_000; // the extension already times CDP commands out at 30 s
+// CDP commands that wait on the page (an evaluation's promise, a navigation) have no limit in the extension but the
+// host's 120 s (checked every 10 s): they get longer here, so the host's answer comes first.
+const COMMAND_TIMEOUT_MS = 135_000;
 
 export function listSockets() {
   if (!fs.existsSync(SOCKET_DIR)) return [];
@@ -20,6 +23,7 @@ export class HostClient extends EventEmitter {
   constructor(socketPath) {
     super();
     this.socketPath = socketPath;
+    this.key = path.basename(socketPath, '.sock'); // the browser's name in tab ids ("chrome" in "chrome:52")
     this.hello = null;
     this.closed = false;
     this._pending = new Map();
@@ -69,7 +73,7 @@ export class HostClient extends EventEmitter {
         this._pending.delete(id);
         debug('host timeout', method);
         reject(new Error(`${method} timed out`));
-      }, REQUEST_TIMEOUT_MS);
+      }, method === 'chrome.debugger.sendCommand' ? COMMAND_TIMEOUT_MS : REQUEST_TIMEOUT_MS);
       this._pending.set(id, { resolve, reject, timer });
     });
   }
@@ -137,7 +141,8 @@ export class HostClient extends EventEmitter {
       if (!pending) return;
       this._pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error) pending.reject(new Error(message.error.message));
+      // The extension names tabs by Chrome's number; agents know them as "chrome:52".
+      if (message.error) pending.reject(new Error(String(message.error.message).replace(/\bTab (\d+)\b/g, `Tab ${this.key}:$1`)));
       else pending.resolve(message.result);
       return;
     }

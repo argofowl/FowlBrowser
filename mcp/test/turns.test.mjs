@@ -86,6 +86,14 @@ test('closes unkept agent tabs, releases kept, claimed and kept children, skips 
   fs.rmSync(socketPath, { force: true });
 });
 
+test('a browser the session has no tabs in is not asked: the turn ends at once', async () => {
+  const browser = fakeBrowser();
+  browser.tabs.clear();
+  browser.host.request = () => new Promise(() => {}); // a busy browser that never answers
+  const waited = new Promise((resolve) => setTimeout(resolve, 1000, 'waited for the browser').unref());
+  assert.deepEqual(await Promise.race([endTurn(managerOf(browser)), waited]), { closed: [], released: [], skipped: [] });
+});
+
 test('takes the tab ids before any await: a tab mapped meanwhile is left alone', async () => {
   const browser = fakeBrowser();
   const running = endTurn(managerOf(browser));

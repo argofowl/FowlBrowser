@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Drop zone</title>
+<style>body{font:15px system-ui;margin:24px}#zone{width:360px;height:160px;border:2px dashed #888;border-radius:12px;display:grid;place-items:center}#zone.over{border-color:#2457c5}</style>
+<h1>Attach files</h1>
+<div id="zone" role="region" aria-label="Drop files here">Drag files here</div>
+<ul id="files"></ul>
+<script>
+  window.__log = [];
+  const zone = document.getElementById('zone');
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('over'));
+  zone.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    zone.classList.remove('over');
+    for (const file of e.dataTransfer.files) {
+      const text = await file.text();
+      window.__log.push(`${file.name}:${file.size}:${text.slice(0, 20)}`);
+      document.getElementById('files').insertAdjacentHTML('beforeend', `<li>${file.name}</li>`);
+    }
+  });
+</script>
