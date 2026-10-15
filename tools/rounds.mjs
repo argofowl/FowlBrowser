@@ -379,7 +379,9 @@ async function connectRemote(host, { owner, ports, stamp, held, surface, dir, pr
     if (i === 50 || master.exitCode !== null) throw new Error(`--remote ${host}: the ssh connection did not come up (exit ${master.exitCode})`);
     await sleep(200);
   }
-  remote = { host, ssh, dir, home, bed: `${home}/Projects/FowlBrowser`, runDir: `/tmp/fb-rounds-remote/${stamp}-${path.basename(dir).slice('fb-remote-'.length)}` };
+  // In the remote user's home, not /tmp: another account there could own a /tmp parent and swap the run folder (it
+  // holds recorded frames of the user's pages).
+  remote = { host, ssh, dir, home, bed: `${home}/Projects/FowlBrowser`, runDir: `${home}/.fb-rounds-remote/${stamp}-${path.basename(dir).slice('fb-remote-'.length)}` };
   if (!held) console.log(`--remote ${host}: waiting for its GUI lock as ${owner}`);
   const lock = held ? null : procs.spawn('ssh', [...ssh, `${shq(homePath(setting('remoteGuiLock'), home))} ${shq(owner)} sh -c 'echo locked; exec cat >/dev/null'`], { stdio: ['pipe', 'pipe', 'inherit'] });
   if (lock) {

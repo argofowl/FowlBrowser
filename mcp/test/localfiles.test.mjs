@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { execFileSync } from 'node:child_process';
-import { refuseNonWeb, uploadPaths } from '../src/tools.mjs';
+import { dropPayload, refuseNonWeb, uploadPaths } from '../src/tools.mjs';
 
 test('local file and view-source: URLs are refused however they are written; web URLs pass', () => {
   for (const url of ['file:///Users/me/.ssh/id_ed25519', 'fi\tle:///etc/passwd', 'fi\nle:///etc/passwd', '\u0001file:///etc/passwd',
@@ -134,4 +134,56 @@ test('uploads refuse devices, pipes and sockets, also inside a folder, and syste
   for (const p of ['/Library/Keychains/System.keychain', '/var/log/system.log']) {
     if (fs.existsSync(p)) assert.throws(() => uploadPaths([p]), /inside \/(Library\/Keychains|private\/var\/log)/, p);
   }
+});
+
+test('uploads refuse what another account could swap before it is read: a folder others can write to without the sticky bit', (t) => {
+  fs.mkdirSync('/tmp/fb-fix/B', { recursive: true });
+  const dir = fs.realpathSync.native(fs.mkdtempSync('/tmp/fb-fix/B/swap-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const open = path.join(dir, 'open');
+  const sticky = path.join(dir, 'sticky');
+  for (const [folder, mode] of [[open, 0o777], [sticky, 0o1777]]) {
+    fs.mkdirSync(folder);
+    fs.chmodSync(folder, mode);
+    fs.writeFileSync(path.join(folder, 'report.pdf'), 'x');
+  }
+  // /tmp is sticky, and the user's own files in a sticky folder can't be swapped by others.
+  assert.deepEqual(uploadPaths([path.join(sticky, 'report.pdf')]), [path.join(sticky, 'report.pdf')]);
+  assert.throws(() => uploadPaths([path.join(open, 'report.pdf')]),
+    new RegExp(`can't be uploaded: it sits in ${open}, where another account on this Mac could swap it .*copy it into ~/Downloads first`));
+  // Also below a folder given whole, and through a link that leads there.
+  const project = path.join(dir, 'project');
+  fs.mkdirSync(path.join(project, 'shared'), { recursive: true });
+  fs.writeFileSync(path.join(project, 'shared', 'a.txt'), 'x');
+  assert.deepEqual(uploadPaths([project]), [project]);
+  fs.chmodSync(path.join(project, 'shared'), 0o777);
+  assert.throws(() => uploadPaths([project]), /it sits in .*project\/shared, where another account/);
+  fs.chmodSync(path.join(project, 'shared'), 0o755);
+  fs.symlinkSync(path.join(open, 'report.pdf'), path.join(project, 'linked.pdf'));
+  assert.throws(() => uploadPaths([project]), /it sits in .*\/open, where another account/);
+  // Someone else's file in a shared sticky folder (like /Users/Shared) is theirs to swap.
+  if (fs.existsSync('/Users/Shared')) {
+    const theirs = fs.readdirSync('/Users/Shared').map((n) => path.join('/Users/Shared', n))
+      .find((f) => { try { const st = fs.lstatSync(f); return st.isFile() && st.uid !== process.getuid() && st.uid !== 0 && !path.basename(f).startsWith('.'); } catch { return false; } });
+    if (theirs) assert.throws(() => uploadPaths([theirs]), /it sits in \/Users\/Shared, where another account/);
+  }
+});
+
+test('a dropped file is read only if it is still the file that was checked', (t) => {
+  fs.mkdirSync('/tmp/fb-fix/B', { recursive: true });
+  const dir = fs.realpathSync.native(fs.mkdtempSync('/tmp/fb-fix/B/drop-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'photo.png');
+  fs.writeFileSync(file, 'picture');
+  fs.writeFileSync(path.join(dir, 'secret.txt'), 'SECRET');
+  const ids = new Map();
+  const files = uploadPaths([file], undefined, ids);
+  assert.equal(Buffer.from(dropPayload(files, ids)[0].data, 'base64').toString(), 'picture');
+  // Swapped for a link to another file, for another file, and for a pipe after the check: nothing is read.
+  for (const swap of [() => fs.symlinkSync(path.join(dir, 'secret.txt'), file), () => fs.writeFileSync(file, 'SECRET'), () => execFileSync('mkfifo', [file])]) {
+    fs.rmSync(file);
+    swap();
+    assert.throws(() => dropPayload(files, ids), /photo\.png was not uploaded: it was replaced or changed into something else since it was checked/);
+  }
+  assert.throws(() => dropPayload(files, new Map()), /was not uploaded/); // never checked
 });

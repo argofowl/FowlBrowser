@@ -102,11 +102,15 @@ function refuseLocalPage(tab) {
 // also not through a symlink: paths are resolved first (natively, so "~/library" is ~/Library too). iCloud Drive and the
 // cloud drives (Dropbox, Google Drive, OneDrive) live in ~/Library too and stay allowed. A folder (a webkitdirectory
 // input) is uploaded with everything in it, so all of that is checked too.
+// The file is read by path later (after the page checks, the click and a chooser wait), so nothing on its way may be
+// swappable by another account on this Mac: every folder from / down is the user's or root's, and one that others can
+// write to (/tmp, /Users/Shared) only with the sticky bit and with what it holds on the way owned by the user or root.
+// ids (optional Map): filled with each checked path's dev and ino, so dropFiles reads only that same file.
 const MAX_FOLDER_ENTRIES = 10_000;
 // Finder writes these into folders it shows: view settings, no content. A folder holding them uploads as before.
 const FINDER_FILES = new Set(['.DS_Store', '.localized']);
 const DATA_VOLUME = '/System/Volumes/Data/';
-export function uploadPaths(paths, home = os.homedir()) {
+export function uploadPaths(paths, home = os.homedir(), ids = null) {
   // The Data volume's firmlinks name the same folders: /System/Volumes/Data/Users/me/Downloads is /Users/me/Downloads.
   const unalias = (real) => (real.startsWith(DATA_VOLUME) ? real.slice(DATA_VOLUME.length - 1) : real);
   const library = path.join(unalias(fs.realpathSync.native(home)), 'Library');
@@ -124,6 +128,25 @@ export function uploadPaths(paths, home = os.homedir()) {
     throw new Error(`${p}${real === p ? '' : ` (${real})`} can't be uploaded: ${why}, where keys, passwords and app data live. ` +
       'If the user really wants it uploaded, ask them to move or copy it somewhere like ~/Downloads first.');
   };
+  const uid = process.getuid();
+  const mine = (st) => st.uid === uid || st.uid === 0;
+  // Could another account rename or replace `child` (its lstat) in a folder (its stat)?
+  const exposed = (dirStat, childStat) => !mine(dirStat) || ((dirStat.mode & 0o022) !== 0 && (!(dirStat.mode & 0o1000) || !mine(childStat)));
+  const refuseSwappable = (p, real, dir) => {
+    throw new Error(`${p}${real === p ? '' : ` (${real})`} can't be uploaded: it sits in ${dir}, where another account on this Mac could swap it for a ` +
+      'different file before it is read. If the user really wants it uploaded, ask them to copy it into ~/Downloads first.');
+  };
+  // Every folder on the way to a resolved path, from /.
+  const checkWay = (p, real) => {
+    let dir = path.parse(real).root;
+    let dirStat = fs.statSync(dir);
+    for (const part of real.split(path.sep).filter(Boolean)) {
+      const child = path.join(dir, part);
+      const childStat = fs.lstatSync(child);
+      if (exposed(dirStat, childStat)) refuseSwappable(p, real, dir);
+      [dir, dirStat] = [child, childStat];
+    }
+  };
   // A device (/dev/zero, /dev/stdin), pipe or socket never ends or blocks the read: the upload would hang or crash the session.
   const special = (stat) => !stat.isFile() && !stat.isDirectory();
   const refuseSpecial = (p, what) => {
@@ -135,9 +158,11 @@ export function uploadPaths(paths, home = os.homedir()) {
     let count = 0;
     const seen = new Set([folder]);
     const walk = (dir, rel) => {
+      const dirStat = fs.statSync(dir);
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const full = path.join(dir, entry.name);
         const shown = path.join(rel, entry.name);
+        if (exposed(dirStat, dirStat.mode & 0o022 ? fs.lstatSync(full) : dirStat)) refuseSwappable(p, folder, dir);
         if (++count > MAX_FOLDER_ENTRIES) {
           throw new Error(`${p} can't be uploaded: it holds more than ${MAX_FOLDER_ENTRIES.toLocaleString('en-US')} files and folders. ` +
             'Upload the files the page needs, or a smaller folder.');
@@ -148,6 +173,7 @@ export function uploadPaths(paths, home = os.homedir()) {
           try { real = fs.realpathSync.native(full); } catch { continue; } // a broken link carries nothing
           const why = refusal(real);
           if (why) refuse(p, folder, `it holds ${shown}, a link to ${real}: ${why}`);
+          checkWay(p, real);
         }
         const stat = entry.isSymbolicLink() ? fs.statSync(real) : entry;
         if (special(stat)) refuseSpecial(p, `it holds ${shown}, which is`);
@@ -163,11 +189,41 @@ export function uploadPaths(paths, home = os.homedir()) {
     const real = fs.realpathSync.native(path.resolve(p));
     const why = refusal(real);
     if (why) refuse(p, real, why);
+    checkWay(p, real);
     const stat = fs.statSync(real);
     if (special(stat)) refuseSpecial(p, 'it is');
+    ids?.set(real, { dev: stat.dev, ino: stat.ino });
     if (stat.isDirectory()) checkFolder(p, real);
     return real;
   });
+}
+
+// The files a drop carries, at most DROP_MAX_BYTES in all. Each is read only if it is still the file uploadPaths checked
+// (ids: its dev and ino): opened without following a link at its name, and without waiting on a pipe put in its place.
+const DROP_MAX_BYTES = 40 * 1024 * 1024; // as base64 in one message to the browser, under the host's 64 MB a message
+const TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+  '.pdf': 'application/pdf', '.txt': 'text/plain', '.csv': 'text/csv', '.json': 'application/json', '.zip': 'application/zip', '.mp4': 'video/mp4', '.mov': 'video/quicktime' };
+export function dropPayload(files, ids) {
+  const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+  const opened = [];
+  try {
+    let total = 0;
+    for (const file of files) {
+      let fd;
+      try { fd = fs.openSync(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK); } catch { fd = null; }
+      if (fd !== null) opened.push(fd);
+      const stat = fd === null ? null : fs.fstatSync(fd);
+      const id = ids?.get(file);
+      if (!stat?.isFile() || !id || stat.dev !== id.dev || stat.ino !== id.ino) {
+        throw new Error(`${file} was not uploaded: it was replaced or changed into something else since it was checked. Call upload_files again.`);
+      }
+      if ((total += stat.size) > DROP_MAX_BYTES) throw new Error(`The files are over ${DROP_MAX_BYTES / 1024 / 1024} MB together, too big to drop on a page; use a file input or a file chooser instead.`);
+    }
+    return files.map((file, i) => ({ name: path.basename(file), type: TYPES[path.extname(file).toLowerCase()] ?? '',
+      lastModified: Math.round(fs.fstatSync(opened[i]).mtimeMs), data: fs.readFileSync(opened[i]).toString('base64') }));
+  } finally {
+    for (const fd of opened) fs.closeSync(fd);
+  }
 }
 
 function locator(tab, ref) {
@@ -2123,10 +2179,7 @@ export function registerTools(server, manager) {
   // A drop zone that opens no chooser (drag files here) gets the files dropped on it: real File objects in a
   // DataTransfer, through the drag events a drop from Finder fires (dragenter, dragover, drop) on what is under the
   // element's centre. Chrome refuses file drags over an extension's debugger connection, so they are the page's own
-  // events, which drop zones read the same way. At most DROP_MAX_BYTES in all.
-  const DROP_MAX_BYTES = 40 * 1024 * 1024; // as base64 in one message to the browser, under the host's 64 MB a message
-  const TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-    '.pdf': 'application/pdf', '.txt': 'text/plain', '.csv': 'text/csv', '.json': 'application/json', '.zip': 'application/zip', '.mp4': 'video/mp4', '.mov': 'video/quicktime' };
+  // events, which drop zones read the same way (dropPayload).
   const DROP_FN = (el, files) => {
     const dt = new DataTransfer();
     for (const f of files) {
@@ -2140,13 +2193,7 @@ export function registerTools(server, manager) {
     const init = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, dataTransfer: dt };
     for (const type of ['dragenter', 'dragover', 'drop']) target.dispatchEvent(new DragEvent(type, init));
   };
-  const dropFiles = async (loc, files) => {
-    const sizes = files.map((file) => fs.statSync(file).size);
-    if (sizes.reduce((a, b) => a + b, 0) > DROP_MAX_BYTES) throw new Error(`The files are over ${DROP_MAX_BYTES / 1024 / 1024} MB together, too big to drop on a page; use a file input or a file chooser instead.`);
-    const payload = files.map((file) => ({ name: path.basename(file), type: TYPES[path.extname(file).toLowerCase()] ?? '',
-      lastModified: Math.round(fs.statSync(file).mtimeMs), data: fs.readFileSync(file).toString('base64') }));
-    await loc.evaluate(DROP_FN, payload);
-  };
+  const dropFiles = async (loc, files, ids) => loc.evaluate(DROP_FN, dropPayload(files, ids));
   const CHOOSER_MS = 1500; // after a click on what is no file input: how long a chooser has to open before the files are dropped instead
   tool('upload_files',
     'Upload local files: ref is a file input, a button that opens a file chooser, or a drop zone (drag files here): files are ' +
@@ -2154,7 +2201,8 @@ export function registerTools(server, manager) {
     'Ask the user first before uploading a file they didn\'t name for this site.',
     { tab: tabArg, ref: refArg.optional(), paths: z.array(z.string()).min(1), snapshot: snapshotArg, screenshot: screenshotArg, timeout_ms: timeoutArg },
     withTab(manager, (tab, args) => act(tab, args, async () => {
-      const files = uploadPaths(args.paths);
+      const ids = new Map();
+      const files = uploadPaths(args.paths, undefined, ids);
       if (!args.ref) {
         const chooser = tab.fileChooser;
         if (!chooser) throw new Error('No file chooser is open in this tab. Pass ref: a file input, or a button that opens a file chooser.');
@@ -2182,7 +2230,7 @@ export function registerTools(server, manager) {
           if (tab.fileChooser === opened) tab.fileChooser = null;
           return;
         }
-        await dropFiles(loc, files);
+        await dropFiles(loc, files, ids);
         dropped = true;
       }, { feedback: false, cue: 'transfer' });
       return dropped ? `Ref ${cleanRef(args.ref)} opened no file chooser, so the ${plural} ${files.length === 1 ? 'was' : 'were'} dropped on it (as dragged from Finder).` : `Uploaded ${plural}.`;

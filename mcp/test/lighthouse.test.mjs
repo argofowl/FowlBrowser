@@ -1,10 +1,12 @@
 // The Lighthouse shim (session routing, in-flight cap, restore) over a fake host, and the result text from a small lhr.
 import assert from 'node:assert/strict';
 import EventEmitter from 'node:events';
+import fs from 'node:fs';
 import { test } from 'node:test';
 import zlib from 'node:zlib';
 import { formatResult, restore, rootSession } from '../src/lighthouse.mjs';
 import { TRACE_WAIT } from '../src/perf.mjs';
+import { tracedTabOnly } from '../src/trace.mjs';
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.7000.1 Safari/537.36';
 
@@ -260,7 +262,9 @@ const BUSY = 'Tracing has already been started (possibly in another tab).';
 
 test('Tracing.start goes out as a gzipped stream and waits for a busy browser; the stream comes back as dataCollected chunks', async () => {
   Object.assign(TRACE_WAIT, { waitMs: 500, retryMs: 5 });
-  const trace = { traceEvents: Array.from({ length: 25_000 }, (_, i) => ({ name: 'e', ts: i })), metadata: { v: 1 } };
+  // The audited tab's renderer (pid 1), as TracingStartedInBrowser names it.
+  const started = { name: 'TracingStartedInBrowser', pid: 2, ts: 0, args: { data: { frameTreeNodeId: 1, frames: [{ frame: 'F', processId: 1, url: 'https://site.example/' }] } } };
+  const trace = { traceEvents: [started, ...Array.from({ length: 24_999 }, (_, i) => ({ name: 'e', pid: 1, ts: i }))], metadata: { v: 1 } };
   const gz = zlib.gzipSync(JSON.stringify(trace));
   let starts = 0;
   let offset = 0;
@@ -285,6 +289,61 @@ test('Tracing.start goes out as a gzipped stream and waits for a busy browser; t
   assert.equal(methods.at(-1), 'IO.close');
   assert.deepEqual(tab.browser.host.calls.at(-1).params, { handle: 's1' });
   root.close();
+});
+
+// Another tab's font request just before the page's layout shift (trace-load.json.gz), in that tab's renderer and frame.
+const OTHER_FONT = 'https://other-tab.example/private/font.woff2';
+function withOtherTabsFont() {
+  const trace = JSON.parse(zlib.gunzipSync(fs.readFileSync(new URL('./fixtures/trace-load.json.gz', import.meta.url))));
+  const shift = trace.traceEvents.find((e) => e.name === 'LayoutShift');
+  const t = trace.traceEvents.filter((e) => e.name === 'PrePaint' && e.pid === shift.pid && e.ts <= shift.ts).at(-1).ts - 50_000;
+  const [pid, tid, frame, requestId] = [9999, 1, 'F'.repeat(32), '9999.1'];
+  const at = (name, ts, data) => ({ ph: 'I', s: 't', cat: 'devtools.timeline', name, pid, tid, ts, args: { data: { frame, requestId, ...data } } });
+  const timing = { requestTime: t / 1e6, proxyStart: -1, proxyEnd: -1, dnsStart: -1, dnsEnd: -1, connectStart: -1, connectEnd: -1, sslStart: -1, sslEnd: -1,
+    sendStart: 0.1, sendEnd: 0.2, receiveHeadersStart: 5, receiveHeadersEnd: 5, pushStart: 0, pushEnd: 0, workerStart: -1, workerReady: -1 };
+  trace.traceEvents.push(
+    { ph: 'M', cat: '__metadata', name: 'process_name', pid, tid: 0, args: { name: 'Renderer' } },
+    at('ResourceSendRequest', t, { url: OTHER_FONT, resourceType: 'Font', priority: 'VeryHigh', requestMethod: 'GET', renderBlocking: 'non_blocking' }),
+    at('ResourceReceiveResponse', t + 10_000, { mimeType: 'font/woff2', statusCode: 200, encodedDataLength: 100, fromCache: false, fromServiceWorker: false, protocol: 'h2', responseTime: 1, timing }),
+    at('ResourceFinish', t + 20_000, { finishTime: (t + 20_000) / 1e6, encodedDataLength: 100, decodedBodyLength: 100, didFail: false }));
+  return trace;
+}
+
+// Lighthouse 13's insight audits, run offline on a trace as its run would (the trace is all they read here).
+async function insightAudits(trace) {
+  const { defaultSettings: settings } = await import('lighthouse/core/config/constants.js');
+  const dir = new URL('../node_modules/lighthouse/core/audits/insights/', import.meta.url);
+  const results = {};
+  for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('-insight.js')).sort()) {
+    const { default: audit } = await import(new URL(file, dir));
+    const artifacts = { Trace: structuredClone(trace), TraceElements: [], SourceMaps: [], HostDPR: 1, settings };
+    results[file] = JSON.stringify(await audit.audit(artifacts, { settings, computedCache: new Map(), options: {} }).catch((e) => `error: ${e.message}`));
+  }
+  return results;
+}
+
+test('Lighthouse gets only the audited tab\'s trace: another tab\'s font request never reaches its layout shift culprits', async () => {
+  const trace = withOtherTabsFont();
+  const raw = await insightAudits(trace);
+  assert.match(raw['cls-culprits-insight.js'], new RegExp(OTHER_FONT.replaceAll('.', '\\.')), 'the whole-browser trace leaks it (as before the fix)');
+  // What collectTrace hands Lighthouse.
+  const gz = zlib.gzipSync(JSON.stringify(trace));
+  const tab = fakeTab((method) => (method === 'IO.read' ? { data: gz.toString('base64'), base64Encoded: true, eof: true } : {}));
+  const root = rootSession(tab);
+  const handed = [];
+  root.on('Tracing.dataCollected', (p) => handed.push(...p.value));
+  const complete = new Promise((resolve) => root.once('Tracing.tracingComplete', resolve));
+  event(tab, 'Tracing.tracingComplete', { stream: 's3', dataLossOccurred: false });
+  await complete;
+  root.close();
+  assert.ok(handed.length > 18_000, `the tab's events go through (${handed.length})`);
+  assert.doesNotMatch(JSON.stringify(handed), /other-tab\.example/);
+  const filtered = await insightAudits({ traceEvents: handed });
+  assert.doesNotMatch(filtered['cls-culprits-insight.js'], /other-tab\.example/);
+  // The audited page's own results: every insight audit as on the trace without the other tab.
+  const clean = await insightAudits(JSON.parse(zlib.gunzipSync(fs.readFileSync(new URL('./fixtures/trace-load.json.gz', import.meta.url)))));
+  assert.deepEqual(filtered, clean);
+  assert.ok(Object.values(clean).every((r) => !r.startsWith('"error')), 'every audit ran');
 });
 
 test('a failed stream read still completes the trace, with no events, and closes the stream', async () => {

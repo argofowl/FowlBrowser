@@ -361,7 +361,13 @@ honest pages; a page can always show its own field's value, so a page faking its
   height (80% each, like page scrolls); with no such box, the mouse wheel over the ref; ref alone: into view), `drag {tab, from_ref, to_ref}`, `upload_files {tab, ref, paths}` (paths resolved through symlinks, `/System/Volumes/Data/<x>` counted as `/<x>`; hidden files and folders, `~/Library` other than iCloud
   Drive and `~/Library/CloudStorage`, `/etc`, `/System`, `/private/var/db`, `/Library/Keychains` and `/private/var/log` are refused, and so is
   anything that isn't a regular file or folder (a device like `/dev/zero`, a pipe, a socket); a folder is refused if anything in it is hidden,
-  not a regular file or folder, or a link into those places, or it holds more than 10,000 entries),
+  not a regular file or folder, or a link into those places, or it holds more than 10,000 entries; a path is also refused
+  when another account on this Mac could swap it before it is read: a folder on the way (from `/` down, also inside an
+  uploaded folder and at a link's target) that belongs to neither the user nor root, or that group or others can write to
+  without the sticky bit, or with it but holding an item someone else owns (so /tmp stays usable for the user's own
+  files, and files on a volume that ignores ownership are refused: copy them into ~/Downloads first); a dropped file is
+  opened without following a link at its name and read only if it is still the file that was checked (same device and
+  inode); file inputs and choosers get the checked path, which Chrome reads itself),
   `dialog {tab, accept, text?}`, `wait_for {tab, text? | text_gone? | url? | seconds?}` (text: until a visible copy of it is in
   any frame, iframes too, as the snapshot shows them; text_gone: until no frame shows one; read every 100 ms; a timeout
   says what did not happen, and whether the text was there but hidden),
@@ -954,8 +960,9 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   `trace_start` (this server's runs queue; a navigation run waits for another session's or DevTools' recording as above
   before it starts, its own `Tracing.start` then retries for up to 25 s more, under Lighthouse's 30 s protocol timeout,
   and a wait of 1 s or more is a warning line; still busy, the run fails saying so). Its trace comes back as a gzipped
-  stream too: the session turns Lighthouse's `Tracing.start` into one and, on `tracingComplete`, reads it, gunzips it
-  and hands the events to Lighthouse as `Tracing.dataCollected` chunks of 10,000, then `tracingComplete`; a failed read
+  stream too: the session turns Lighthouse's `Tracing.start` into one and, on `tracingComplete`, reads it, gunzips it,
+  keeps only the audited tab's events as `trace_stop` does (Lighthouse's layout-shift culprits otherwise pick up another
+  tab's font requests by timing alone, URLs included, into the report) and hands the events to Lighthouse as `Tracing.dataCollected` chunks of 10,000, then `tracingComplete`; a failed read
   completes with no events, and Lighthouse reports that; so does a run that ended meanwhile (its `IO.close` still goes
   out, raw). The retrying start and the stream read count as sends in flight for the 45 s settle, and a start retrying
   when the run ends stops at its next try. A run abandoned when the browser connection closed gets up to 60 s to end

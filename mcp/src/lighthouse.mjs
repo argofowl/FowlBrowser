@@ -11,7 +11,7 @@ import { cdp, clearEmulation, fileTab, isUsersTab, onCdpEvent, outputDir, readSt
 import { debug } from './debug.mjs';
 import { POPUP_BINDING, POPUP_WORLD, popupsInstalled } from './popups.mjs';
 import { notice, USER_BINDING, USER_WORLD } from './takeover.mjs';
-import { resetEngine } from './trace.mjs';
+import { resetEngine, tracedTabOnly } from './trace.mjs';
 import { clearViewport, setMedia, setViewport } from './viewport.mjs';
 
 const CATEGORIES = ['performance', 'accessibility', 'best-practices', 'seo', 'agentic-browsing'];
@@ -98,13 +98,15 @@ export class Session extends EventEmitter {
   }
   // One in-flight operation for settled(). IO.close goes raw: a run that closed meanwhile refuses sends, but the
   // stream's buffer in Chrome is still worth freeing. Such a run gets its completion with no events (Lighthouse's
-  // collector would otherwise wait for it without end), and says so.
+  // collector would otherwise wait for it without end), and says so. Chrome traces the whole browser: Lighthouse gets
+  // only the audited tab's events (trace.mjs tracedTabOnly), or its audits (layout shift culprits: any font request
+  // before a shift) could put another tab's URLs in the report.
   collectTrace({ stream, dataLossOccurred }) {
     const send = (m, p) => (m === 'IO.close' ? cdp(this.shared.tab, m, p, this.sessionId) : this.send(m, p));
     const op = (async () => {
       let events = [];
       try {
-        ({ traceEvents: events } = JSON.parse((await gunzip(await readStream(send, stream))).toString('utf8')));
+        ({ traceEvents: events } = tracedTabOnly(JSON.parse((await gunzip(await readStream(send, stream))).toString('utf8'))));
       } catch (error) {
         debug('lh trace', String(error?.message).slice(0, 120)); // Lighthouse then has no trace events, and says so
       }
