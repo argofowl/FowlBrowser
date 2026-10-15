@@ -274,9 +274,10 @@ async function checkRefs(tab, args) {
 }
 
 // The agent cursor (docs/cursor-spec.md), only in a tab the user can see: it travels to `where` (a point, or a function
-// returning one) before the action, plays `cue` during it (cueOnPress: from the action's mouse press on), and clicks
-// when the action presses the mouse button (feedback: false when the action is no click), not once the action and a
-// navigation it started are done; an action that presses none (a select) clicks at its end. Not shown: none of it runs.
+// returning one) before the action, plays `cue` during it (painted before it starts; cueOnPress: from the action's
+// mouse press on), and clicks when the action presses the mouse button (feedback: false when the action is no click),
+// not once the action and a navigation it started are done; an action that presses none (a select) clicks at its end.
+// Not shown: none of it runs.
 async function pointed(tab, where, action, { feedback = true, shown, cue, cueOnPress = false, deadline = Date.now() + cursor.ARRIVAL_CAP_MS } = {}) {
   // One budget for the whole cursor path (visibility, target, travel): a slow answer means "not shown".
   shown ??= await cursor.isShown(tab);
@@ -286,7 +287,7 @@ async function pointed(tab, where, action, { feedback = true, shown, cue, cueOnP
   let late = false;
   const target = shown ? await cursor.moveTo(tab, where, Math.max(0, deadline - Date.now()), { acting, onLate: () => { late = true; } }) : null;
   const seen = record.recording && shown ? await record.pointSeen(tab, target, () => cursor.state(tab)) : null;
-  if (shown && cue && !cueOnPress) cursor.cue(tab, cue);
+  if (shown && cue && !cueOnPress) await cursor.painted(cursor.cue(tab, cue));
   let pressed = false;
   const onInput = (method, params) => {
     if (pressed || method !== 'Input.dispatchMouseEvent' || params?.type !== 'mousePressed') return;
@@ -314,14 +315,20 @@ async function pointed(tab, where, action, { feedback = true, shown, cue, cueOnP
 
 // The cursor for an action with no point (reading, waiting, typing into the focused element): it shows where it
 // last was with the action's cue, during the action (after: once it is done, for navigations and screenshots).
-// Never delays the action: visibility is asked alongside it, and the cue calls keep their order.
+// A cue during the action is painted first (cursor.painted: CUE_WAIT_MS at most, the visibility answer included;
+// not when the tab wasn't shown when last asked); the cue calls keep their order.
 // follow: the cursor also shows clicks the action makes from a script (evaluate); in record mode the action waits
 // (up to FOLLOW_CAP_MS) until the overlay listens, so none is missed.
 const FOLLOW_CAP_MS = 300;
 async function cued(tab, kind, action, { after = false, follow = false } = {}) {
   const shown = cursor.isShown(tab);
-  const following = after ? null : shown.then((yes) => { if (yes) { cursor.cue(tab, kind); if (follow) return cursor.follow(tab, true); } });
-  if (follow && following && record.recording) await Promise.race([following, sleep(FOLLOW_CAP_MS)]);
+  if (!after) {
+    const cueing = shown.then((yes) => yes && cursor.cue(tab, kind));
+    // A tab that wasn't shown when last asked starts at once (its cue still shows if it is now).
+    const painting = cursor.wasShown(tab) === false ? null : cursor.painted(cueing);
+    const following = follow && shown.then((yes) => yes && cursor.follow(tab, true));
+    await Promise.all([painting, following && record.recording && Promise.race([following, sleep(FOLLOW_CAP_MS)])]);
+  }
   try {
     const result = await action();
     if (after) shown.then((yes) => { if (yes) { cursor.cue(tab, kind); cursor.cueEnd(tab); } });
@@ -2157,7 +2164,7 @@ export function registerTools(server, manager) {
       const a = await fromPoint();
       if (!a) throw new Error('The from element has no box on the page (hidden or zero size).');
       await refuseNativeUI(tab, { point: a, what: `The element at ${Math.round(a.x)},${Math.round(a.y)}`, by: 'A drag starting on it' });
-      if (shown) cursor.cue(tab, 'drag');
+      if (shown) await cursor.painted(cursor.cue(tab, 'drag'));
       let b;
       try {
         await tab.page.mouse.move(a.x, a.y);
@@ -2479,8 +2486,9 @@ export function registerTools(server, manager) {
       let handle, refused, status;
       // Players often build their <video> after load (YouTube is a single-page app).
       if (!args.ref) await tab.page.locator('video, audio').first().waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+      const started = Date.now();
       const shown = await cursor.isShown(tab);
-      if (shown) cursor.cue(tab, 'observe');
+      if (shown) await cursor.painted(cursor.cue(tab, 'observe'), started);
       try {
         for (let attempt = 0; ; attempt++) {
           try {

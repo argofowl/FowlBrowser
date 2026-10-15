@@ -11,8 +11,11 @@ import * as cursor from '../src/cursor/index.mjs';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let nextTab = 1;
-function fakeTab({ captureDelayMs = 0, shown = true, zoom = 1, zoomDelayMs = 0 } = {}) {
+// cueDelayMs: how long the overlay takes to answer a cue (it answers once the word is painted; Infinity: never).
+// answered: the overlay calls with the time their answer came back.
+function fakeTab({ captureDelayMs = 0, shown = true, zoom = 1, zoomDelayMs = 0, cueDelayMs = 0 } = {}) {
   const evaluated = []; // overlay calls, in the order the host received them
+  const answered = [];
   const host = {
     async request(method, params) {
       if (method === 'tabs.isShown') return { shown };
@@ -23,11 +26,13 @@ function fakeTab({ captureDelayMs = 0, shown = true, zoom = 1, zoomDelayMs = 0 }
       const call = args.expression.startsWith('globalThis.__fbCursor.') ? args.expression.slice('globalThis.__fbCursor.'.length) : 'overlay source';
       evaluated.push(call);
       if (call === 'capture(true)') await sleep(captureDelayMs);
+      if (call.startsWith('cue(')) await (cueDelayMs === Infinity ? new Promise(() => {}) : sleep(cueDelayMs));
+      answered.push({ call, at: Date.now() });
       return { result: { value: true } };
     },
   };
   const tabId = nextTab++;
-  return { tab: { id: `chrome:${tabId}`, tabId, documentGeneration: 0, page: new EventEmitter(), browser: { host } }, evaluated };
+  return { tab: { id: `chrome:${tabId}`, tabId, documentGeneration: 0, page: new EventEmitter(), browser: { host } }, evaluated, answered };
 }
 
 test('a slow hide does not hold up the screenshot, and the cursor is shown again after it', async () => {
@@ -272,15 +277,82 @@ test('a resize that leaves the resting cursor outside the window (a smaller view
 // A click whose page is too busy to answer within the cursor's budget (a loaded Mac: the page's thread stalls for a
 // second or so): the action waits for the page and goes through, and so must the cursor. Its target, found once the
 // page answers, is landed while the action runs, and the click shows there, not where the last action was.
-test('a page too busy for the cursor budget still gets the cursor on the target, and the click shown there', async () => {
+// The tools against the fake tab `shape` (fakeTab) showing `page`: a fake Playwright page with the given methods.
+async function withTools(shape, methods) {
   const { Tab } = await import('../src/browsers.mjs');
-  const { registerTools, REF_POINT_FN } = await import('../src/tools.mjs');
+  const { registerTools } = await import('../src/tools.mjs');
+  const page = Object.assign(new EventEmitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://mail.example/', mainFrame: () => page, isClosed: () => false,
+    ...methods,
+  });
+  const host = {
+    async request(method, params) {
+      if (method === 'tabs.expectChild') return {};
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'Mail' } };
+      return shape.browser.host.request(method, params);
+    },
+  };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  const tab = new Tab(browser, shape.tabId, page);
+  browser.tabs.set(tab.tabId, tab);
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  const call = async (name, args) => {
+    const result = await tools[name]({ tab: tab.id, ...args });
+    assert.equal(!!result.isError, false, result.content.map((c) => c.text).join('\n'));
+  };
+  return { tab, call };
+}
+
+// A snapshot of a big page keeps the page's main thread busy until it is done: its "Reading" must be on screen first.
+async function snapshotStart(fake) {
+  let readAt;
+  const { call } = await withTools(fake.tab, { ariaSnapshot: async () => { readAt ??= Date.now(); return '- row "Billing" [ref=e1]'; } });
+  const started = Date.now();
+  await call('snapshot', {});
+  return { waitedMs: readAt - started, readAt };
+}
+
+test('an action shown with a cue starts only once the overlay has painted the cue', async () => {
+  const fake = fakeTab({ cueDelayMs: 50 }); // two frames on a slowish page
+  const { waitedMs, readAt } = await snapshotStart(fake);
+  const cue = fake.answered.find((a) => a.call.startsWith('cue("observe"'));
+  assert.ok(cue && cue.at <= readAt, `the snapshot started ${cue ? cue.at - readAt : '?'} ms before the cue was painted`);
+  assert.ok(waitedMs >= 45, `waited ${waitedMs} ms`);
+});
+
+test('a cue that is never painted holds the action up CUE_WAIT_MS at most', async () => {
+  const fake = fakeTab({ cueDelayMs: Infinity });
+  const { waitedMs } = await snapshotStart(fake);
+  assert.ok(waitedMs >= cursor.CUE_WAIT_MS - 5 && waitedMs <= cursor.CUE_WAIT_MS + 40, `waited ${waitedMs} ms`);
+});
+
+test('in a tab the user can\'t see, an action shows no cue and doesn\'t wait for one', async () => {
+  const fake = fakeTab({ shown: false, cueDelayMs: Infinity });
+  const { waitedMs } = await snapshotStart(fake);
+  assert.ok(waitedMs < 20, `waited ${waitedMs} ms`);
+  assert.deepEqual(fake.evaluated, []);
+});
+
+test('a cue waited for until painted keeps its order with its end and the next cue', async () => {
+  const { tab, evaluated } = fakeTab({ cueDelayMs: 40, zoomDelayMs: 30 });
+  const first = cursor.cue(tab, 'observe');
+  cursor.cueEnd(tab);
+  cursor.cue(tab, 'text');
+  assert.equal(await cursor.painted(first), true, 'the cue\'s paint was not waited for');
+  await sleep(150);
+  assert.deepEqual(evaluated.map((c) => c.split('(')[0]), ['overlay source', 'cue', 'cueEnd', 'cue']);
+  assert.match(evaluated.at(-1), /^cue\("text"/);
+});
+
+test('a page too busy for the cursor budget still gets the cursor on the target, and the click shown there', async () => {
+  const { REF_POINT_FN } = await import('../src/tools.mjs');
   const { tab: shape, evaluated } = fakeTab();
   const boxes = { e1: { x: 404, y: 215, w: 758, h: 43 }, e2: { x: 89, y: 258, w: 103, h: 22 } };
   let busyUntil = 0; // the page answers nothing before this (wall clock)
   let tab;
-  const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://mail.example/', mainFrame: () => page, isClosed: () => false,
+  const methods = {
     ariaSnapshot: async () => '- row "Billing" [ref=e1]\n- row "Priya Natarajan" [ref=e2]',
     getByRef: (ref) => ({
       count: async () => 1,
@@ -296,24 +368,9 @@ test('a page too busy for the cursor budget still gets the cursor on the target,
         tab.emit('input', 'Input.dispatchMouseEvent', { type: 'mousePressed' });
       },
     }),
-  });
-  const host = {
-    async request(method, params) {
-      if (method === 'tabs.expectChild') return {};
-      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'Mail' } };
-      return shape.browser.host.request(method, params);
-    },
   };
-  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
-  browser.waitForTab = async (id) => browser.tabs.get(id);
-  tab = new Tab(browser, shape.tabId, page);
-  browser.tabs.set(tab.tabId, tab);
-  const tools = {};
-  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
-  const call = async (name, args) => {
-    const result = await tools[name]({ tab: tab.id, ...args });
-    assert.equal(!!result.isError, false, result.content.map((c) => c.text).join('\n'));
-  };
+  let call;
+  ({ tab, call } = await withTools(shape, methods));
   await call('snapshot', {});
   await call('click', { ref: 'e1', snapshot: false });
   evaluated.length = 0;

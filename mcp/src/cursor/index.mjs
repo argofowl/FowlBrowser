@@ -1,7 +1,7 @@
 // The on-page agent cursor (docs/cursor-spec.md): shows the user where an agent is about to act, only in a tab they can
 // see. The overlay (overlay.js) lives in an isolated world of the tab's top frame, injected through the tab's
 // debugger session once per document. Everything here is best effort: errors only go to debug(), and no call
-// delays an action beyond ARRIVAL_CAP_MS plus LAND_CAP_MS.
+// delays an action beyond ARRIVAL_CAP_MS plus LAND_CAP_MS, plus CUE_WAIT_MS for an action shown with a cue.
 import fs from 'node:fs';
 import { LABEL } from '../browsers.mjs';
 import { debug } from '../debug.mjs';
@@ -11,6 +11,7 @@ const SOURCE = fs.readFileSync(new URL('./overlay.js', import.meta.url), 'utf8')
 const WORLD = 'fowlbrowser-cursor';
 export const ARRIVAL_CAP_MS = 900; // the longest move is 850 ms (overlay.js MAX_MOVE_MS)
 const LAND_CAP_MS = 150;
+export const CUE_WAIT_MS = 120; // an action waits this long at most for its cue to be painted (painted())
 const SHOWN_CAP_MS = 700;
 const HIDE_CAP_MS = 400;
 const REMOVE_CAP_MS = 400; // exit animation (200 ms) plus a round trip
@@ -32,19 +33,26 @@ function capped(promise, ms) {
 
 // Whether the user can see the tab: the active tab of a normal, non-minimized window. Older extensions don't know
 // the command; then nothing is shown.
+const lastShown = new WeakMap(); // Tab -> the last answer isShown got
 export async function isShown(tab) {
   if (recording) return true; // record mode: every tab this session controls, background tabs too
+  let shown = false;
   try {
     // A slow answer (window change, busy extension) counts as not shown, so the cursor never holds up an action.
     const answer = tab.browser.host.request('tabs.isShown', { tabId: tab.tabId });
     let timer;
     const late = new Promise((resolve) => { timer = setTimeout(resolve, SHOWN_CAP_MS, null); });
-    return (await Promise.race([answer, late]).finally(() => clearTimeout(timer)))?.shown === true;
+    shown = (await Promise.race([answer, late]).finally(() => clearTimeout(timer)))?.shown === true;
   } catch (error) {
     debug('cursor: isShown failed', error.message);
-    return false;
   }
+  lastShown.set(tab, shown);
+  return shown;
 }
+
+// Whether the tab was shown when last asked (undefined: never asked). A tab that wasn't doesn't wait for its answer
+// before an action: a background tab costs nothing.
+export const wasShown = (tab) => (recording ? true : lastShown.get(tab));
 
 // The isolated world of the tab's current document, with the overlay evaluated in it (created once per document).
 function world(tab, { create = true } = {}) {
@@ -153,22 +161,30 @@ export async function drainClicks(tab) {
 }
 
 // Shows the cursor where it last was (or at its rest point) with an action cue beside the tip: observe, scroll,
-// text, key, navigate, drag, transfer. Looping cues run until cueEnd. Fire and forget.
+// text, key, navigate, drag, transfer. Looping cues run until cueEnd. Resolves once the overlay has painted the word
+// (it answers two frames after the call, within 100 ms), never rejects; callers that don't wait for it ignore it.
 // A tab's cue calls go out one after another, in the order they were made: a cue waits for the zoom, and an end
 // sent before an earlier cue arrived would end the next one instead.
 const cues = new WeakMap(); // Tab -> the last cue call on its way
 const inTurn = (tab, send, failed) => {
   const next = Promise.resolve(cues.get(tab)).then(send).catch((error) => debug(failed, tab.id, error.message));
   cues.set(tab, next);
+  return next;
 };
 export function cue(tab, kind) {
-  if (capturing.get(tab)) return; // a late cue of an earlier action would land in the screenshot
+  if (capturing.get(tab)) return Promise.resolve(false); // a late cue of an earlier action would land in the screenshot
   world(tab); // made while the zoom is read
   const zoom = zoomOf(tab);
-  inTurn(tab, async () => {
+  return inTurn(tab, async () => {
     const opts = { label: LABEL, from: states.get(tab)?.last ?? null, zoom: await zoom };
-    if (!capturing.get(tab)) await call(tab, `cue(${JSON.stringify(kind)}, ${JSON.stringify(opts)})`);
+    if (!capturing.get(tab)) return call(tab, `cue(${JSON.stringify(kind)}, ${JSON.stringify(opts)})`, { wait: true });
   }, 'cursor: cue failed');
+}
+
+// An action shown with a cue starts once the cue is painted, so the word is on screen before an action that keeps the
+// page's main thread busy (a snapshot of a big page) holds back every frame; at most CUE_WAIT_MS after `since`.
+export function painted(cueing, since = Date.now()) {
+  return capped(cueing, CUE_WAIT_MS - (Date.now() - since));
 }
 
 // While on, the overlay shows clicks a page script makes (an agent's evaluate) as cursor travel and clicks, and in

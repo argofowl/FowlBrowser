@@ -4,7 +4,7 @@
 //                                           (for a fresh document), w,h the target's box (bigger targets are quicker),
 //                                           until the wall-clock ms by which it must arrive
 //   land(x, y, opts) -> changed             the tip on (x, y) at full opacity at once (travel and appear fade cut short)
-//   cue(kind, opts) / cueEnd()             the action as a word in place of the label: observe, scroll, text, key,
+//   cue(kind, opts) -> Promise<shown> / cueEnd()   the action as a word in place of the label: observe, scroll, text, key,
 //                                          navigate, drag, transfer ("Claude" morphs into "Typing" and back)
 //   click()                                press and ring at the current point
 //   follow(on, record)                     while on, travels to and clicks on clicks a script makes (an agent's evaluate);
@@ -12,7 +12,7 @@
 //   hide()                                 exit animation, then the host is removed; resolves when gone
 //   capture(on)                            display:none while the agent takes a screenshot
 //   state() / drainClicks()                record mode: what a viewer sees now; script clicks shown since the last drain
-// No dependencies. rAF runs only while the pointer travels or turns back to rest; the rest is WAAPI.
+// No dependencies and no frame loop: all motion is WAAPI, the travel too (worked out ahead, so the compositor plays it).
 (() => {
   if (globalThis.__fbCursor) return;
 
@@ -37,10 +37,13 @@
   const PAD = 7; // the label's text inset
   const MAX_PILL = 200;
   const RING_R = 22; // the click ring's radius when it has spread
-  const WORD_MS = 180; // a word change: the next word in, the pill to its width
-  const SHIMMER_MS = 1500; // one pass of the light over an action word
-  const SHIMMER_EVERY_MS = 4000; // and the next pass this long after the last one began
-  const MIN_CUE_MS = 600; // an action word for a quick action stays long enough to be read
+  const WORD_MS = 180; // the label gliding to another side of the arrow
+  const MORPH_MS = 280; // a word change: letters both words share slide over, the pill glides to its width
+  const EASE_IN_OUT = 'cubic-bezier(0.77, 0, 0.175, 1)'; // for what moves on screen (shared letters, the pill's end)
+  const DIM = 0.6; // an action word at rest; the light sweeping over it is full strength
+  const SHIMMER_MS = 1100; // one pass of the light over an action word
+  const SHIMMER_EVERY_MS = 1800; // and the next pass this long after the last one began
+  const MIN_CUE_MS = 900; // an action word for a quick action stays long enough to be read
   const ONE_SHOT_MS = 1200; // a key press or a page load: its word shows this long
   const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
   let still = motionQuery.matches;
@@ -76,12 +79,23 @@
     .arrow { fill: var(--fill); stroke: #fff; stroke-width: ${1.7 / SCALE}; stroke-linejoin: round; paint-order: stroke; }
     .edge { fill: none; stroke: #131110; stroke-opacity: 0.3; stroke-width: ${0.45 / SCALE}; }
     .badge { position: absolute; left: 0; top: 0; }
-    .pill { position: relative; height: 17px; border-radius: 8.5px; overflow: hidden; background: var(--fill);
-      box-shadow: 0 0 0 1.5px #fff, 0 1px 3px rgba(0, 0, 0, 0.3); }
+    .pill { position: relative; height: 17px; }
+    /* The pill as two pieces that only move by transform and clip-path, so its width glides on the compositor: a long
+       left piece cut off at the right end's centre, and a round right end that slides. White rims under both fills. */
+    .shape { position: absolute; left: 0; top: 0; filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.3)); }
+    .shape > div { position: absolute; left: 0; top: 0; height: 17px; border-radius: 8.5px; background: var(--fill); }
+    .shape > .rim { left: -1.5px; top: -1.5px; height: 20px; border-radius: 10px; background: #fff; }
+    .shape > .long { width: ${MAX_PILL}px; }
+    .shape > .long.rim { width: ${MAX_PILL + 3}px; }
+    .shape > .end { width: 17px; }
+    .shape > .end.rim { width: 20px; }
+    .text { position: absolute; left: 0; top: 0; width: ${MAX_PILL}px; height: 17px; }
     .word, .measure { position: absolute; left: ${PAD}px; top: 0; white-space: nowrap; color: var(--text); letter-spacing: 0.01em;
       font: 600 10.5px/17px -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
-    .word { max-width: ${MAX_PILL - 2 * PAD}px; overflow: hidden; text-overflow: ellipsis; transform-origin: 0 50%; }
-    .word.busy { color: var(--dim); }
+    .word { height: 17px; }
+    .ch { position: absolute; left: 0; top: 0; transform-origin: 50% 60%; }
+    .ch.whole { max-width: ${MAX_PILL - 2 * PAD}px; overflow: hidden; text-overflow: ellipsis; transform-origin: 0 50%; }
+    .word.busy > .ch { opacity: ${DIM}; }
     .ring { position: absolute; left: ${-RING_R}px; top: ${-RING_R}px; width: ${2 * RING_R}px; height: ${2 * RING_R}px;
       box-sizing: border-box; border: 2px solid; border-radius: 50%; }
     .measure { left: 0; visibility: hidden; }
@@ -103,8 +117,7 @@
   let pose = 0; // the turn it rests in: 0, or a quarter or half turn where the window's edge would cut it off
   let placed = ''; // which side of the arrow the label is on
   let travel = null; // the planned move: bezier, arc-length table, duration
-  let frame = 0;
-  let frameAt = 0;
+  let motion = null; // { start, frames, anims }: the travel, lean or turn playing; the state above is read from it
   let waiting = []; // resolvers of move() promises for the current target
   let cueing = null; // { kind, started, ending }: the action word shown
   let following = 0; // follow(true) calls not yet ended (script clicks shown)
@@ -153,7 +166,10 @@
     ]);
     const press = div('press', [pointer]);
     const art = div('art', [press]);
-    const pill = div('pill');
+    const piece = { longRim: div('long rim'), endRim: div('end rim'), long: div('long'), end: div('end') };
+    const shape = div('shape', [piece.longRim, piece.endRim, piece.long, piece.end]);
+    const text = div('text');
+    const pill = div('pill', [shape, text]);
     const badge = div('badge', [pill]);
     const body = div('body', [art, badge]);
     const cursor = div('cursor', [body]);
@@ -161,7 +177,7 @@
     // Words are measured outside the cursor, whose zoom and appear scale would skew the box.
     const measure = node('span', { class: 'measure' });
     root.append(fx, cursor, measure);
-    parts = { root, cursor, body, art, press, pill, badge, measure, fx, hiding, captureStyle };
+    parts = { root, cursor, body, art, press, pill, shape, text, piece, badge, measure, fx, hiding, captureStyle, born: performance.now() };
     attach();
     setLabel(label, true); // after attaching, so the badge can be measured
   }
@@ -205,7 +221,10 @@
     // own clicks must never bring the cursor back.
     if (following) removeEventListener('click', onScriptClick, true);
     following = 0;
-    stopFrames();
+    if (motion) {
+      halt();
+      last = { x: pos.x, y: pos.y }; // a travel cut short: the next cursor appears where it had got to
+    }
     travel = null;
     rot = pose = 0;
     placed = '';
@@ -221,7 +240,6 @@
     const ink = luminance(fill) > 0.4;
     style.setProperty('--fill', rgb(fill));
     style.setProperty('--text', ink ? '#131110' : '#fff');
-    style.setProperty('--dim', ink ? 'rgba(19, 17, 16, 0.65)' : 'rgba(255, 255, 255, 0.8)');
     parts.fill = fill;
     showWord(force);
   }
@@ -233,18 +251,91 @@
     render();
   }
 
-  // Where an element is now, its animations stopped: an interrupted change goes on from there.
-  function stopAt(el) {
+  // The word's letters and where each starts (kerning kept), measured outside the cursor. Text too wide for the pill
+  // stays whole, cut with an ellipsis.
+  const graphemes = (text) => (globalThis.Intl?.Segmenter ? [...new Intl.Segmenter().segment(text)].map((s) => s.segment) : [...text]);
+  function measureWord(text) {
+    const { measure } = parts;
+    measure.textContent = text;
+    const box = measure.getBoundingClientRect();
+    const chars = graphemes(text);
+    if (!box.width || box.width > MAX_PILL - 2 * PAD) return { width: box.width, chars: [text], xs: [0], whole: true };
+    const range = document.createRange();
+    const xs = [];
+    let at = 0;
+    for (const ch of chars) {
+      range.setStart(measure.firstChild, at);
+      range.setEnd(measure.firstChild, at + ch.length);
+      xs.push(range.getBoundingClientRect().left - box.left);
+      at += ch.length;
+    }
+    return { width: box.width, chars, xs, whole: false };
+  }
+
+  // Pairs of letters the two words share, in order (longest common subsequence): those slide to their new places.
+  function shared(a, b) {
+    const n = a.length;
+    const m = b.length;
+    const len = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) len[i][j] = a[i] === b[j] ? len[i + 1][j + 1] + 1 : Math.max(len[i + 1][j], len[i][j + 1]);
+    const pairs = new Map(); // index in b -> index in a
+    for (let i = 0, j = 0; i < n && j < m;) {
+      if (a[i] === b[j]) pairs.set(j++, i++);
+      else if (len[i + 1][j] >= len[i][j + 1]) i++;
+      else j++;
+    }
+    return pairs;
+  }
+
+  // The pill's width: the long piece is cut off at the right end's centre, the round end slides there. Transforms and
+  // clip-path only, which the compositor animates, so a page busy with the agent's action can't stall the glide.
+  // The words are cut off at the pill's end too, so a long one never shows past it while the pill grows.
+  const pieces = (w) => ({ long: `inset(0 ${MAX_PILL - w + 8.5}px 0 0)`, longRim: `inset(0 ${MAX_PILL - w + 10}px 0 0)`,
+    end: `translateX(${w - 17}px)`, text: `inset(0 ${MAX_PILL - w}px 0 0 round 8.5px)` });
+  function pillWidth() {
+    const glide = parts.glide;
+    if (!glide) return parts.width ?? NaN;
+    const p = glide.anim.effect.getComputedTiming().progress;
+    return p === null ? glide.to : glide.from + (glide.to - glide.from) * p;
+  }
+  function setPillWidth(to, animate) {
+    const { piece } = parts;
+    const from = pillWidth();
+    for (const a of [...parts.shape.getAnimations({ subtree: true }), ...parts.text.getAnimations()]) a.cancel();
+    const at = pieces(to);
+    parts.text.style.clipPath = at.text;
+    piece.long.style.clipPath = at.long;
+    piece.longRim.style.clipPath = at.longRim;
+    piece.end.style.transform = piece.endRim.style.transform = at.end;
+    parts.glide = null;
+    parts.width = to;
+    if (!animate || !(Math.abs(from - to) > 0.5)) return;
+    const was = pieces(from);
+    const timing = { duration: MORPH_MS, easing: EASE_IN_OUT };
+    parts.glide = { from, to, anim: piece.long.animate([{ clipPath: was.long }, { clipPath: at.long }], timing) };
+    piece.longRim.animate([{ clipPath: was.longRim }, { clipPath: at.longRim }], timing);
+    for (const el of [piece.end, piece.endRim]) el.animate([{ transform: was.end }, { transform: at.end }], timing);
+    parts.text.animate([{ clipPath: was.text }, { clipPath: at.text }], timing);
+  }
+
+  // Where a letter is drawn now, its animations stopped: an interrupted change goes on from there.
+  function letterAt(el) {
     const style = getComputedStyle(el);
-    const at = { opacity: style.opacity, transform: style.transform === 'none' ? 'scale(1)' : style.transform,
-      filter: style.filter === 'none' ? 'blur(0px)' : style.filter };
+    const v = matrix(style.transform);
+    const at = { x: v[4], y: v[5], scale: v[0], opacity: Number(style.opacity) }; // read before the animations go
     for (const a of el.getAnimations()) a.cancel();
     return at;
   }
+  function matrix(transform) {
+    const m = transform.match(/^matrix\(([^)]+)\)/);
+    return m ? m[1].split(',').map(Number) : [1, 0, 0, 1, 0, 0];
+  }
+  // Where the label is drawn now, its animations included.
+  const shownAt = () => { const v = matrix(getComputedStyle(parts.badge).transform); return { x: v[4], y: v[5] }; };
 
-  // The pill shows the action word while there is one, else the label. A change morphs: the word going blurs away in
-  // place as the next comes into focus, and the pill glides to its width. While an action word shows, a light runs
-  // over it, in transforms only, so a busy page can't stall it.
+  // The pill shows the action word while there is one, else the label. A change morphs: letters both words share slide
+  // to their new places, the others rise away and come up in turn, and the pill glides to its width. While an action
+  // word shows, a light runs over it. Transforms, opacity and clip-path only, so a busy page can't stall any of it.
   function showWord(instant) {
     if (!parts) return;
     const { pill, badge } = parts;
@@ -252,58 +343,106 @@
     const shown = `${action ? 'action' : 'label'}:${text}`; // a label spelled like an action word is still a label
     badge.style.display = text ? '' : 'none';
     if (shown === parts.shown && !instant) return;
-    const morph = !instant && parts.shown !== undefined;
+    // A cursor just appearing shows its first word as it fades in, without a change on top.
+    const morph = !instant && parts.shown !== undefined && performance.now() - parts.born > 120;
     parts.shown = shown;
-    parts.measure.textContent = text;
-    const textWidth = parts.measure.getBoundingClientRect().width;
-    parts.unmeasured = !textWidth && !!text; // hidden for a screenshot: measured again after it
-    const from = morph && !still ? parseFloat(getComputedStyle(pill).width) : NaN;
+    const m = measureWord(text);
+    parts.unmeasured = !m.width && !!text; // hidden for a screenshot: measured again after it
     const placed = morph && !still ? getComputedStyle(badge).transform : 'none';
-    badgeWidth = Math.min(Math.ceil(textWidth) + 2 * PAD, MAX_PILL);
+    badgeWidth = Math.min(Math.ceil(m.width) + 2 * PAD, MAX_PILL);
+    const old = parts.word;
+    const word = node('span', { class: action && !still ? 'word busy' : 'word' });
+    const letters = m.chars.map((ch, i) => {
+      const el = node('span', { class: m.whole ? 'ch whole' : 'ch' }, [ch]);
+      el.style.transform = `translateX(${m.xs[i]}px)`;
+      return el;
+    });
+    word.append(...letters);
+    parts.text.appendChild(word);
+    parts.word = word;
+    const rest = action && !still ? DIM : 1;
     if (!morph) {
-      for (const a of pill.getAnimations({ subtree: true })) a.cancel();
-      pill.replaceChildren();
+      for (const el of parts.text.querySelectorAll('.word')) if (el !== word) leave(el);
+    } else if (still) {
+      if (old) {
+        const { opacity } = current(old); // a word still coming in goes from where it got to
+        for (const a of old.getAnimations()) a.cancel();
+        fade(old, [old.animate([{ opacity }, { opacity: 0 }], { duration: 120, easing: CURVE, fill: 'forwards' })]);
+      }
+      word.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 120, easing: CURVE, fill: 'backwards' });
+    } else {
+      const before = old && !old.classList.contains('out') ? [...old.querySelectorAll('.ch')] : [];
+      const pairs = old && !m.whole && !before.some((el) => el.classList.contains('whole'))
+        ? shared(before.map((el) => el.textContent), m.chars) : new Map();
+      const kept = new Set(pairs.values());
+      const from = new Map([...pairs].map(([j, i]) => [j, letterAt(before[i])]));
+      // Going: letters the next word doesn't have rise a little and fade, from the left.
+      if (old) {
+        old.classList.add('out');
+        for (const a of old.getAnimations({ subtree: true })) if (a.effect.target.closest('.glint')) a.cancel();
+        old.querySelector('.glint')?.remove();
+        let k = 0;
+        const going = [];
+        for (const [i, el] of before.entries()) {
+          if (kept.has(i) || !el.textContent.trim()) { el.style.visibility = 'hidden'; continue; } // a space has nothing to animate
+          const at = letterAt(el);
+          going[going.length] = el.animate([{ transform: `translate(${at.x}px, ${at.y}px) scale(${at.scale})`, opacity: at.opacity },
+            { transform: `translate(${at.x}px, -3px) scale(0.92)`, opacity: 0 }],
+          { duration: 120, delay: 10 * k++, easing: CURVE, fill: 'both' });
+        }
+        fade(old, going);
+      }
+      // Coming: shared letters slide over from where they were; the rest come up in turn.
+      let k = 0;
+      for (const [j, el] of letters.entries()) {
+        const was = from.get(j);
+        if (!m.chars[j].trim()) continue;
+        if (was) {
+          // It takes the next word's strength by halfway, so it doesn't stand out while it slides.
+          el.animate([{ transform: `translate(${was.x}px, ${was.y}px) scale(${was.scale})`, opacity: was.opacity, easing: EASE_IN_OUT },
+            { opacity: rest, offset: 0.5, easing: EASE_IN_OUT }, { transform: el.style.transform, opacity: rest }],
+          { duration: MORPH_MS, fill: 'backwards' });
+        } else {
+          el.animate([{ transform: `translate(${m.xs[j]}px, 3px) scale(0.92)`, opacity: 0 }, { transform: el.style.transform, opacity: rest }],
+            { duration: 200, delay: 60 + 12 * k++, easing: CURVE, fill: 'backwards' });
+        }
+      }
     }
-    for (const old of pill.querySelectorAll('.word:not(.out)')) {
-      old.classList.add('out');
-      const at = stopAt(old);
-      old.animate([at, still ? { ...at, opacity: 0 } : { opacity: 0, transform: 'scale(0.96)', filter: 'blur(4px)' }],
-        { duration: still ? 120 : WORD_MS - 40, easing: CURVE, fill: 'forwards' }).finished.then(() => {
-        for (const a of old.getAnimations({ subtree: true })) a.cancel(); // its light, endless otherwise
-        old.remove();
-      }, () => {});
-    }
-    const word = node('span', { class: action && !still ? 'word busy' : 'word' }, [text]);
-    pill.appendChild(word);
-    if (morph) {
-      word.animate(still ? [{ opacity: 0 }, { opacity: 1 }]
-        : [{ opacity: 0, transform: 'scale(1.04)', filter: 'blur(4px)' }, { opacity: 1, transform: 'scale(1)', filter: 'blur(0px)' }],
-      { duration: still ? 120 : WORD_MS - 20, delay: still ? 0 : 20, easing: CURVE, fill: 'backwards' });
-    }
-    // The light: a soft-edged window sweeping across the word once as it arrives, then again every few seconds while
-    // the action lasts, holding a full-strength copy that stays in place.
+    // The light: a soft-edged window sweeping across the word as it arrives and every 1.8 s while the action lasts,
+    // holding a full-strength copy that stays in place.
     if (action && !still) {
-      const band = Math.max(24, Math.round(textWidth * 0.7));
+      const band = Math.max(24, Math.round(m.width * 0.6));
       const lit = node('span', {}, [text]);
       const glint = node('span', { class: 'glint' }, [lit]);
       glint.style.width = `${band}px`;
       word.appendChild(glint);
       const swept = SHIMMER_MS / SHIMMER_EVERY_MS;
-      const pass = { duration: SHIMMER_EVERY_MS, delay: morph ? WORD_MS : 0, iterations: Infinity, fill: 'backwards' };
+      const pass = { duration: SHIMMER_EVERY_MS, delay: morph ? MORPH_MS : 0, iterations: Infinity, fill: 'backwards' };
       const sweep = (a, b) => [{ transform: `translateX(${a}px)`, easing: 'cubic-bezier(0.45, 0, 0.55, 1)' },
         { transform: `translateX(${b}px)`, offset: swept }, { transform: `translateX(${b}px)` }];
-      glint.animate(sweep(-band, textWidth), pass);
-      lit.animate(sweep(band, -textWidth), pass);
+      glint.animate(sweep(-band, m.width), pass);
+      lit.animate(sweep(band, -m.width), pass);
     }
-    for (const a of pill.getAnimations()) a.cancel();
-    pill.style.width = `${badgeWidth}px`;
-    if (Math.abs(from - badgeWidth) > 0.5) pill.animate([{ width: `${from}px` }, { width: `${badgeWidth}px` }], { duration: WORD_MS, easing: CURVE });
+    setPillWidth(badgeWidth, morph && !still);
+    // A travel places the label as it goes: the rest of its way is worked out again for the new width.
+    if (travel && motion && relabel()) return;
     // Against the viewport's right edge the label moves as it grows or shrinks: it glides there with the width.
     for (const a of badge.getAnimations()) a.cancel();
     badge.style.transform = badgeAt();
     if (placed !== 'none' && placed !== getComputedStyle(badge).transform) {
-      badge.animate([{ transform: placed }, { transform: badge.style.transform }], { duration: WORD_MS, easing: CURVE });
+      badge.animate([{ transform: placed }, { transform: badge.style.transform }], { duration: MORPH_MS, easing: EASE_IN_OUT });
     }
+  }
+
+  // A word that has gone: removed with every animation on it (its light is endless).
+  function leave(el) {
+    for (const a of el.getAnimations({ subtree: true })) a.cancel();
+    el.remove();
+  }
+  // A word on its way out: removed once its animations have played (a word interrupted mid-change stays until then).
+  function fade(el, animations) {
+    el.classList.add('out');
+    Promise.all(animations.map((a) => a.finished)).then(() => leave(el), () => {});
   }
 
   // The viewport's size and the page scale, read once and kept until the window or the visual viewport changes, so a
@@ -326,6 +465,7 @@
   addEventListener('resize', () => {
     forget();
     if (!parts || travel) return;
+    halt(); // a lean settling or a turn goes on from here into the pose that fits now
     pos = inside(pos);
     render();
   });
@@ -341,15 +481,17 @@
   }
 
   function render() {
+    sync();
     last = { x: pos.x, y: pos.y };
     if (!parts) return;
     // A page zoomed out (a mobile viewport without a viewport meta) would shrink the cursor with it: undo the page scale.
     const k = zoom();
-    // At rest, a window resize can leave the arrow where its pose no longer fits: it turns again.
-    if (!travel && !frame && poseAt(pos) !== pose) {
+    // At rest, a window resize can leave the arrow where its pose no longer fits: it turns again (and a lean cut short
+    // settles back).
+    if (!motion && (poseAt(pos) !== pose || rot !== pose)) {
       pose = poseAt(pos);
-      if (still) rot = pose;
-      else startFrames();
+      if (still || Math.abs(wrap(rot - pose)) < 0.002) rot = pose;
+      else play(null);
     }
     parts.cursor.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0)${k === 1 ? '' : ` scale(${k})`}`;
     parts.art.style.transform = rot ? `rotate(${rot}rad)` : '';
@@ -381,8 +523,8 @@
   }
 
   // The label: below and to the right of the arrow; where that doesn't fit, beside the arrow at the tip's height, on the
-  // side away from its body when it is turned; always inside the window. [side, transform].
-  function badgePlace() {
+  // side away from its body when it is turned; always inside the window. [side, transform], for the tip at p in pose turn.
+  function badgePlace(p = pos, turn = pose) {
     const k = zoom();
     const { w, h } = viewport();
     const bh = 17;
@@ -393,12 +535,12 @@
       [-Math.PI / 2]: [['right', [24, -bh / 2]], ['left', left(6)]],
       [Math.PI / 2]: [['left', left(24)], ['right', [6, -bh / 2]]],
       [Math.PI]: [['left', left(20)], ['right', [6, -bh / 2]]],
-    }[pose] ?? [['below', [BADGE.x, BADGE.y]]];
-    const inside = ([bx, by]) => pos.x + bx * k >= 2 && pos.y + by * k >= 2 && pos.x + (bx + badgeWidth) * k <= w - 2 && pos.y + (by + bh) * k <= h - 2;
+    }[turn] ?? [['below', [BADGE.x, BADGE.y]]];
+    const inside = ([bx, by]) => p.x + bx * k >= 2 && p.y + by * k >= 2 && p.x + (bx + badgeWidth) * k <= w - 2 && p.y + (by + bh) * k <= h - 2;
     const [side, [bx, by]] = sides.find(([, at]) => inside(at)) ?? sides[0];
-    const x = Math.min(Math.max(bx, (2 - pos.x) / k), (w - 2 - pos.x) / k - badgeWidth);
-    const y = Math.min(Math.max(by, (2 - pos.y) / k), (h - 2 - pos.y) / k - bh);
-    return [side, `translate(${x}px, ${y}px)`];
+    const x = Math.min(Math.max(bx, (2 - p.x) / k), (w - 2 - p.x) / k - badgeWidth);
+    const y = Math.min(Math.max(by, (2 - p.y) / k), (h - 2 - p.y) / k - bh);
+    return [side, `translate(${x}px, ${y}px)`, x, y];
   }
   const badgeAt = () => badgePlace()[1];
 
@@ -512,7 +654,7 @@
     const fitts = Math.min(Math.max(150 + 120 * Math.log2(d / width + 1), 300), 1000) * TIMING;
     const ms = Math.min(fitts, SHORT_MS + 1.6 * d, MAX_MOVE_MS, left);
     return {
-      to, ms, over: Math.min(0.018, 6 / d), start: performance.now(), arrived: false,
+      to, ms, over: Math.min(0.018, 6 / d),
       // The point `frac` of the way along by distance; past 1 it carries on along the end tangent.
       at(frac) {
         if (frac > 1) return { x: to.x + ((to.x - near.x) / tail) * (frac - 1) * total, y: to.y + ((to.y - near.y) / tail) * (frac - 1) * total };
@@ -530,65 +672,180 @@
     };
   }
 
-  function startFrames() {
-    if (frame) return;
-    frameAt = performance.now();
-    frame = requestAnimationFrame(tick);
+  // CURVE at u (0..1 of the time), for the label's glides worked out ahead.
+  const cubic = (t, a, b) => 3 * a * t * (1 - t) ** 2 + 3 * b * t * t * (1 - t) + t ** 3;
+  function ease(u) {
+    let lo = 0;
+    let hi = 1;
+    for (let i = 0; i < 24; i++) {
+      const t = (lo + hi) / 2;
+      if (cubic(t, 0.23, 0.32) < u) lo = t;
+      else hi = t;
+    }
+    return cubic((lo + hi) / 2, 1, 1);
   }
 
-  function stopFrames() {
-    if (frame) cancelAnimationFrame(frame);
-    frame = 0;
-  }
-
-  function tick(now) {
-    const dt = Math.min((now - frameAt) / 1000, 0.064);
-    frameAt = now;
-    let speed = 0;
-    let vx = 0;
-    let vy = 0;
-    if (travel) {
-      const m = travel;
-      const profile = (t) => m.at(minJerk(t) + m.over * bump(t));
-      const t = Math.min((now - m.start) / m.ms, 1);
-      pos = profile(t);
-      // Velocity from the neighbouring samples (about 17 ms either side), for the lean.
-      const h = 1000 / 60 / m.ms;
-      const t0 = Math.max(t - h, 0);
-      const t1 = Math.min(t + h, 1);
-      const a = profile(t0);
-      const b = profile(t1);
-      const span = ((t1 - t0) * m.ms) / 1000;
-      if (span > 0) {
+  // A move's travel, lean and turn, worked out ahead the way a frame loop would draw them: a sample every 60th of a
+  // second, on until the lean has settled into the pose. m: a planned move, or null to turn in place into the pose.
+  const STEP = 1000 / 60;
+  function sample(m) {
+    const ms = m ? m.ms : 0;
+    const profile = (t) => m.at(minJerk(t) + m.over * bump(t));
+    const frames = [];
+    let r = rot;
+    for (let at = 0, prev = 0; ; prev = at, at = at < ms ? Math.min(at + STEP, ms) : at + STEP) {
+      let p = m ? m.to : pos;
+      let vx = 0;
+      let vy = 0;
+      if (m && at <= ms) {
+        const t = at / ms;
+        if (t < 1) p = profile(t);
+        // Velocity from the neighbouring samples (about 17 ms either side), for the lean.
+        const h = STEP / ms;
+        const t0 = Math.max(t - h, 0);
+        const t1 = Math.min(t + h, 1);
+        const a = profile(t0);
+        const b = profile(t1);
+        const span = ((t1 - t0) * ms) / 1000;
         vx = (b.x - a.x) / span;
         vy = (b.y - a.y) / span;
-        speed = Math.hypot(vx, vy);
       }
-      if (!m.arrived && Math.hypot(m.to.x - pos.x, m.to.y - pos.y) <= 1) {
-        m.arrived = true;
-        settle(true);
-      }
-      if (t >= 1) {
-        pos = { ...m.to };
-        travel = null;
-        settle(true);
-      }
+      const speed = Math.hypot(vx, vy);
+      // The tip leans a little into the direction of travel once it moves fast enough, and settles back after, into the
+      // pose that fits where it is (turned near the window's bottom or right edge).
+      const turn = poseAt(p);
+      const toward = Math.min(Math.max(wrap(Math.atan2(vy, vx) - TIP_ANGLE - turn), -LEAN), LEAN);
+      const want = turn + (speed > 0 ? toward * Math.min(Math.max((speed - 40) / 260, 0), 1) : 0);
+      r += wrap(want - r) * (1 - Math.exp(-((at - prev) / 1000) * 22));
+      const settled = at >= ms && Math.abs(wrap(r - turn)) < 0.002;
+      if (settled) r -= wrap(r - turn); // the pose, or a whole turn from it: a keyframe at the pose itself would spin
+      const [side, , bx, by] = badgePlace(p, turn);
+      frames.push({ at, x: p.x, y: p.y, rot: r, side, bx, by });
+      if (settled) return frames;
     }
-    // The tip leans a little into the direction of travel once it moves fast enough, and settles back after, into the
-    // pose that fits where it is (turned near the window's bottom or right edge).
+  }
+
+  // Plays a move (or, m null, a turn in place) as WAAPI animations of transform, which Chrome runs on the compositor:
+  // a busy page's main thread can't stall them. When they end, their last values go to the inline styles.
+  function play(m) {
+    const frames = sample(m);
+    const start = performance.now();
+    const old = motion;
+    const anims = [];
+    let end = 0;
+    const run = (el, keys) => {
+      const anim = track(el, keys, start);
+      if (!anim) return;
+      anims.push(anim);
+      end = Math.max(end, keys.at(-1).at);
+    };
+    run(parts.art, frames.map((f) => ({ at: f.at, transform: `rotate(${f.rot}rad)` })));
+    if (m) {
+      const k = zoom();
+      run(parts.cursor, frames.filter((f) => f.at <= m.ms)
+        .map((f) => ({ at: f.at, transform: `translate3d(${f.x}px, ${f.y}px, 0)${k === 1 ? '' : ` scale(${k})`}` })));
+      const from = shownAt();
+      for (const a of parts.badge.getAnimations()) if (!old?.anims.includes(a)) a.cancel(); // a word's glide: the travel's own takes over
+      run(parts.badge, labelKeys(frames, from));
+      // Arrival: the tip within 1 px of the target (the follow-through finishes during the action).
+      m.arrive = frames.find((f) => Math.hypot(m.to.x - f.x, m.to.y - f.y) <= 1).at;
+    }
+    const played = { start, frames, anims, end };
+    motion = played;
+    for (const anim of old?.anims ?? []) anim.cancel(); // after the new ones started: no frame of the inline styles
+    // At the end (later if relabel() gave the label a longer way), the last values go to the inline styles.
+    const finish = () => {
+      if (motion !== played) return;
+      const wait = played.start + played.end - performance.now();
+      if (wait > 1) return void setTimeout(finish, wait);
+      sync();
+      rot = pose;
+      motion = null;
+      render();
+      for (const anim of played.anims) anim.cancel();
+    };
+    setTimeout(finish, end);
+  }
+
+  // Keyframes ({ at, transform }, at 0 first) played from `start` on the clock sync() reads, whenever the page gets to
+  // its next frame; none when they hold still (the label, mostly: its inline style holds).
+  function track(el, keys, start) {
+    if (keys.every((key) => key.transform === keys[0].transform)) return null;
+    const duration = keys.at(-1).at;
+    const anim = el.animate(keys.map(({ at, ...key }) => ({ easing: 'linear', ...key, offset: at / duration })), { duration, fill: 'forwards' });
+    anim.startTime = start;
+    return anim;
+  }
+
+  // The label along a travel's frames, from where it is drawn now (`from`): it glides (WORD_MS) rather than jumps, to its
+  // other side when the arrow turns near an edge or meets one, and from wherever it was, toward where that side is as
+  // the arrow moves on, so it stays inside the window.
+  function labelKeys(frames, from) {
+    const keys = [];
+    let side = placed;
+    let { x, y } = from;
+    let glide = Math.hypot(x - frames[0].bx, y - frames[0].by) > 0.5 ? { at: frames[0].at, x, y } : null; // { at, x, y }: when and from where it last set off
+    const place = (at, f) => {
+      if (side && f.side !== side && !(at < glide?.at + WORD_MS)) glide = { at, x, y }; // (one running goes on)
+      side = f.side;
+      const k = glide ? ease(Math.min((at - glide.at) / WORD_MS, 1)) : 1;
+      x = (glide?.x ?? f.bx) + (f.bx - (glide?.x ?? f.bx)) * k;
+      y = (glide?.y ?? f.by) + (f.by - (glide?.y ?? f.by)) * k;
+      keys.push({ at, transform: `translate(${x}px, ${y}px)` });
+    };
+    for (const f of frames) place(f.at, f);
+    for (let at = frames.at(-1).at; glide && at < glide.at + WORD_MS;) place(at = Math.min(at + STEP, glide.at + WORD_MS), frames.at(-1));
+    return keys;
+  }
+
+  // The label's width changed during a travel: the rest of its way, placed for the new width. False when the travel has
+  // no frames left (it is placed where it ends).
+  function relabel() {
+    sync();
+    const now = performance.now();
+    const at = now - motion.start;
+    const left = motion.frames.filter((f) => f.at > at);
+    if (!left.length) return false;
+    const frames = [{ ...left[0], at }, ...left].map((f) => {
+      const [side, , bx, by] = badgePlace(f, poseAt(f));
+      return { ...f, at: f.at - at, side, bx, by };
+    });
+    const keys = labelKeys(frames, shownAt());
+    const anim = track(parts.badge, keys, now);
+    for (const a of motion.anims) if (a.effect.target === parts.badge) a.cancel();
+    motion.anims = [...motion.anims.filter((a) => a.effect.target !== parts.badge), ...(anim ? [anim] : [])];
+    if (anim) motion.end = Math.max(motion.end, at + keys.at(-1).at);
+    if (!anim) parts.badge.style.transform = badgeAt();
+    return true;
+  }
+
+  // While a motion plays, the tip, its turn and the label's side are where its animations have got to.
+  function sync() {
+    if (!motion) return;
+    const { frames, start } = motion;
+    const at = performance.now() - start;
+    let i = 0;
+    while (i < frames.length - 1 && frames[i + 1].at <= at) i++;
+    const f = frames[i];
+    const g = frames[i + 1] ?? f;
+    const u = g === f ? 0 : Math.max((at - f.at) / (g.at - f.at), 0);
+    pos = { x: f.x + (g.x - f.x) * u, y: f.y + (g.y - f.y) * u };
+    rot = f.rot + (g.rot - f.rot) * u;
     pose = poseAt(pos);
-    const toward = Math.min(Math.max(wrap(Math.atan2(vy, vx) - TIP_ANGLE - pose), -LEAN), LEAN);
-    const want = pose + (speed > 0 ? toward * Math.min(Math.max((speed - 40) / 260, 0), 1) : 0);
-    rot += wrap(want - rot) * (1 - Math.exp(-dt * 22));
-    if (!travel && Math.abs(wrap(rot - pose)) < 0.002) rot = pose;
-    frame = travel || rot !== pose ? requestAnimationFrame(tick) : 0;
-    render();
+    placed = f.side;
+  }
+
+  // A motion cut short: the state stays where it got to (the caller renders it), its animations go.
+  function halt() {
+    sync();
+    for (const anim of motion?.anims ?? []) anim.cancel();
+    motion = travel = null;
   }
 
   // Reduced motion: no travel, the pointer crossfades from where it was to the target in 120 ms.
   function jump(to) {
-    stopFrames();
-    travel = null;
+    halt();
+    render(); // the ghost below starts where the cursor is
     rot = pose = poseAt(to);
     // The ghost starts as visible as the cursor is (a cursor still fading in leaves no flash where it was).
     const { opacity } = current(parts.body);
@@ -658,16 +915,23 @@
     }
     const box = Number.isFinite(opts.w) && Number.isFinite(opts.h) ? { w: opts.w, h: opts.h } : null;
     const planned = plan(to, box, left);
-    travel = planned;
-    if (!travel) {
+    if (!planned) {
+      halt();
       pos = { ...to };
       render();
       own(true);
-    } else {
-      // Frames can stop under us (the window covered or on another Space): the move still ends on time.
-      setTimeout(() => { if (travel === planned) snap(planned.to); }, Math.min(planned.ms + 150, left));
+      return arrived;
     }
-    startFrames();
+    travel = planned;
+    play(planned); // from the tip and lean where a travel under way has got to
+    setTimeout(() => { if (travel === planned) settle(true); }, planned.arrive);
+    setTimeout(() => {
+      if (travel !== planned) return;
+      travel = null;
+      settle(true);
+    }, planned.ms);
+    // Frames can stop under us (the window covered or on another Space): the move still ends on time.
+    setTimeout(() => { if (travel === planned) snap(planned.to); }, Math.min(planned.ms + 150, left));
     return arrived;
   }
 
@@ -676,6 +940,7 @@
   function land(x, y, opts = {}) {
     if (!Number.isFinite(Number(x)) || !Number.isFinite(Number(y))) return false;
     const to = inside({ x: Number(x), y: Number(y) });
+    sync();
     if (host && !exiting && Math.hypot(to.x - pos.x, to.y - pos.y) <= 2 && current(parts.body).opacity >= 0.99) return false;
     ensure(opts);
     exiting = null;
@@ -686,21 +951,28 @@
 
   // Straight to a point, done: no travel left, everyone waiting has arrived.
   function snap(to) {
-    stopFrames();
-    travel = null;
+    halt();
     rot = pose = poseAt(to);
     pos = { ...to };
     // The label goes with it at once, at its new width: a glide from where it sat by the old point (or toward it) would
     // start it off the window's edge.
-    for (const a of [...parts?.badge.getAnimations() ?? [], ...parts?.pill.getAnimations() ?? []]) a.cancel();
+    for (const a of [...parts?.badge.getAnimations() ?? [], ...parts?.shape.getAnimations({ subtree: true }) ?? [], ...parts?.text.getAnimations() ?? []]) a.cancel();
     placed = '';
     render();
     settle(true);
   }
 
+  // Resolves once the word is on screen (two frames on, at most 100 ms), so the server can start the action after it:
+  // a page busy with the action can't hold the change back, and the compositor plays it from there.
   function cue(kind, opts = {}) {
     ensure(opts);
     playCue(kind);
+    if (!parts || !VERBS[kind]) return Promise.resolve(false);
+    if (document.hidden) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, 100, true);
+      requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(timer); resolve(true); }));
+    });
   }
 
   function cueEnd() {
@@ -712,6 +984,7 @@
   function click(x, y) {
     if (!host) return;
     resetIdle();
+    sync();
     if (Number.isFinite(x) && Number.isFinite(y)) {
       const at = inside({ x, y });
       if (Math.hypot(at.x - pos.x, at.y - pos.y) > 12) snap(at); // (a few px off is the follow-through settling)
@@ -762,8 +1035,8 @@
     clearTimeout(idleTimer);
     if (!host) return Promise.resolve();
     if (exiting) return exiting;
-    stopFrames();
-    travel = null;
+    halt();
+    render(); // the exit plays where the cursor is
     settle(false);
     const anim = animateBody(0, still ? current(parts.body).scale : 0.9, 200);
     const done = anim.finished.then(() => true, () => false).then((finished) => {
@@ -790,6 +1063,7 @@
   // What a viewer sees (record mode): the host attached and displayed, the arrow's effective opacity (its own times
   // its ancestors' in the shadow tree) and the tip in viewport CSS px.
   function state() {
+    sync();
     const attached = !!host?.isConnected;
     const displayed = attached && host.checkVisibility();
     let opacity = 0;

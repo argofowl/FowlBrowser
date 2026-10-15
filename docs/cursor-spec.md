@@ -56,7 +56,8 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
 - Label: a flat pill in the same colour, 17 px tall, 10.5 px semibold system font, white text (ink on light fills,
   relative luminance over 0.4), a 1.5 px white ring and a small shadow; 16 px right of and 24 px below the tip. Where
   that doesn't fit, beside the arrow at the tip's height (right, else left; for a turned arrow, the side away from its
-  body), always inside the viewport; moving to another side it glides there (180 ms). Max 200 px with ellipsis.
+  body), always inside the viewport; moving to another side it glides there (180 ms; during a travel toward where that
+  side is as the arrow moves on, and a side change while it glides doesn't start it over). Max 200 px with ellipsis.
 - Size on screen: the same at any browser zoom. The server reads the site's zoom (`Page.getLayoutMetrics`
   `cssVisualViewport.zoom`, at most every 2 s per tab, alongside the target lookup) and passes it with each move and
   cue (a cue's end waits for its cue); on an
@@ -70,9 +71,9 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
   inside, 2 px from the edge); with reduced motion it is set at once. A jump (a click far from where it was) takes the
   label along at once, at its new width, without a glide.
 - Action words: what the agent is doing takes the name's place in the pill ("Claude" becomes "Typing", then "Claude"
-  again): Reading, Scrolling, Typing, Dragging and Uploading stay while the action runs (at least 0.6 s); Pressing keys
-  and Loading show for 1.2 s. An action word is drawn at 80% (ink 65%) with a light sweeping over it once as it
-  arrives, then every 4 s while the action lasts.
+  again): Reading, Scrolling, Typing, Dragging and Uploading stay while the action runs (at least 0.9 s); Pressing keys
+  and Loading show for 1.2 s. An action word is drawn at 60% with a light sweeping over it as it arrives and every
+  1.8 s while the action lasts.
 
 ## Motion
 - Travel (after Cua's `signature_arc`): a cubic Bezier from the current tip to the target, handles 0.3 of the distance at each
@@ -95,22 +96,36 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
   ring of the session's colour (a circle drawn at 22 px radius with a 2 px border, scaled down, so it stays sharp)
   grows from the tip by transform (scale 0.3 -> 1) over 420 ms while it fades (opacity 0.85 -> 0.55 at 80% -> 0),
   both on `cubic-bezier(0.33, 1, 0.68, 1)`.
-- Word change (name to action word, one word to the next, back to the name), 180 ms in all: the word going fades out
-  in place to scale 0.96 and blur 4 px over 140 ms; the next comes in from scale 1.04 and blur 4 px over 160 ms, 20 ms
-  later; the pill glides to the new width over 180 ms (against the viewport's right edge the label glides along, so it stays
-  inside); all `cubic-bezier(0.23, 1, 0.32, 1)`, scale around the text's left edge. A word that goes takes its light's
-  animations with it, and so does the cursor.
-  An interrupted change goes on from where it is. The light on an action word: a soft-edged band (70% of the word's
-  width, at least 24 px) holding a full-strength copy of the word crosses it in 1.5 s (`cubic-bezier(0.45, 0, 0.55,
-  1)`), starting as the word has arrived (180 ms), then again every 4 s; transforms only, so it stays smooth on a busy
-  page.
+- Word change (name to action word, one word to the next, back to the name), about 300 ms in all, a morph by letters:
+  letters both words share (in order, longest common subsequence: "Claude" and "Reading" share "a" and "d", "Reading"
+  and "Typing" share "ing") slide to their new places over 280 ms (`cubic-bezier(0.77, 0, 0.175, 1)`) and take the next
+  word's strength over 140 ms; the other letters of the word going rise 3 px, shrink to 0.92 and fade over 120 ms, 10 ms
+  apart from the left; the next word's letters come up from 3 px below and 0.92 over 200 ms, 12 ms apart, from 60 ms;
+  `cubic-bezier(0.23, 1, 0.32, 1)` where not said. Text too wide for the pill changes as one piece the same way. The
+  pill glides to its new width over 280 ms on the same curve as the shared letters (against the viewport's right edge
+  the label glides along, so it stays inside). A word that goes takes its light's animations with it, and so does the
+  cursor. An interrupted change goes on from where every letter is. A cursor that has just appeared (under 120 ms)
+  shows its first word without a change. The light on an action word: a soft-edged band (60% of the word's width, at
+  least 24 px) holding a full-strength copy of the word crosses it in 1.1 s (`cubic-bezier(0.45, 0, 0.55, 1)`),
+  starting as the word has arrived (280 ms), then again every 1.8 s.
+- Compositor only: the word change, the light, the pill's glide, appear and exit, press and ring animate transform,
+  opacity and clip-path, which Chrome runs off the page's main thread, so a page busy with the agent's action (a
+  snapshot of a big page) can't stall them. No blur and no width animation. The pill is drawn as two pieces for this:
+  a long piece cut off (clip-path) at the centre of its round right end, and the round end, which slides; white rims
+  under both fills and one drop shadow over the whole.
 - Appear: at the last point, else where the server last had it, else 58% x / 55% y of the viewport; opacity 0 -> 1 and
   scale 0.85 -> 1 around the tip, 220 ms `cubic-bezier(0.23, 1, 0.32, 1)`. Exit: opacity -> 0, scale -> 0.9, 200 ms.
-- rAF runs only while travelling or turning back to rest; everything else is WAAPI. A frame reads no layout: the
+- No frame loop: all motion is WAAPI, the travel too, so Chrome plays it on the compositor and a busy page's main
+  thread can't stall it. When a move is planned, its path, lean, edge turn and label side are sampled every 60th of a
+  second (on until the lean has settled) and played as linear keyframes of `transform` on the pointer, the arrow and
+  the label (a label that never moves gets none), started on the clock the overlay reads; at their end the last values
+  go to the inline styles. While they play, the tip the overlay reports (`state()`, a click, a new move's start and
+  lean) is read from the same samples at the current time, and arrival is the first sample within 1 px of the target.
+  A turn at rest (a resize) is a rotation animation with the lean's smoothing. Planning reads no layout: the
   viewport's size and page scale are kept until a window or visual viewport resize or scroll, and a word is measured
   only when it changes.
 - Reduced motion: no travel (120 ms crossfade to the target, the old point fading from the cursor's current opacity),
-  no press or ring; appear and exit by opacity only; words change by a 120 ms crossfade (no blur, scale or glide) and
+  no press or ring; appear and exit by opacity only; words change by a 120 ms crossfade (no letters moving, no glide) and
   action words show at full strength without the light. The preference turning on while the cursor shows puts a
   travel under way on its target (crossfade), ends an appear or exit at once and draws the word again without its
   light; turning off brings the light back.
@@ -128,4 +143,12 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
 - Late target: a lookup that ends after the budget while the action is still running lands the cursor there at once
   (appears at the target, no travel). Record mode: the point line keeps the state from before the action, plus
   `late: true`.
-  Cues never wait. Any cursor failure is logged (debug) and never fails or delays an action beyond the caps.
+- Cues during an action (Reading, Scrolling, Typing, Pressing keys, Dragging, Uploading) are painted before it starts:
+  the overlay's `cue` answers two frames after the call (at most 100 ms), and the action waits for that answer, at
+  most 120 ms from when it would have started (the visibility answer, the overlay's injection and the zoom read
+  included). An action that keeps the page's main thread busy (a snapshot of a big page) holds back every frame until
+  it is done, so a word not painted before it would first show after it. A pointer action waits after its land, a
+  drag with refs not at all (its word comes with the press). Cues after an action (Loading, Reading after a
+  screenshot) don't wait, nor does a tab that wasn't shown when last asked (it starts at once; its word still shows
+  if the tab is shown by the time the answer comes). Any cursor failure is logged (debug) and
+  never fails or delays an action beyond the caps.
