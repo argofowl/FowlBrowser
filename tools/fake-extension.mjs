@@ -147,6 +147,38 @@ async function selfTest() {
   await new Promise((resolve) => stranger.once('close', resolve));
   assert.ok(!a.fromHost.some((m) => m.method === 'tabs.listAll' || m.method === 'host.clientConnected'), 'stranger reached extension');
 
+  // Before auth a frame over 4 KB drops the client at its header: it never makes the host buffer the body.
+  const bulky = net.connect(sockName());
+  await new Promise((resolve) => bulky.once('connect', resolve));
+  bulky.on('error', () => {});
+  const bulkyHeader = Buffer.alloc(4);
+  bulkyHeader.writeUInt32LE(4097);
+  bulky.write(bulkyHeader);
+  const bulkyStart = Date.now();
+  await new Promise((resolve) => bulky.once('close', resolve));
+  assert.ok(Date.now() - bulkyStart < 1000, 'dropped at the header, not by the 5 s auth timeout');
+
+  // A token file that holds no real token (empty, short) is replaced at startup, and an empty token never gets in.
+  for (const bad of ['', 'abc\n']) {
+    const tokenDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fowlbrowser-token-'));
+    fs.writeFileSync(path.join(tokenDir, 'token'), bad, { mode: 0o600 });
+    const h = startHost({ FOWLBROWSER_DIR: tokenDir });
+    await waitFor(() => fs.existsSync(path.join(tokenDir, 'node.sock')), 'socket for the bad-token host');
+    assert.match(fs.readFileSync(path.join(tokenDir, 'token'), 'utf8'), /^[0-9a-f]{64}$/, `token ${JSON.stringify(bad)} replaced`);
+    assert.equal(fs.statSync(path.join(tokenDir, 'token')).mode & 0o777, 0o600, 'replaced token mode');
+    const empty = net.connect(path.join(tokenDir, 'node.sock'));
+    await new Promise((resolve) => empty.once('connect', resolve));
+    empty.write(encode({ method: 'host.auth', params: { token: bad.trim() } }));
+    await new Promise((resolve) => empty.once('close', resolve));
+    assert.ok(!h.fromHost.some((m) => m.method === 'host.clientConnected'), 'a client with the old token got in');
+    const good = await connect(path.join(tokenDir, 'node.sock'));
+    await waitFor(() => good.messages[0]?.method === 'host.hello', 'hello with the new token');
+    good.socket.destroy();
+    h.host.stdin.end();
+    await new Promise((r) => (h.host.exitCode !== null ? r() : h.host.once('exit', r)));
+    fs.rmSync(tokenDir, { recursive: true, force: true });
+  }
+
   // A socket that never authenticates is dropped after 5 s (checked at the end).
   const silent = net.connect(sockName());
   let silentClosed = false;
@@ -216,7 +248,7 @@ async function selfTest() {
   const fromHostItself = ['host.clientConnected', 'host.listening'];
   assert.ok(!a.fromHost.some((m) => m.method?.startsWith('host.') && !fromHostItself.includes(m.method)), 'host.* from a client reached the extension');
   // The host tells the extension (its popup) that it is installed and which socket name agents reach it by.
-  assert.deepEqual(a.fromHost.find((m) => m.method === 'host.listening')?.params, { browser: 'node', key: 'node' });
+  assert.deepEqual(a.fromHost.find((m) => m.method === 'host.listening')?.params, { browser: 'node', key: 'node', silentDebugger: false });
   assert.ok(!c1.closed, 'a reserved method only drops the message');
 
   // A later extension.hello (the user renamed the browser in the popup) reaches connected clients, and new ones get

@@ -13,6 +13,7 @@ const CHUNK_THRESHOLD = 900_000;
 const CHUNK_CHARS = 250_000;
 // Socket limits: one client can't make the host shared by every session hold unbounded memory.
 const MAX_FRAME = 64 * 1024 * 1024;
+const MAX_AUTH_FRAME = 4096; // before host.auth: a client that can't read the token gets no more than this
 const MAX_BACKLOG = 64 * 1024 * 1024;
 const AUTH_TIMEOUT_MS = 5000;
 const SAME_NAME_WAIT_MS = 500;
@@ -66,7 +67,7 @@ function log(...parts) {
 // An oversized frame, bad JSON or a throwing onMessage stops the reader and goes to onError.
 // Chunks are joined only once a frame is whole: a multi-megabyte message arrives in many small chunks, and joining
 // on each would copy it again and again.
-function frameReader(readLength, onMessage, onError, maxFrame = Infinity) {
+function frameReader(readLength, onMessage, onError, maxFrame = () => Infinity) {
   let chunks = [];
   let bytes = 0;
   let length = null;
@@ -87,7 +88,7 @@ function frameReader(readLength, onMessage, onError, maxFrame = Infinity) {
         if (length === null) {
           if (bytes < 4) break;
           length = readLength(take(4));
-          if (length > maxFrame) throw new Error(`frame of ${length} bytes is over the limit`);
+          if (length > maxFrame()) throw new Error(`frame of ${length} bytes is over the limit`);
         }
         if (bytes < length) break;
         const body = take(length).toString('utf8');
@@ -216,19 +217,31 @@ process.stdout.on('error', () => shutdown('stdout error'));
 
 // Clients must prove they can read ~/.fowlbrowser/token (0600) before anything reaches the browser.
 const tokenFile = path.join(DIR, 'token');
+// Only 64 hex characters count as a token: an empty file would let any client in with an empty one.
+const readToken = () => {
+  try {
+    const value = fs.readFileSync(tokenFile, 'utf8').trim();
+    return /^[0-9a-f]{64}$/.test(value) ? Buffer.from(value) : null;
+  } catch { return null; }
+};
 // Two hosts starting at once (Chrome and Helium at login) may both create it: each writes its own file and links it
-// into place, so the token appears whole in one step and the loser (EEXIST) reads the winner's.
-if (!fs.existsSync(tokenFile)) {
+// into place, so the token appears whole in one step and the loser (EEXIST) reads the winner's. A file that holds no
+// token is replaced in one step (rename); two hosts doing that at once leave the later one's, which is why the token
+// is read again at every auth instead of kept from startup.
+if (!readToken()) {
   const draft = `${tokenFile}.${process.pid}`;
   fs.writeFileSync(draft, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
-  try { fs.linkSync(draft, tokenFile); }
+  try {
+    if (fs.existsSync(tokenFile)) { fs.renameSync(draft, tokenFile); log('token file held no token: replaced'); }
+    else fs.linkSync(draft, tokenFile);
+  }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
   finally { fs.rmSync(draft, { force: true }); }
 }
-const token = Buffer.from(fs.readFileSync(tokenFile, 'utf8').trim());
 const tokenMatches = (value) => {
+  const token = readToken();
   const given = Buffer.from(String(value ?? ''));
-  return given.length === token.length && crypto.timingSafeEqual(given, token);
+  return token !== null && given.length === token.length && crypto.timingSafeEqual(given, token);
 };
 
 let nextClientId = 1;
@@ -297,7 +310,7 @@ function onClient(socket) {
   }, (error) => {
     log('client dropped', clientId, error.message);
     socket.destroy();
-  }, MAX_FRAME));
+  }, () => (authed ? MAX_FRAME : MAX_AUTH_FRAME)));
 
   let closed = false;
   const close = () => {

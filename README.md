@@ -125,13 +125,20 @@ Name your browsers (Work, Personal) by clicking the FowlBrowser icon in the tool
 
 - **No servers, no tracking.** FowlBrowser runs on your Mac and sends nothing anywhere. Pages an agent reads go only to
   the agent you use.
-- **No open debugging port.** Chrome never opens its remote-debugging port, so other programs can't take over your
-  browser through it. Agents go through the extension, one tab at a time, over a local channel locked to your Mac user.
+- **No open debugging port.** Chrome never opens its remote-debugging port. Agents go through the extension, one tab
+  at a time, over a local channel only your Mac user can open. Programs running as you can open it too, just as they
+  can read your files, so only run agents and tools you trust.
+- **Agents only open web pages.** http and https only: never local files, browser settings or extension pages.
+  Downloads come only from the web.
 - **Agents only touch their own tabs.** The tabs they opened and the ones they borrowed from you. They never close your
   tabs unless you asked, incognito windows are left alone, and commands that would reach other tabs, your window focus
-  or your whole profile's cookies and storage are blocked.
-- **Your files stay yours.** Agents can't open local files in the browser, and won't upload hidden files (like
-  `~/.ssh` or `.env`), anything in `~/Library` other than iCloud Drive and cloud drives, or system files.
+  or your whole profile's cookies and storage are blocked. Cookie values never leave the extension.
+- **Your files stay yours.** Agents won't upload hidden files (like `~/.ssh` or `.env`), anything in `~/Library` other
+  than iCloud Drive and cloud drives, or system files.
+- **Passwords stay hidden.** Agents see a filled password field as dots, never its value.
+- **Pages are not instructions.** Agents are told to treat page text as data, and to ask you before they send, post,
+  buy, delete or upload a file you didn't name. That is guidance to the model, not a lock, so keep an eye on agents
+  where a mistake costs money.
 
 ## Good to know
 
@@ -142,7 +149,8 @@ Name your browsers (Work, Personal) by clicking the FowlBrowser icon in the tool
 - With Claude Code, an agent's work tabs close when it finishes its reply. With other agents they close when the
   session ends.
 - While an agent works, Chrome shows a "started debugging this browser" bar. To hide it, quit Chrome and start it with
-  `open -a "Google Chrome" --args --silent-debugger-extension-api`.
+  `open -a "Google Chrome" --args --silent-debugger-extension-api`. That hides it for every extension that uses the
+  debugger, not only FowlBrowser.
 
 ## Troubleshooting
 
@@ -181,7 +189,7 @@ Claude Code runs a batch of them at once. Every tool names its tab (`chrome:52`,
 Any MCP client can run the server: a stdio server with the command
 `~/Library/Application Support/FowlBrowser/mcp/bin/fowlbrowser-mcp` (written out as an absolute path, no arguments).
 `FOWLBROWSER_LABEL` sets the name on the cursor and tab group. `FOWLBROWSER_DEBUG=<file>` logs every call, for bug
-reports. `sh install.sh --lite` skips Lighthouse (about 160 MB).
+reports (typed text left out; the file is created readable only by you). `sh install.sh --lite` skips Lighthouse (about 160 MB).
 
 ```sh
 npm ci --prefix mcp && npm install --prefix test   # once

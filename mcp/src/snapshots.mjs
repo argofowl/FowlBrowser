@@ -36,7 +36,7 @@ export const REF_PATTERN = /^(f\d+)?e\d+$/;
 export const newRefState = () => ({ generation: null, base: 0, max: 0, main: null, mainPrefixes: new Set(), frames: new Map() });
 
 // Prefixes of the refs outside iframe subtrees, in order. An iframe's own line belongs to its parent frame.
-function mainFramePrefixes(text) {
+export function mainFramePrefixes(text) {
   const prefixes = [];
   let iframeLevel = null;
   for (const line of text.split('\n')) {
@@ -171,6 +171,57 @@ export function snapshotChanges(previous, next, { since, number } = {}) {
   }
   const result = out.join('\n');
   return result.length > next.length * DIFF_SHARE ? null : result;
+}
+
+// --- Password values ---
+// Playwright's snapshot shows what an input holds, a password input's too: `- textbox "Password" [ref=e3]: hunter2`, or,
+// with a placeholder, on a `- text: hunter2` line under it; with an explicit role (role="button") under that role.
+// textFields finds every value a line shows; maskFields replaces those found to be passwords by MASK (fixed length, so
+// the length doesn't show either).
+export const MASK = '"••••••••"';
+const FIELD_ROLES = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton']);
+// indent, then the key (single-quoted when it needs quoting), then ":" and the value, or ":" alone when children follow.
+const ELEMENT_LINE = /^(\s*)- (?:'((?:[^']|'')*)'|([^'].*?))(?:(:)(?: (.*))?)?$/;
+
+// [{ ref (Playwright's, or null when the line has none), field (a text field role: its value is the input's),
+//   own (the value is on the element's own line, as an input's is, not a `- text:` line of page text),
+//   at (index of the line holding the value), value (as written) }] for every line that shows a value or text.
+export function textFields(text) {
+  const lines = text.split('\n');
+  const fields = [];
+  const held = new Set(); // `- text:` lines holding a text field's value, taken with the field
+  lines.forEach((line, i) => {
+    const m = ELEMENT_LINE.exec(line);
+    const key = m && (m[2]?.replace(/''/g, '\'') ?? m[3]);
+    if (!key || key.startsWith('/') || held.has(i)) return; // /url, /placeholder: attributes, not values
+    const field = FIELD_ROLES.has(key.split(' ')[0]);
+    // The ref among the attributes after the name, never one written inside the name.
+    const ref = / \[ref=((?:f\d+)?e\d+)\]/.exec(key.replace(/^\S+ "(?:[^"\\]|\\.)*"/, ''))?.[1] ?? null;
+    let at = m[5] === undefined ? -1 : i;
+    for (let j = i + 1; field && m[4] && at < 0 && j < lines.length && indent(lines[j]) > m[1].length; j++) {
+      if (indent(lines[j]) === m[1].length + 2 && lines[j].trimStart().startsWith('- text: ')) held.add(at = j);
+    }
+    const value = at === i ? m[5] : lines[at]?.trimStart().slice('- text: '.length);
+    if (at >= 0 && value !== '""') fields.push({ ref, field, own: at === i && key !== 'text', at, value });
+  });
+  return fields;
+}
+
+// A value as Playwright writes it in a snapshot (normalizeWhiteSpace in playwright-core): zero-width spaces and soft
+// hyphens dropped, trimmed, whitespace runs as one space.
+export const shownValue = (value) => value.replace(/[\u200b\u00ad]/g, '').trim().replace(/\s+/g, ' ');
+
+export function maskFields(text, fields) {
+  const lines = text.split('\n');
+  for (const { at, value } of fields) lines[at] = lines[at].slice(0, lines[at].length - value.length) + MASK;
+  return lines.join('\n');
+}
+
+// A value as written in the snapshot (YAML: double-quoted with escapes when it needs quoting) as the field holds it.
+export function yamlValue(written) {
+  if (!written.startsWith('"')) return written;
+  const named = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+  return written.slice(1, -1).replace(/\\(?:x([0-9a-f]{2})|(.))/gi, (_, hex, c) => (hex ? String.fromCharCode(parseInt(hex, 16)) : named[c] ?? c));
 }
 
 // innerText, whitespace collapsed within each line, empty lines dropped.

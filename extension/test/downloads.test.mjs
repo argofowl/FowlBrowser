@@ -145,6 +145,22 @@ test("a download goes to the client whose tab started it, and client A never see
   assert.deepEqual(sent.map((m) => [m.method, m.client, m.params[0].id, m.params[0].state]), [['downloads.changed', 1, a.id, 'complete']]);
 });
 
+// A live run copied ~/.ssh/id_ed25519 into ~/Downloads with downloads.start {url: 'file:///...'}.
+test('downloads.start downloads only from the web, however the URL is written', async () => {
+  const { chrome, call } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  for (const url of ['file:///Users/me/.ssh/id_ed25519', 'fi\tle:///etc/passwd', ' FILE:///etc/passwd',
+    'chrome-extension://lpfcnmmimgcillacmnibffooadlofjhj/popup.html', 'chrome://settings', 'data:text/plain,hi',
+    'blob:https://example.com/6f1c', 'filesystem:https://example.com/temporary/x', 'javascript:alert(1)', '/relative', '']) {
+    assert.match((await call(1, 'downloads.start', { tabId: tab.id, url })).error?.message ?? '', /only http and https/, JSON.stringify(url));
+  }
+  assert.ok(!chrome.calls.some((c) => c[0] === 'downloads.download'));
+  for (const url of [FILE, 'https://example.com/report.pdf', ' HTTPS://example.com/a.csv']) {
+    assert.ok(!(await call(1, 'downloads.start', { tabId: tab.id, url })).error, url);
+  }
+  assert.equal(chrome.calls.filter((c) => c[0] === 'downloads.download').length, 3);
+});
+
 test('only the owner of a tab may start or expect downloads on it', async () => {
   const { chrome, core, call } = setup();
   const { result: tab } = await call(1, 'tabs.open', {});

@@ -500,8 +500,8 @@ test('local files and view-source: pages are never opened or claimed, however th
   }
   // Nor opened in a new tab, by tabs.open or by chrome.tabs.create (the relay's Target.createTarget).
   for (const url of ['file:///etc/passwd', 'fi\tle:///etc/passwd', 'view-source:file:///etc/passwd']) {
-    assert.match((await call(1, 'tabs.open', { url })).error?.message ?? '', /never opened/, JSON.stringify(url));
-    assert.match((await call(1, 'chrome.tabs.create', [{ url }])).error?.message ?? '', /never opened/, JSON.stringify(url));
+    assert.match((await call(1, 'tabs.open', { url })).error?.message ?? '', /only open web pages/, JSON.stringify(url));
+    assert.match((await call(1, 'chrome.tabs.create', [{ url }])).error?.message ?? '', /only open web pages/, JSON.stringify(url));
   }
   assert.equal(chrome.calls.filter((c) => c[0] === 'tabs.create' || c[0] === 'windows.create').length, 1, 'only the first about:blank tab was created');
   assert.ok(!(await call(1, 'tabs.open', { url: 'https://example.com/file:///x' })).error);
@@ -515,8 +515,363 @@ test('navigation checks work on Chrome 125, which has no URL.parse', async (t) =
   const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
   assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url: 'https://example.org/' }])).error);
   assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url: 'file:///etc/passwd' }])).error?.message ?? '', /is blocked/);
-  assert.match((await call(1, 'tabs.open', { url: 'file:///etc/passwd' })).error?.message ?? '', /never opened/);
+  assert.match((await call(1, 'tabs.open', { url: 'file:///etc/passwd' })).error?.message ?? '', /only open web pages/);
   assert.equal(chrome.calls.filter((c) => c[0] === 'debugger.sendCommand' && c[2] === 'Page.navigate').length, 1);
+});
+
+const OWN_PAGE = 'chrome-extension://lpfcnmmimgcillacmnibffooadlofjhj/popup.html';
+const NOT_WEB = [OWN_PAGE, 'CHROME-EXTENSION://lpfcnmmimgcillacmnibffooadlofjhj/popup.html', ' chrome-extension://lpfcnmmimgcillacmnibffooadlofjhj/popup.html',
+  'chrome-ext\tension://lpfcnmmimgcillacmnibffooadlofjhj/popup.html', 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/options.html',
+  'chrome://settings', 'chrome-untrusted://print/', 'devtools://devtools/bundled/inspector.html', 'about:version', 'javascript:alert(1)',
+  'mailto:me@example.com', 'file:///etc/passwd', 'fi\tle:///etc/passwd', 'view-source:https://example.com/',
+  'blob:chrome-extension://lpfcnmmimgcillacmnibffooadlofjhj/6f1c', 'filesystem:https://example.com/temporary/x', '/relative', ''];
+const WEB = ['https://example.com/', 'http://127.0.0.1:5411/a', ' HTTPS://example.com/b', 'about:blank', 'data:text/html,<p>hi</p>'];
+
+// Confirmed live: Page.navigate to this extension's own popup.html kept the debugger attached (Chrome lets an extension
+// debug its own pages), and an evaluate there had chrome.debugger, chrome.history and connectNative.
+test('agent tabs only go to web pages: tabs.open, Page.navigate and history entries refuse extension, browser and local pages', async () => {
+  const { call, chrome } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  const created = () => chrome.calls.filter((c) => c[0] === 'tabs.create' || c[0] === 'windows.create').length;
+  const navigated = () => chrome.calls.filter((c) => c[0] === 'debugger.sendCommand' && c[2] === 'Page.navigate').length;
+  for (const url of NOT_WEB) {
+    assert.match((await call(1, 'tabs.open', { url })).error?.message ?? '', /agents only open web pages/, JSON.stringify(url));
+    assert.match((await call(1, 'chrome.tabs.create', [{ url }])).error?.message ?? '', /agents only open web pages/, JSON.stringify(url));
+    assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url }])).error?.message ?? '', /is blocked: .*agents only open web pages/, JSON.stringify(url));
+    // Nor in a frame of the tab, or a child session.
+    assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id, sessionId: 'child' }, 'Page.navigate', { url, frameId: 'f' }])).error?.message ?? '', /is blocked/, JSON.stringify(url));
+  }
+  assert.equal(created(), 1, 'only the first tab was created');
+  assert.equal(navigated(), 0);
+  for (const url of WEB) {
+    assert.ok(!(await call(1, 'tabs.open', { url })).error, url);
+    assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url }])).error, url);
+  }
+  assert.equal(created(), 1 + WEB.length);
+  assert.equal(navigated(), WEB.length);
+  // Back and forward: the entry's URL is looked up in the same session first.
+  const history = [{ id: 1, url: 'https://example.com/' }, { id: 2, url: OWN_PAGE }, { id: 3, url: 'chrome://settings/' }, { id: 4, url: 'about:blank' }];
+  const send = chrome.debugger.sendCommand;
+  chrome.debugger.sendCommand = async (target, method, params) => (method === 'Page.getNavigationHistory' ? { currentIndex: 0, entries: history } : send(target, method, params));
+  for (const entryId of [2, 3]) {
+    assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigateToHistoryEntry', { entryId }])).error?.message ?? '', /is blocked: .*agents only open web pages/, String(entryId));
+  }
+  for (const entryId of [1, 4]) assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigateToHistoryEntry', { entryId }])).error, String(entryId));
+  assert.equal(chrome.calls.filter((c) => c[0] === 'debugger.sendCommand' && c[2] === 'Page.navigateToHistoryEntry').length, 2);
+});
+
+test('a tab whose page reaches a non-web page anyway is let go at once, and refused until it shows a web page again', async () => {
+  const { call, chrome, core, sent } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3']);
+  const detaches = () => chrome.calls.filter((c) => c[0] === 'debugger.detach' && c[1] === tab.id).length;
+  const evaluate = () => call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Runtime.evaluate', { expression: 'chrome.debugger' }]);
+  // Not for an error page, a blank page with a fragment, a subframe or another tab's commit.
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: 'about:blank#x' });
+  await core.onDebuggerEvent({ tabId: tab.id }, 'Page.frameNavigated', { frame: { id: 'main', url: 'chrome-error://chromewebdata/' } });
+  await core.onDebuggerEvent({ tabId: tab.id }, 'Page.frameNavigated', { frame: { id: 'sub', parentId: 'main', url: OWN_PAGE } });
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 3, url: OWN_PAGE });
+  assert.equal(detaches(), 0);
+  assert.ok(!(await evaluate()).error);
+
+  // The page's own history.back() into an old entry: its commit, as Page.frameNavigated (webNavigation's comes too).
+  sent.length = 0;
+  await core.onDebuggerEvent({ tabId: tab.id }, 'Page.frameNavigated', { frame: { id: 'main', url: OWN_PAGE } });
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: OWN_PAGE });
+  assert.equal(detaches(), 1, 'detached once');
+  assert.ok(core.owners.get(tab.id).detached);
+  assert.deepEqual(sent.map((m) => [m.method, m.params]), [['chrome.debugger.onDetach', [{ tabId: tab.id }, 'target_closed']]],
+    'the client hears a detach, and nothing of the page');
+  await core.onDebuggerEvent({ tabId: tab.id }, 'Runtime.consoleAPICalled', { type: 'log', args: [] });
+  assert.equal(sent.length, 1, 'events still on their way are dropped');
+  assert.match((await evaluate()).error?.message ?? '', /agents can't control/);
+  assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error?.message ?? '', /agents can't control/);
+  const commands = chrome.calls.filter((c) => c[0] === 'debugger.sendCommand' || c[0] === 'debugger.attach').length;
+
+  // Back on the web: driven again once the client attaches.
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: 'https://example.com/' });
+  assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
+  assert.ok(!(await evaluate()).error);
+  assert.ok(chrome.calls.filter((c) => c[0] === 'debugger.sendCommand' || c[0] === 'debugger.attach').length > commands);
+
+  // webNavigation's commit alone is enough (a client that never enabled Page).
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: 'chrome://settings/' });
+  assert.equal(detaches(), 2);
+  assert.match((await evaluate()).error?.message ?? '', /agents can't control/);
+});
+
+test('attach refuses a tab showing a non-web page, also unrecorded (a restarted service worker), and lets go of one that left meanwhile', async () => {
+  const { call, chrome, core } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  chrome.tabsById.get(tab.id).url = OWN_PAGE; // committed before this core heard of it
+  assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error?.message ?? '', /agents can't control/);
+  assert.ok(!chrome.calls.some((c) => c[0] === 'debugger.attach'));
+  chrome.tabsById.get(tab.id).url = 'https://example.com/';
+  // Its commit while the attach is under way.
+  const send = chrome.debugger.attach;
+  chrome.debugger.attach = async (target) => { await send(target); await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: OWN_PAGE }); };
+  assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error?.message ?? '', /agents can't control/);
+  const last = chrome.calls.filter((c) => c[0].startsWith('debugger.')).at(-1);
+  assert.deepEqual(last, ['debugger.detach', tab.id], 'detached after the attach');
+});
+
+// Sol: a script added for new documents, then history.back() into this extension's own page, runs there with the
+// extension's powers before any commit is seen. A tab with such an entry is never attached.
+test("a tab with this extension's own page in its history is refused at attach and detached; other browser pages there don't matter", async () => {
+  const { call, chrome } = setup();
+  const histories = new Map();
+  const send = chrome.debugger.sendCommand;
+  chrome.debugger.sendCommand = async (target, method, params) => (method === 'Page.getNavigationHistory'
+    ? (chrome.calls.push(['debugger.sendCommand', target.tabId, method]), { currentIndex: 1, entries: histories.get(target.tabId) ?? [] })
+    : send(target, method, params));
+  const web = { id: 9, url: 'https://mail.example/' };
+  for (const own of ['chrome-extension://fowlbrowser-ext/popup.html', 'blob:chrome-extension://fowlbrowser-ext/6f1c', 'filesystem:chrome-extension://fowlbrowser-ext/temporary/x']) {
+    const tab = chrome.addTab({ url: 'https://mail.example/' });
+    histories.set(tab.id, [{ id: 1, url: own }, web]);
+    assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id })).error, 'the claim itself goes through');
+    assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error?.message ?? '', /FowlBrowser page in its history/, own);
+    assert.deepEqual(chrome.calls.filter((c) => c[1] === tab.id && c[0].startsWith('debugger.')).map((c) => c[2] ?? c[0]),
+      ['debugger.attach', 'Page.getNavigationHistory', 'debugger.detach'], 'detached before anything else was sent');
+  }
+  // Browser pages and another extension's page in the history: attached as usual.
+  const tab = chrome.addTab({ url: 'https://mail.example/' });
+  histories.set(tab.id, [{ id: 1, url: 'chrome://settings/' }, { id: 2, url: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/options.html' }, web]);
+  await call(1, 'tabs.claim', { tabId: tab.id });
+  assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
+  assert.ok(!chrome.calls.some((c) => c[0] === 'debugger.detach' && c[1] === tab.id));
+  // An agent's own tab is checked the same way (tab_open attaches through here too).
+  const { result: opened } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  histories.set(opened.id, [{ id: 1, url: 'chrome-extension://fowlbrowser-ext/popup.html' }]);
+  assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: opened.id }, '1.3'])).error?.message ?? '', /FowlBrowser page in its history/);
+});
+
+// Sol: the about:blank chrome.tabs.create makes runs in this extension's process with the extension as its initiator;
+// whatever Chrome lets such a document navigate to, no client command or new-document script ever runs in it.
+test('a blank tab this extension made is re-navigated to a browser-made blank page before the client gets it', async () => {
+  const { call, chrome } = setup();
+  const send = chrome.debugger.sendCommand;
+  chrome.debugger.sendCommand = async (target, method, params) => {
+    if (method === 'Page.navigate') return chrome.calls.push(['navigate', target.tabId, params.url]) && { frameId: 'main' };
+    if (method !== 'Page.getNavigationHistory') return send(target, method, params);
+    chrome.calls.push(['debugger.sendCommand', target.tabId, method]);
+    const tab = chrome.tabsById.get(target.tabId);
+    return { currentIndex: 0, entries: [{ id: 1, url: tab.url }] };
+  };
+  const sequence = (tabId) => chrome.calls.filter((c) => c[1] === tabId && /^(debugger\.|navigate)/.test(c[0])).map((c) => (c[0] === 'navigate' ? `navigate ${c[2]}` : c[2] ?? c[0]));
+  const attach = (tabId) => call(1, 'chrome.debugger.attach', [{ tabId }, '1.3']);
+  // tabs.open (also the relay's Target.createTarget): replaced right after the attach, before focus emulation.
+  const { result: blank } = await call(1, 'tabs.open', {});
+  assert.ok(!(await attach(blank.id)).error);
+  assert.deepEqual(sequence(blank.id), ['debugger.attach', 'Page.getNavigationHistory', 'navigate about:blank',
+    'Emulation.setFocusEmulationEnabled', 'Page.setWebLifecycleState']);
+  // Once: a later attach (a re-claim after Cancel) leaves the page alone.
+  assert.ok(!(await attach(blank.id)).error);
+  assert.equal(sequence(blank.id).filter((s) => s.startsWith('navigate')).length, 1);
+  // A tabs.openChild child and a claimed New Tab page are blank pages this extension asked for too.
+  const opener = (await call(1, 'tabs.open', { url: 'https://example.com' })).result;
+  const { result: child } = await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' });
+  const ntp = chrome.addTab({ url: 'chrome://newtab/' });
+  assert.ok(!(await call(1, 'tabs.claim', { tabId: ntp.id })).error);
+  for (const tabId of [child.tabId, ntp.id]) {
+    assert.ok(!(await attach(tabId)).error);
+    assert.ok(sequence(tabId).includes('navigate about:blank'), String(tabId));
+  }
+  // Not a web page, nor a blank page the extension didn't make (a popup a page wrote into), nor one that moved on.
+  const users = chrome.addTab({ url: 'about:blank' });
+  await call(1, 'tabs.claim', { tabId: users.id });
+  const { result: moved } = await call(1, 'tabs.open', {});
+  chrome.tabsById.get(moved.id).url = 'https://example.com/';
+  for (const tabId of [opener.id, users.id, moved.id]) {
+    assert.ok(!(await attach(tabId)).error);
+    assert.ok(!sequence(tabId).some((s) => s.startsWith('navigate')), String(tabId));
+  }
+  // A failed replacement leaves no debugger on the tab.
+  const { result: failing } = await call(1, 'tabs.open', {});
+  chrome.debugger.sendCommand = async (target, method, params) => {
+    if (method === 'Page.navigate') throw new Error('Cannot navigate');
+    return method === 'Page.getNavigationHistory' ? { currentIndex: 0, entries: [{ id: 1, url: 'about:blank' }] } : send(target, method, params);
+  };
+  assert.match((await attach(failing.id)).error?.message ?? '', /Cannot navigate/);
+  assert.equal(chrome.calls.at(-1).join(' '), `debugger.detach ${failing.id}`);
+});
+
+// mac2: a fresh agent tab's own location change reached the extension's popup in Chrome and Helium, and the commit-time
+// detach came only at or after that page's document existed. The debugger now lets go as the navigation starts.
+test('a navigation toward a non-web page detaches the tab as it starts, before any commit; web navigations and other tabs are left alone', async () => {
+  const { call, chrome, core, sent } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  const { result: other } = await call(1, 'tabs.open', { url: 'https://example.org' });
+  const users = chrome.addTab({ url: 'https://mail.example' });
+  for (const id of [tab.id, other.id]) await call(1, 'chrome.debugger.attach', [{ tabId: id }, '1.3']);
+  const detaches = (id) => chrome.calls.filter((c) => c[0] === 'debugger.detach' && c[1] === id).length;
+  const evaluate = (id) => call(1, 'chrome.debugger.sendCommand', [{ tabId: id }, 'Runtime.evaluate', { expression: '1' }]);
+  // Left alone: web navigations, the user's tab, other extensions' frames and srcdoc frames (password managers, widgets).
+  await core.onBeforeNavigate({ tabId: tab.id, frameId: 0, url: 'https://example.com/next' });
+  await core.onBeforeNavigate({ tabId: users.id, frameId: 0, url: OWN_PAGE });
+  await core.onBeforeNavigate({ tabId: tab.id, frameId: 4, url: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/frame.html' });
+  await core.onBeforeNavigate({ tabId: tab.id, frameId: 5, url: 'about:srcdoc' });
+  await core.onDebuggerEvent({ tabId: tab.id }, 'Page.frameRequestedNavigation', { frameId: 'main', url: 'chrome-extension://fowlbrowser-ext/popup.html', disposition: 'newTab', reason: 'scriptInitiated' });
+  assert.equal(detaches(tab.id), 0);
+  assert.ok(!(await evaluate(tab.id)).error);
+
+  // The page's own location change to this extension's popup: gone as it starts, with no commit seen.
+  sent.length = 0;
+  await core.onBeforeNavigate({ tabId: tab.id, frameId: 0, url: OWN_PAGE });
+  assert.equal(detaches(tab.id), 1);
+  assert.deepEqual(sent.map((m) => [m.method, m.params]), [['chrome.debugger.onDetach', [{ tabId: tab.id }, 'target_closed']]]);
+  assert.match((await evaluate(tab.id)).error?.message ?? '', /agents can't control/);
+  assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error?.message ?? '', /agents can't control/);
+  assert.equal(detaches(other.id), 0, 'other tabs are untouched');
+  assert.ok(!(await evaluate(other.id)).error);
+  // An error for another navigation changes nothing; one for this navigation (blocked, cancelled) gives the tab back.
+  await core.onNavigationError({ tabId: tab.id, frameId: 0, url: 'https://example.com/old' });
+  assert.match((await evaluate(tab.id)).error?.message ?? '', /agents can't control/);
+  await core.onNavigationError({ tabId: tab.id, frameId: 0, url: OWN_PAGE });
+  assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
+  assert.ok(!(await evaluate(tab.id)).error);
+  // Once it commits there, an error no longer gives it back.
+  await core.onBeforeNavigate({ tabId: tab.id, frameId: 0, url: 'chrome://settings/' });
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: 'chrome://settings/' });
+  await core.onNavigationError({ tabId: tab.id, frameId: 0, url: 'chrome://settings/' });
+  assert.match((await evaluate(tab.id)).error?.message ?? '', /agents can't control/);
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: 'https://example.com/' });
+  assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
+
+  // A child frame sent to this extension's own page, and the page's request seen first over CDP.
+  await core.onBeforeNavigate({ tabId: tab.id, frameId: 7, url: 'blob:chrome-extension://fowlbrowser-ext/6f1c' });
+  assert.equal(detaches(tab.id), 3);
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: 'https://example.com/again' });
+  assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: other.id }, '1.3'])).error);
+  // (This extension's id in the fake chrome is fowlbrowser-ext.)
+  await core.onDebuggerEvent({ tabId: other.id }, 'Page.frameRequestedNavigation', { frameId: 'main', url: 'chrome-extension://fowlbrowser-ext/popup.html', disposition: 'currentTab', reason: 'scriptInitiated' });
+  assert.equal(detaches(other.id), 1);
+  assert.match((await evaluate(other.id)).error?.message ?? '', /agents can't control/);
+});
+
+test("a child target showing a non-web page is let go, and its session refused", async () => {
+  const { call, chrome, core, sent } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  sent.length = 0;
+  await core.onDebuggerEvent({ tabId: tab.id }, 'Target.attachedToTarget',
+    { sessionId: 'ext-session', targetInfo: { targetId: 'ext-frame', type: 'iframe', url: OWN_PAGE } });
+  assert.equal(sent.length, 0, 'the client never hears of it');
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'debugger.sendCommand').map((c) => [c[1], c[2]]), [[tab.id, 'Target.detachFromTarget']]);
+  assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id, sessionId: 'ext-session' }, 'Runtime.evaluate', {}])).error?.message ?? '', /agents can't control/);
+  assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Target.attachToTarget', { targetId: 'ext-frame', flatten: true }])).error?.message ?? '', /is blocked/);
+  sent.length = 0;
+  await core.onDebuggerEvent({ tabId: tab.id, sessionId: 'ext-session' }, 'Runtime.consoleAPICalled', { type: 'log', args: [] });
+  assert.equal(sent.length, 0);
+  // A web child that later navigates to such a page in its own session (an out-of-process iframe).
+  await core.onDebuggerEvent({ tabId: tab.id }, 'Target.attachedToTarget',
+    { sessionId: 'web-session', targetInfo: { targetId: 'web-frame', type: 'iframe', url: 'https://ads.example/' } });
+  assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id, sessionId: 'web-session' }, 'Runtime.evaluate', {}])).error);
+  // Its own frame has a parentId (the frame in the tab it is in); a frame inside it doesn't count.
+  await core.onDebuggerEvent({ tabId: tab.id, sessionId: 'web-session' }, 'Page.frameNavigated', { frame: { id: 'inner', parentId: 'web-frame', url: 'chrome://settings/' } });
+  assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id, sessionId: 'web-session' }, 'Runtime.evaluate', {}])).error);
+  await core.onDebuggerEvent({ tabId: tab.id, sessionId: 'web-session' }, 'Page.frameNavigated', { frame: { id: 'web-frame', parentId: 'main', url: 'chrome://settings/' } });
+  assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id, sessionId: 'web-session' }, 'Runtime.evaluate', {}])).error?.message ?? '', /agents can't control/);
+  assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Runtime.evaluate', {}])).error, 'the tab itself is still driven');
+  await core.onDebuggerEvent({ tabId: tab.id, sessionId: 'web-session' }, 'Page.frameNavigated', { frame: { id: 'web-frame', parentId: 'main', url: 'https://ads.example/2' } });
+  assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id, sessionId: 'web-session' }, 'Runtime.evaluate', {}])).error);
+});
+
+// The audit reached Page.setDownloadBehavior (into ~/Library/LaunchAgents), Extensions.*, PWA.*, Security.* and more
+// through a blocklist; now only what FowlBrowser's own stack sends passes.
+test('CDP is an allowlist: what Playwright, the MCP tools and Lighthouse send passes; anything else is refused', async () => {
+  const { call, chrome } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  for (const [method, params = {}] of [['Page.enable'], ['Page.getFrameTree'], ['Page.captureScreenshot'], ['Page.createIsolatedWorld'],
+    ['Page.addScriptToEvaluateOnNewDocument'], ['Page.setLifecycleEventsEnabled'], ['Page.handleJavaScriptDialog'], ['Page.reload'],
+    ['Page.setInterceptFileChooserDialog'], ['Page.startScreencast'], ['Page.printToPDF'], ['Runtime.enable'], ['Runtime.callFunctionOn'],
+    ['Runtime.addBinding'], ['Runtime.getHeapUsage'], ['DOM.describeNode'], ['DOM.getContentQuads'], ['DOM.setFileInputFiles'],
+    ['Input.dispatchMouseEvent'], ['Input.dispatchKeyEvent'], ['Input.insertText'], ['Emulation.setFocusEmulationEnabled'],
+    ['Emulation.setDeviceMetricsOverride'], ['Network.enable'], ['Network.getResponseBody'], ['Network.setExtraHTTPHeaders'],
+    ['Network.emulateNetworkConditions'], ['Network.loadNetworkResource', { url: 'https://docs.google.com/export', frameId: 'f' }],
+    ['Fetch.enable'], ['Fetch.continueRequest'], ['Log.enable'], ['Inspector.enable'], ['IO.read'], ['IO.close'], ['Tracing.start'],
+    ['Tracing.end'], ['Target.setAutoAttach'], ['Accessibility.queryAXTree'], ['Performance.getMetrics'], ['CSS.enable'],
+    ['Debugger.enable'], ['DOMDebugger.getEventListeners'], ['Profiler.enable'], ['Audits.enable'], ['Storage.getUsageAndQuota'],
+    ['HeapProfiler.collectGarbage'], ['WebMCP.enable']]) {
+    assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, method, params])).error, method);
+  }
+  const passed = chrome.calls.filter((c) => c[0] === 'debugger.sendCommand').length;
+  for (const [method, params = {}] of [['Page.setDownloadBehavior', { behavior: 'allow', downloadPath: '/Users/me/Library/LaunchAgents' }],
+    ['Browser.setDownloadBehavior'], ['Browser.getVersion'], ['Network.loadNetworkResource', { url: 'file:///Users/me/.ssh/id_ed25519', frameId: 'f' }],
+    ['Network.loadNetworkResource', { url: OWN_PAGE }], ['Network.loadNetworkResource'], ['Network.clearBrowserCache'],
+    ['Network.getAllCookies'], ['Network.setCookieControls'], ['Extensions.loadUnpacked', { path: '/tmp/x' }], ['Extensions.uninstall'],
+    ['Extensions.getStorageItems'], ['PWA.install'], ['PWA.launch'], ['Cast.enable'], ['Security.setIgnoreCertificateErrors', { ignore: true }],
+    ['Security.setOverrideCertificateErrors'], ['Security.handleCertificateError'], ['WebAuthn.enable'], ['WebAuthn.addVirtualAuthenticator'],
+    ['FedCm.enable'], ['Autofill.trigger'], ['DeviceAccess.enable'], ['BluetoothEmulation.enable'], ['DigitalCredentials.enable'],
+    ['FileSystem.getDirectory'], ['BackgroundService.startObserving'], ['SystemInfo.getInfo'], ['Storage.getCookies'],
+    ['Storage.clearDataForOrigin'], ['ServiceWorker.enable'], ['IndexedDB.enable'], ['DOMStorage.enable'], ['CacheStorage.enable'],
+    ['IO.resolveBlob'], ['Page.setRPHRegistrationMode'], ['Page.setSPCTransactionMode'], ['Page.bringToFront'], ['Tracing.requestMemoryDump'],
+    ['Preload.enable'], ['SomeFutureDomain.enable'], ['Runtime'], ['Runtime.evaluate.extra'], ['constructor.name'], ['__proto__.x'], ['toString.call']]) {
+    assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, method, params])).error?.message ?? '', /is blocked/, method);
+  }
+  assert.equal(chrome.calls.filter((c) => c[0] === 'debugger.sendCommand').length, passed, 'none reached the browser');
+});
+
+// Forwarded events carried every site's cookies, HttpOnly ones included, to any process holding the host token.
+test('no cookie value leaves the extension: events and loadNetworkResource keep cookie names with a placeholder value', async () => {
+  const { call, chrome, core, sent } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  const source = { tabId: tab.id };
+  const response = { url: 'https://example.com/', status: 200, headers: { 'Content-Type': 'text/html', 'Set-Cookie': 'sid=SECRET01; Path=/; HttpOnly' },
+    requestHeaders: { Cookie: 'sid=SECRET02; theme=SECRET03' }, headersText: 'HTTP/1.1 200 OK\r\nset-cookie: sid=SECRET04; Secure\r\nX-A: 1\r\n',
+    requestHeadersText: 'GET / HTTP/1.1\r\nCookie: sid=SECRET05\r\nHost: example.com\r\n' };
+  sent.length = 0;
+  const events = [
+    ['Network.requestWillBeSent', { requestId: '1', request: { url: 'https://example.com/', headers: { Cookie: 'a=SECRET06', Accept: '*/*' } }, redirectResponse: response }],
+    ['Network.requestWillBeSentExtraInfo', { requestId: '1', headers: { cookie: 'sid=SECRET07; nameless', ':path': '/' },
+      associatedCookies: [{ blockedReasons: [], cookie: { name: 'sid', value: 'SECRET08', domain: 'example.com', httpOnly: true } }] }],
+    ['Network.responseReceived', { requestId: '1', response }],
+    ['Network.responseReceivedExtraInfo', { requestId: '1', statusCode: 200, headers: { 'set-cookie': 'sid=SECRET09; Path=/\nother=SECRET10; Max-Age=60' },
+      headersText: 'HTTP/1.1 200 OK\r\nSet-Cookie: sid=SECRET11\r\n', blockedCookies: [{ blockedReasons: ['SecureOnly'], cookieLine: 'x=SECRET12; Secure', cookie: { name: 'x', value: 'SECRET13' } }],
+      exemptedCookies: [{ exemptionReason: 'None', cookieLine: 'y=SECRET14', cookie: { name: 'y', value: 'SECRET15' } }] }],
+    ['Network.responseReceivedEarlyHints', { requestId: '1', headers: { 'Set-Cookie': 'z=SECRET16' } }],
+    ['Network.webSocketWillSendHandshakeRequest', { requestId: '2', request: { headers: { Cookie: 'ws=SECRET17' } } }],
+    ['Network.webSocketHandshakeResponseReceived', { requestId: '2', response }],
+    ['Network.signedExchangeReceived', { requestId: '3', info: { outerResponse: response, header: { responseHeaders: { 'set-cookie': 'sx=SECRET18' } } } }],
+    ['Fetch.requestPaused', { requestId: 'f1', request: { url: 'https://example.com/', headers: { Cookie: 'f=SECRET19' } },
+      responseHeaders: [{ name: 'Set-Cookie', value: 'g=SECRET20; Path=/' }, { name: 'Content-Type', value: 'text/html' }] }],
+    ['Fetch.authRequired', { requestId: 'f2', request: { headers: { cookie: 'h=SECRET21' } } }],
+    ['Audits.issueAdded', { issue: { code: 'CookieIssue', details: { cookieIssueDetails: { cookie: { name: 'i', domain: 'example.com', path: '/' }, rawCookieLine: 'i=SECRET22; j=SECRET23' } } } }],
+  ];
+  for (const [method, params] of events) await core.onDebuggerEvent(source, method, structuredClone(params));
+  const forwarded = JSON.stringify(sent);
+  assert.equal(sent.length, events.length);
+  assert.doesNotMatch(forwarded, /SECRET/);
+  const params = (method) => sent.find((m) => m.params[1] === method).params[2];
+  assert.deepEqual(params('Network.requestWillBeSentExtraInfo').headers, { cookie: 'sid=hidden; hidden', ':path': '/' });
+  assert.deepEqual(params('Network.requestWillBeSentExtraInfo').associatedCookies[0].cookie, { name: 'sid', value: 'hidden', domain: 'example.com', httpOnly: true });
+  assert.equal(params('Network.responseReceivedExtraInfo').headers['set-cookie'], 'sid=hidden; Path=/\nother=hidden; Max-Age=60');
+  assert.equal(params('Network.responseReceivedExtraInfo').headersText, 'HTTP/1.1 200 OK\r\nSet-Cookie: sid=hidden\r\n');
+  assert.equal(params('Network.responseReceivedExtraInfo').blockedCookies[0].cookieLine, 'x=hidden; Secure');
+  assert.deepEqual(params('Network.responseReceived').response, { ...response, headers: { 'Content-Type': 'text/html', 'Set-Cookie': 'sid=hidden; Path=/; HttpOnly' },
+    requestHeaders: { Cookie: 'sid=hidden; theme=hidden' }, headersText: 'HTTP/1.1 200 OK\r\nset-cookie: sid=hidden; Secure\r\nX-A: 1\r\n',
+    requestHeadersText: 'GET / HTTP/1.1\r\nCookie: sid=hidden\r\nHost: example.com\r\n' });
+  assert.deepEqual(params('Fetch.requestPaused').responseHeaders, [{ name: 'Set-Cookie', value: 'g=hidden; Path=/' }, { name: 'Content-Type', value: 'text/html' }]);
+  assert.equal(params('Network.requestWillBeSent').request.headers.Accept, '*/*');
+  // Other events pass unchanged.
+  const other = { requestId: '1', timestamp: 1, type: 'Document' };
+  await core.onDebuggerEvent(source, 'Network.loadingFinished', other);
+  assert.equal(sent.at(-1).params[2], other);
+  // A command's headers: loadNetworkResource (export's download) answers with the response's.
+  chrome.debugger.sendCommand = async () => ({ resource: { success: true, httpStatusCode: 200, stream: 's1', headers: { 'content-type': 'text/csv', 'set-cookie': 'k=SECRET24' } } });
+  const { result } = await call(1, 'chrome.debugger.sendCommand', [source, 'Network.loadNetworkResource', { url: 'https://docs.google.com/x', frameId: 'f' }]);
+  assert.deepEqual(result.resource.headers, { 'content-type': 'text/csv', 'set-cookie': 'k=hidden' });
+});
+
+test('tabs.focus brings any tab to the front but an incognito one', async () => {
+  const { call, chrome } = setup();
+  const { result: mine } = await call(1, 'tabs.open', {});
+  const { result: theirs } = await call(2, 'tabs.open', {});
+  const users = chrome.addTab({ url: 'https://mail.example' });
+  const privateTab = chrome.addTab({ url: 'https://bank.example', incognito: true, windowId: 7 });
+  assert.match((await call(1, 'tabs.focus', { tabId: privateTab.id })).error?.message ?? '', /incognito/);
+  assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && c[2].active), 'nothing was activated');
+  assert.ok(!chrome.calls.some((c) => c[0] === 'windows.update'));
+  for (const tab of [mine, users, theirs]) assert.deepEqual((await call(1, 'tabs.focus', { tabId: tab.id })).result, { ok: true });
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.update' && c[2].active).map((c) => c[1]), [mine.id, users.id, theirs.id]);
 });
 
 test('incognito tabs are never claimed, also not by a resume', async () => {
@@ -773,9 +1128,7 @@ test('CDP commands that reach beyond the tab are refused for every client', asyn
   // Another tab's children are not this tab's.
   const { result: other } = await call(1, 'tabs.open', {});
   assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: other.id }, 'Target.attachToTarget', { targetId: 'child-frame', flatten: true }])).error?.message ?? '', /is blocked/);
-  for (const method of ['Network.enable', 'Network.loadNetworkResource', 'IndexedDB.enable', 'IndexedDB.disable', 'DOMStorage.enable',
-    'CacheStorage.enable', 'ServiceWorker.enable', 'ServiceWorker.disable', 'Storage.getUsageAndQuota', 'Target.getTargetInfo',
-    'Target.detachFromTarget', 'Page.navigate', 'Runtime.evaluate']) {
+  for (const method of ['Network.enable', 'Storage.getUsageAndQuota', 'Target.getTargetInfo', 'Target.detachFromTarget', 'Runtime.evaluate']) {
     assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, method, {}])).error, method);
   }
   // Cookies and other sites' stored data are never read out, for any site.

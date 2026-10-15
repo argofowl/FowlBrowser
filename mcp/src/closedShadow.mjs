@@ -19,6 +19,7 @@
 
 import crypto from 'node:crypto';
 import { cdp } from './cdp.mjs';
+import { MASK } from './snapshots.mjs';
 import { sleep, within } from './util.mjs';
 
 const KEY = `__fb${crypto.randomBytes(6).toString('hex')}`; // per server process, so pages cannot guess it
@@ -156,7 +157,9 @@ export async function closedShadowSection(tab) {
       const props = Object.fromEntries((node.properties ?? []).map((p) => [p.name, p.value?.value]));
       const flags = ['checked', 'disabled', 'expanded', 'selected'].filter((f) => props[f] === true || props[f] === 'true').map((f) => ` [${f}]`).join('');
       const name = node.name?.value ? ` ${JSON.stringify(node.name.value)}` : '';
-      const value = node.value?.value ? `: ${JSON.stringify(String(node.value.value))}` : '';
+      // A password input's value never reaches the agent (snapshots.mjs MASK); one that can't be looked up is masked too.
+      const value = !node.value?.value ? ''
+        : await isPassword(tab, node.backendDOMNodeId) ? `: ${MASK}` : `: ${JSON.stringify(String(node.value.value))}`;
       lines.push(`  - ${node.role.value}${name}${flags} [ref=${ref}]${value}`);
     }
   }
@@ -165,6 +168,14 @@ export async function closedShadowSection(tab) {
   state.refs = refs;
   if (!lines.length) return unreachable ? `\n- group "Inside closed shadow roots":${unreachable}` : '';
   return `\n- group "Inside closed shadow roots (use these s refs with click, type, hover, press_key)":\n${lines.join('\n')}${unreachable}`;
+}
+
+async function isPassword(tab, backendNodeId) {
+  const { node } = await cdp(tab, 'DOM.describeNode', { backendNodeId }).catch(() => ({}));
+  if (!node) return true;
+  const attrs = node.attributes ?? []; // [name, value, name, value...]
+  const type = attrs.findIndex((v, i) => i % 2 === 0 && v === 'type');
+  return node.localName === 'input' && type >= 0 && attrs[type + 1].toLowerCase() === 'password';
 }
 
 function refStateOf(tab) {

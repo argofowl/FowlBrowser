@@ -49,7 +49,8 @@ function render() {
   if (app) {
     const name = NAMES[status.browser] ?? app;
     $('bar-text').textContent = `While an agent works, ${name} shows a “started debugging this browser” bar, and Cancel there stops the agent. ` +
-      `To hide it, quit ${name} (⌘Q), then run this in Terminal (your tabs come back):`;
+      `To hide it, quit ${name} (⌘Q), then run this in Terminal (your tabs come back). ` +
+      `It hides that bar for every extension that uses the debugger, not only FowlBrowser:`;
     // Lines break between words only, never inside a flag or the quoted app name.
     $('bar-command-text').replaceChildren(...barCommand(app).match(/"[^"]*"|\S+/g).flatMap((word, i) => {
       const span = document.createElement('span');

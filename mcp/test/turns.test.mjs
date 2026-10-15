@@ -239,7 +239,7 @@ test('the hook stops at the first claude ancestor and never looks further up', (
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('the turn socket is in the FowlBrowser folder, made private, else in the user\'s temp folder; the hook still finds a server from before that in /tmp', async (t) => {
+test('the turn socket is in the FowlBrowser folder, made private, else in the user\'s temp folder; never in /tmp', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-turns-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   assert.equal(turnSocketPath(4321, dir), path.join(dir, 'turns', '4321.sock'));
@@ -260,10 +260,43 @@ test('the turn socket is in the FowlBrowser folder, made private, else in the us
     const ps = ([, field]) => (field === 'comm=' ? 'claude' : '1');
     assert.equal(findSocket(4321, ps, dir), path.join(dir, 'turns', '4321.sock'));
   } finally { server.close(); }
+  // Another user's socket in the shared /tmp is never contacted.
   const pid = 900_000 + (process.pid % 90_000); // a pid no claude has, so no real server's socket
   const legacy = `/tmp/fowlbrowser-turn-${pid}.sock`;
   fs.writeFileSync(legacy, '');
-  try { assert.equal(findSocket(pid, () => 'claude', dir), legacy); } finally { fs.rmSync(legacy, { force: true }); }
+  try { assert.equal(findSocket(pid, () => 'claude', dir), null); } finally { fs.rmSync(legacy, { force: true }); }
+});
+
+test('a temp folder others can write to, or that is a symlink, is used by neither the server nor the hook', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-turns-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const long = `/tmp/${'x'.repeat(90)}`;
+  const shared = path.join(dir, 'shared');
+  fs.mkdirSync(shared);
+  fs.chmodSync(shared, 0o1777); // like /tmp
+  fs.writeFileSync(path.join(shared, 'fowlbrowser-turn-4323.sock'), ''); // planted by another user
+  const link = path.join(dir, 'link');
+  fs.symlinkSync(os.tmpdir(), link);
+  for (const tmp of [shared, link, '/tmp']) {
+    assert.equal(turnSocketPath(4323, long, tmp), null, tmp);
+    assert.equal(findSocket(4323, () => 'claude', long, tmp), null, tmp);
+  }
+  assert.equal(listenForTurns({ browsers: new Map() }, turnSocketPath(4323, long, shared)), null, 'no server, no crash');
+});
+
+test('a turn line longer than any the hook sends is dropped before its newline', async (t) => {
+  const socketPath = `/tmp/fowlbrowser-turn-test-${process.pid}-long.sock`;
+  const server = listenForTurns({ browsers: new Map() }, socketPath);
+  t.after(() => { server.close(); fs.rmSync(socketPath, { force: true }); });
+  await new Promise((resolve) => server.listening ? resolve() : server.once('listening', resolve));
+  const closed = await new Promise((resolve) => {
+    const socket = net.connect(socketPath, () => socket.write('x'.repeat(10_000)));
+    socket.on('close', () => resolve(true));
+    socket.on('error', () => {});
+    setTimeout(() => resolve(false), 1000).unref();
+  });
+  assert.ok(closed, 'dropped without a newline');
+  assert.deepEqual(await ask(socketPath, 'subagent_stop'), { subagents: 0 }, 'short lines still answered');
 });
 
 // A real process chain: this test process (with a socket named after it) -> a fake `claude` -> the hook. The hook

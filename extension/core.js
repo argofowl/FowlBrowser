@@ -5,25 +5,41 @@ const NO_REPLY = Symbol('no reply');
 const DEFAULT_LABEL = 'Claude';
 const COMMAND_TIMEOUT_MS = 30_000;
 const LISTED_WINDOW_TYPES = ['normal', 'popup', 'app'];
-// CDP policy: a client drives its own tab and that tab's child targets (iframes, workers), never the browser,
-// other tabs, the user's focus or the whole profile's cookies and storage. Refused for every client; the relay
-// answers what Playwright needs from these itself.
-const BLOCKED_CDP = [
-  /^Browser\./,
-  /^Page\.bringToFront$/,
-  // Only these Target methods; attachToTarget only flattened and only for the tab's own children. No
-  // sendMessageToTarget: a non-flat session would carry commands past this filter.
-  /^Target\.(?!(setAutoAttach|getTargetInfo|detachFromTarget|attachToTarget)$)/,
-  /^Network\.(clearBrowserCookies|clearBrowserCache|setCookie|setCookies|deleteCookies|getCookies|getAllCookies)$/,
-  // Profile-wide storage domains: Storage only the quota read Lighthouse makes, and enable/disable; ServiceWorker
-  // reads (get*, request*), tracking and enable/disable; any site's DOM storage, IndexedDB and Cache Storage only
-  // enable/disable, never their data.
-  /^Storage\.(?!(getUsageAndQuota|enable|disable)$)/,
-  /^ServiceWorker\.(?!((get|request|track|untrack)[A-Z]\w*|enable|disable)$)/,
-  /^(DOMStorage|IndexedDB|CacheStorage)\.(?!(enable|disable)$)/,
-];
+// CDP policy, an allowlist: a client drives its own tab and that tab's child targets (iframes, workers), never the
+// browser, other tabs, the user's focus, the file system or the whole profile's cookies and storage. Anything not
+// listed is refused, also domains Chrome adds later. Derived from what FowlBrowser sends (Playwright 1.64's chromium
+// page, frame and worker sessions in crPage, crNetworkManager, crExecutionContext, crInput, crDragDrop, crPdf, crCoverage
+// and crServiceWorker; mcp/src's own calls; Lighthouse 13.5's gather/), minus what the relay answers itself (Browser.*,
+// browser-level Target.*, Page.bringToFront) and what reaches beyond the tab: Browser.*, Page.setDownloadBehavior,
+// Security.*, Storage.* cookie and data methods, Network.clearBrowserCache and cookie methods, Extensions.*, PWA.*.
+// A domain set to true is wholly the tab's own; otherwise only the methods named.
+const ALLOWED_CDP = {
+  Accessibility: true, Audits: true, CSS: true, Debugger: true, DOM: true, DOMDebugger: true, Emulation: true,
+  Fetch: true, Input: true, Inspector: true, Log: true, Performance: true, Profiler: true, Runtime: true,
+  HeapProfiler: ['collectGarbage'],
+  IO: ['read', 'close'],
+  // loadNetworkResource only for http(s) (isHttpUrl): export's Google Docs download, Playwright's response bodies.
+  Network: ['enable', 'disable', 'getResponseBody', 'setCacheDisabled', 'setExtraHTTPHeaders', 'emulateNetworkConditions',
+    'setBypassServiceWorker', 'setBlockedURLs', 'setUserAgentOverride', 'loadNetworkResource'],
+  // navigate and navigateToHistoryEntry only to web pages (isWebUrl).
+  Page: ['enable', 'disable', 'navigate', 'navigateToHistoryEntry', 'reload', 'getNavigationHistory', 'getFrameTree',
+    'getLayoutMetrics', 'captureScreenshot', 'printToPDF', 'startScreencast', 'stopScreencast', 'screencastFrameAck',
+    'createIsolatedWorld', 'addScriptToEvaluateOnNewDocument', 'removeScriptToEvaluateOnNewDocument',
+    'setLifecycleEventsEnabled', 'handleJavaScriptDialog', 'setInterceptFileChooserDialog', 'setBypassCSP',
+    'setFontFamilies', 'close'],
+  Storage: ['getUsageAndQuota'], // Lighthouse's quota read
+  // attachToTarget only flattened and only for the tab's own children (CHILD_ONLY_CDP). No sendMessageToTarget: a
+  // non-flat session would carry commands past this filter.
+  Target: ['setAutoAttach', 'getTargetInfo', 'detachFromTarget', 'attachToTarget'],
+  Tracing: ['start', 'end', 'recordClockSyncMarker'],
+  WebMCP: ['enable', 'disable'], // Lighthouse's agentic-browsing category
+};
 const CHILD_ONLY_CDP = /^Target\.attachToTarget$/;
-const isBlockedCommand = (method) => BLOCKED_CDP.some((rule) => rule.test(String(method)));
+const isBlockedCommand = (method) => {
+  const [domain, name, ...rest] = String(method).split('.');
+  const allowed = Object.hasOwn(ALLOWED_CDP, domain) ? ALLOWED_CDP[domain] : false;
+  return rest.length > 0 || !name || !(allowed === true || (Array.isArray(allowed) && allowed.includes(name)));
+};
 // Commands that wait on the page (a promise it settles, a navigation's response) take as long as their caller allows
 // (evaluate's timeout_ms, a navigation's timeout; Playwright reads any error of an evaluation as "Execution context was
 // destroyed", so a cut here reads as a navigation that never happened): only the host's 120 s limit is theirs.
@@ -49,10 +65,18 @@ export function isNewTabPage(url) {
   return /^(chrome|edge):\/\/(newtab|new-tab-page)\b/.test(url) || url.startsWith('chrome-search://');
 }
 
-// Parsed as Chrome does, so "fi\tle:" is a local file too. new URL, not URL.parse: Chrome 125 lacks that.
-function isLocalFile(url) {
-  try { return ['file:', 'view-source:'].includes(new URL(String(url ?? '')).protocol); } catch { return false; }
+// Where an agent tab may go: web pages, a blank page and data: URLs, never this extension's own pages (Chrome lets an
+// extension debug those, with all of its powers), browser, DevTools or local pages. Parsed as Chrome does, so
+// "fi\tle:" is a local file too. new URL, not URL.parse: Chrome 125 lacks that.
+function parsed(url) {
+  try { return new URL(String(url ?? '')); } catch { return null; }
 }
+function isWebUrl(url) {
+  const { protocol, pathname } = parsed(url) ?? {};
+  return ['http:', 'https:', 'data:'].includes(protocol) || (protocol === 'about:' && pathname === 'blank');
+}
+const isHttpUrl = (url) => ['http:', 'https:'].includes(parsed(url)?.protocol);
+const webOnly = (url) => `${url} can't be opened: agents only open web pages (http and https)`;
 
 export function isRestricted(url) {
   if (url === 'about:blank') return false;
@@ -60,6 +84,61 @@ export function isRestricted(url) {
     || url.startsWith('https://chromewebstore.google.com')
     || url.startsWith('https://chrome.google.com/webstore');
 }
+
+// A page shown in a tab (or a child frame) that no agent may drive: isRestricted, also behind blob: or filesystem:
+// (an extension's own blob: page has its origin). An about:blank with a query or fragment is still blank.
+function offTheWeb(url) {
+  const inner = String(url ?? '').replace(/^(blob|filesystem):/, '');
+  return isRestricted(inner) && !/^about:blank[?#]/.test(inner);
+}
+
+// No cookie value leaves the extension, HttpOnly ones included (a page's own script can't read those; any process
+// holding the host token could): forwarded events, and loadNetworkResource's headers, keep each cookie's name, so
+// Playwright and the network tool still see it was there, with HIDDEN for its value. Neither needs the values.
+const HIDDEN = 'hidden';
+const hidePair = (pair) => {
+  const at = pair.indexOf('=');
+  return at < 0 ? pair.replace(/\S[\s\S]*/, HIDDEN) : `${pair.slice(0, at + 1)}${HIDDEN}`;
+};
+const hideCookie = (value) => String(value).split(';').map(hidePair).join(';'); // "a=1; b=2"
+const hideSetCookie = (value) => String(value).split('\n') // "a=1; Path=/; HttpOnly", one per line
+  .map((line) => { const [first, ...attributes] = line.split(';'); return [hidePair(first), ...attributes].join(';'); }).join('\n');
+const COOKIE_HEADERS = new Map([['cookie', hideCookie], ['set-cookie', hideSetCookie]]);
+const hideHeaders = (headers) => {
+  if (Array.isArray(headers)) return headers.map((h) => (COOKIE_HEADERS.has(String(h?.name).toLowerCase()) ? { ...h, value: COOKIE_HEADERS.get(String(h.name).toLowerCase())(h.value) } : h));
+  if (!headers || typeof headers !== 'object') return headers;
+  return Object.fromEntries(Object.entries(headers).map(([name, value]) => [name, COOKIE_HEADERS.get(name.toLowerCase())?.(value) ?? value]));
+};
+const hideHeadersText = (text) => String(text).replace(/^(cookie|set-cookie)(\s*:)(.*)$/gim, (_, name, colon, value) => `${name}${colon}${COOKIE_HEADERS.get(name.toLowerCase())(value)}`);
+// A copy of `object` with each of `fields` present passed through its function.
+function hide(object, fields) {
+  if (!object || typeof object !== 'object') return object;
+  const copy = { ...object };
+  for (const [key, fn] of Object.entries(fields)) if (copy[key] !== undefined) copy[key] = fn(copy[key]);
+  return copy;
+}
+const each = (fn) => (list) => (Array.isArray(list) ? list.map(fn) : list);
+const request = (r) => hide(r, { headers: hideHeaders });
+const response = (r) => hide(r, { headers: hideHeaders, requestHeaders: hideHeaders, headersText: hideHeadersText, requestHeadersText: hideHeadersText });
+const cookie = (c) => hide(c, { value: () => HIDDEN });
+const setCookie = (b) => hide(b, { cookie, cookieLine: hideSetCookie });
+// Every event of the protocol (browser_protocol.json) with a header, cookie or raw cookie line in it, of the domains
+// clients may enable.
+const COOKIE_FIELDS = new Map([
+  ['Network.requestWillBeSent', { request, redirectResponse: response }],
+  ['Network.requestWillBeSentExtraInfo', { headers: hideHeaders, associatedCookies: each((a) => hide(a, { cookie })) }],
+  ['Network.responseReceived', { response }],
+  ['Network.responseReceivedExtraInfo', { headers: hideHeaders, headersText: hideHeadersText, blockedCookies: each(setCookie), exemptedCookies: each(setCookie) }],
+  ['Network.responseReceivedEarlyHints', { headers: hideHeaders }],
+  ['Network.webSocketWillSendHandshakeRequest', { request }],
+  ['Network.webSocketHandshakeResponseReceived', { response }],
+  ['Network.signedExchangeReceived', { info: (i) => hide(i, { outerResponse: response, header: (h) => hide(h, { responseHeaders: hideHeaders }) }) }],
+  ['Fetch.requestPaused', { request, responseHeaders: hideHeaders }],
+  ['Fetch.authRequired', { request }],
+  ['Audits.issueAdded', { issue: (i) => hide(i, { details: (d) => hide(d, { cookieIssueDetails: (c) => hide(c, { rawCookieLine: hideCookie }) }) }) }],
+  ['Network.loadNetworkResource', { resource: (r) => hide(r, { headers: hideHeaders }) }], // a command's result
+]);
+const withoutCookies = (method, params) => (COOKIE_FIELDS.has(method) ? hide(params, COOKIE_FIELDS.get(method)) : params);
 
 export function createCore({ chrome, send, timers = globalThis }) {
   // tabId -> { client, origin: 'agent'|'user', group, kept, releasing?, detached? }. `releasing` holds
@@ -84,6 +163,11 @@ export function createCore({ chrome, send, timers = globalThis }) {
   const userInputAt = new Map();    // owned tabId -> time of the user's latest input in it (tabs.userInput)
   const agentInputAt = new Map();   // owned tabId -> when its client last sent it an Input.* command
   const adoptedFrom = new Map();    // adopted child tabId -> { from, at, wasActive }, for EXPECT_CHILD_MAX_MS (giveBack)
+  // tabs whose main frame went to a page no agent may drive (offTheWeb), till a web one -> false once committed there, or
+  // the URL of the navigation still on its way there (onBeforeNavigate), which an error for it calls off
+  const offWeb = new Map();
+  const offWebSessions = new Map(); // tabId -> its child sessions (frames) showing such a page
+  const blankedByUs = new Set();    // tabs showing an about:blank this extension asked for, until their first attach
   // Downloads: each belongs to the client whose tab started it (see attributeDownload), and only that client
   // ever sees it. Nothing here survives a disconnect; the files stay.
   const downloads = new Map();      // download id -> { client, tabId }
@@ -155,6 +239,13 @@ export function createCore({ chrome, send, timers = globalThis }) {
     return owner;
   }
 
+  // This extension's own origin, also behind blob: or filesystem:.
+  const isOwnPage = (url) => {
+    const page = parsed(String(url ?? '').replace(/^(blob|filesystem):/i, ''));
+    return page?.protocol === 'chrome-extension:' && page.hostname === chrome.runtime.id;
+  };
+  const notOnTheWeb = (tabId) => new Error(`Tab ${tabId} shows a browser, extension or local page, which agents can't control`);
+
   const ownedByOther = (tabId) => new Error(`Tab ${tabId} is controlled by another agent session: leave it alone (to work on the same page, open its URL in a tab of your own)`);
 
   // Claim, release and close of one tab run one at a time.
@@ -216,7 +307,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // autoplay) and is unmuted when control ends, unless the agent set its mute itself or the user changed it meanwhile.
   // Several given to the user at once share a group of their own (groupForUser).
   async function openTab({ client, live }, { url = 'about:blank', group, muted = true, forUser = false } = {}) {
-    if (isLocalFile(url)) throw new Error(`${url} can't be opened: local files and view-source: pages are never opened`);
+    if (!isWebUrl(url)) throw new Error(webOnly(url));
     const label = group || labelFor(client);
     const windowId = await pickWindow();
     const tab = windowId === undefined
@@ -228,6 +319,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     }
     const owner = { client, origin: 'agent', group: label, kept: !!forUser, handedOver: !!forUser, agentMuted: !!forUser };
     owners.set(tab.id, owner);
+    if (parsed(url)?.protocol === 'about:') blankedByUs.add(tab.id);
     try {
       // In the tab's queue, like a child's adoption: a disconnect's cleanup comes after it and finds the group to leave.
       return await serialize(tab.id, async () => {
@@ -250,6 +342,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
   async function navigateBlank(tabId) {
     await chrome.tabs.update(tabId, { url: 'about:blank' });
+    blankedByUs.add(tabId);
     for (let waited = 0; waited < 5000; waited += 25) {
       const tab = await chrome.tabs.get(tabId);
       if (tab.url === 'about:blank' && tab.status !== 'loading') return tab;
@@ -655,6 +748,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
           throw new Error(`Tab ${tabId} is no longer this client's to open from`);
         }
         openedFor.set(tab.id, tabId);
+        blankedByUs.add(tab.id);
         await reserveChild(tab.id, owner, tabId);
         return { tabId: tab.id };
       });
@@ -711,8 +805,11 @@ export function createCore({ chrome, send, timers = globalThis }) {
       });
     },
 
+    // Any tab but an incognito one: focusing hands the caller nothing (the MCP server's tab_focus takes only the session's
+    // own tabs; the rounds harness brings an agent's tab to the front as the user would).
     async 'tabs.focus'({ tabId }) {
       const owner = owners.get(tabId);
+      if ((await chrome.tabs.get(tabId)).incognito) throw new Error(`Tab ${tabId} is in an incognito window, which is left alone`);
       if (owner?.agentMuted) { // The user asked to see it: they hear it too
         await endAgentMute(tabId, owner);
         await persist();
@@ -768,11 +865,41 @@ export function createCore({ chrome, send, timers = globalThis }) {
       // A parked tab attaches only during a resume (tabs.claim resume), and that attach is what ends its parking.
       if (owner.parked && !owner.parked.resuming) throw refused();
       try {
+        // Also by the tab's URL now: offWeb is lost when the service worker restarts.
+        if (offWeb.has(tabId) || offTheWeb((await chrome.tabs.get(tabId)).url)) throw notOnTheWeb(tabId);
         try {
           await chrome.debugger.attach({ tabId }, version);
         } catch (error) {
           if (!/already attached/i.test(error.message)) throw error;
         }
+        // It left the web while attaching: leftTheWeb's detach may have come first.
+        if (offWeb.has(tabId)) {
+          await chrome.debugger.detach({ tabId }).catch(() => {});
+          throw notOnTheWeb(tabId);
+        }
+        // A tab with this extension's own page in its history: a script added for new documents, then history.back(),
+        // would run there with the extension's powers before any commit is seen (leftTheWeb). Checked at every attach
+        // (tab_open, claim, resume), which is enough: an agent tab never gains such an entry later (Page.navigate and
+        // navigateToHistoryEntry go to web pages only, and Chrome keeps web pages from this extension's pages).
+        const history = await chrome.debugger.sendCommand({ tabId }, 'Page.getNavigationHistory').catch(async (error) => {
+          await chrome.debugger.detach({ tabId }).catch(() => {});
+          throw error;
+        });
+        if ((history?.entries ?? []).some((entry) => isOwnPage(entry.url))) {
+          await chrome.debugger.detach({ tabId }).catch(() => {});
+          throw new Error(`Tab ${tabId} has a FowlBrowser page in its history, which agents can't control: open its URL in a new tab instead`);
+        }
+        // A blank page this extension asked for (tabs.open, tabs.openChild, a claimed New Tab page) is a document Chrome made
+        // with this extension as its initiator, in the extension's process. Before any client command it is replaced by a
+        // blank page the browser itself navigates to (Page.navigate has no initiator): nothing a client runs or adds for new
+        // documents ever runs in a document that comes from this extension, whatever Chrome would let that document do.
+        if (blankedByUs.has(tabId) && history?.entries?.[history.currentIndex]?.url === 'about:blank') {
+          await chrome.debugger.sendCommand({ tabId }, 'Page.navigate', { url: 'about:blank' }).catch(async (error) => {
+            await chrome.debugger.detach({ tabId }).catch(() => {});
+            throw error;
+          });
+        }
+        blankedByUs.delete(tabId);
         // Background tabs stop painting and running rAF without focus emulation.
         await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
         await chrome.debugger.sendCommand({ tabId }, 'Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
@@ -807,8 +934,14 @@ export function createCore({ chrome, send, timers = globalThis }) {
         || (CHILD_ONLY_CDP.test(method) && (params?.flatten !== true || !children?.has(params?.targetId)))) {
         throw new Error(`${method} is blocked: it reaches beyond the tab (other tabs, the browser, the whole profile or the user's focus)`);
       }
-      if (method === 'Page.navigate' && isLocalFile(params?.url)) {
-        throw new Error(`${method} to ${params.url} is blocked: local files and view-source: pages can't be opened`);
+      if (offWeb.has(target.tabId) || offWebSessions.get(target.tabId)?.has(target.sessionId)) throw notOnTheWeb(target.tabId);
+      if (method === 'Page.navigate' && !isWebUrl(params?.url)) throw new Error(`${method} is blocked: ${webOnly(params?.url)}`);
+      if (method === 'Network.loadNetworkResource' && !isHttpUrl(params?.url)) throw new Error(`${method} is blocked: only http and https URLs load`);
+      if (method === 'Page.navigateToHistoryEntry') {
+        // By id, so the entry looked up is the one Chrome goes to.
+        const { entries = [] } = await chrome.debugger.sendCommand(target, 'Page.getNavigationHistory') ?? {};
+        const entry = entries.find((e) => e.id === params?.entryId);
+        if (entry && !isWebUrl(entry.url)) throw new Error(`${method} is blocked: ${webOnly(entry.url)}`);
       }
       if (String(method).startsWith('Input.')) agentInputAt.set(target.tabId, Date.now()); // the agent's input (usersTurn)
       if (waitsOnPage(method, params)) return chrome.debugger.sendCommand(target, method, params);
@@ -817,7 +950,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
         timer = timers.setTimeout(() => reject(new Error(`${method} timed out after 30 s`)), COMMAND_TIMEOUT_MS);
       });
       try {
-        return await Promise.race([chrome.debugger.sendCommand(target, method, params), timeout]);
+        const result = await Promise.race([chrome.debugger.sendCommand(target, method, params), timeout]);
+        return method === 'Network.loadNetworkResource' ? withoutCookies(method, result) : result;
       } finally {
         timers.clearTimeout(timer);
       }
@@ -828,6 +962,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     async 'downloads.start'({ tabId, url }, { client, live }) {
       requireOwner(client, tabId);
       url = String(url ?? '');
+      // Only from the web: a file: URL would copy any local file into Downloads, a chrome-extension: one this extension's.
+      if (!isHttpUrl(url)) throw new Error(`${url} can't be downloaded: only http and https URLs are`);
       const gen = generation;
       startsInFlight++; // attribution waits until this id is known, so no signal takes its item meanwhile
       let id;
@@ -1006,13 +1142,33 @@ export function createCore({ chrome, send, timers = globalThis }) {
     await ready;
     const owner = owners.get(source.tabId);
     if (!owner) return;
-    // The tab's own child targets: the only ones Target.attachToTarget/sendMessageToTarget may reach.
+    // The tab's main frame (no parentId), or a child session's own frame (an out-of-process iframe, whose frame id is
+    // its target id and which has a parentId), navigating: see leftTheWeb.
+    if (method === 'Page.frameNavigated' && params?.frame) {
+      const { id, parentId, url } = params.frame;
+      if (!source.sessionId && !parentId && offTheWeb(url)) return leftTheWeb(source.tabId);
+      if (source.sessionId && (!parentId || childTargets.get(source.tabId)?.has(id))) offWebSession(source.tabId, source.sessionId, offTheWeb(url));
+    }
+    // The page asks to go to this extension's own page, in any frame of the tab (Page.frameRequestedNavigation: a script's
+    // location change, a link, a form), before webNavigation hears of it: see onBeforeNavigate.
+    if (method === 'Page.frameRequestedNavigation' && params?.disposition === 'currentTab' && isOwnPage(params.url)) {
+      return leftTheWeb(source.tabId, params.url);
+    }
+    // Nothing of such a page reaches the client, from the tab or a child session.
+    if (offWeb.has(source.tabId) || offWebSessions.get(source.tabId)?.has(source.sessionId)) return;
+    // The tab's own child targets: the only ones Target.attachToTarget/sendMessageToTarget may reach. A child showing a
+    // page no agent may drive is let go at once, its session refused meanwhile, and the client never hears of it.
+    if (method === 'Target.attachedToTarget' && offTheWeb(params?.targetInfo?.url)) {
+      offWebSession(source.tabId, params.sessionId, true);
+      return chrome.debugger.sendCommand(source, 'Target.detachFromTarget', { sessionId: params.sessionId }).catch(() => {});
+    }
     if (method === 'Target.attachedToTarget') {
       if (!childTargets.has(source.tabId)) childTargets.set(source.tabId, new Set());
       childTargets.get(source.tabId).add(params.targetInfo?.targetId).add(params.sessionId);
     } else if (method === 'Target.detachedFromTarget') {
       childTargets.get(source.tabId)?.delete(params.targetId);
       childTargets.get(source.tabId)?.delete(params.sessionId);
+      offWebSession(source.tabId, params.sessionId, false);
     } else if (method === 'Page.downloadWillBegin' && !owner.releasing) {
       // A tabs.openChild child's first navigation is its opener's (the agent acted on the opener), and the tab closes
       // as Chrome closes a new tab whose first navigation turned into a download.
@@ -1025,7 +1181,53 @@ export function createCore({ chrome, send, timers = globalThis }) {
     } else if (method === 'Page.windowOpen' && adopter(source.tabId)) {
       armPopup(source.tabId, params?.url ?? '');
     }
-    emitToOwner(owner, 'chrome.debugger.onEvent', [source, method, params]);
+    emitToOwner(owner, 'chrome.debugger.onEvent', [source, method, withoutCookies(method, params)]);
+  }
+
+  // The tab's main frame went to a page no agent may drive (offTheWeb: a page's own history.back() into an old entry, a
+  // claimed tab's history), seen at its commit (Page.frameNavigated, webNavigation.onCommitted, whichever comes first):
+  // the debugger lets go at once (Chrome lets this extension debug its own pages, with all its powers), and attach and
+  // commands are refused until the tab commits a web page. The client hears a detach as for a browser page Chrome lets go of.
+  // `pending`: the URL of a navigation that has not committed yet (onBeforeNavigate).
+  async function leftTheWeb(tabId, pending = false) {
+    if (offWeb.has(tabId)) {
+      if (!pending) offWeb.set(tabId, false);
+      return;
+    }
+    offWeb.set(tabId, pending);
+    const owner = owners.get(tabId);
+    if (!owner) return;
+    log('left the web', tabId);
+    childTargets.delete(tabId);
+    offWebSessions.delete(tabId);
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+    if (owner.detached || owners.get(tabId) !== owner) return;
+    owner.detached = true;
+    await persist();
+    emitToOwner(owner, 'chrome.debugger.onDetach', [{ tabId }, 'target_closed']);
+  }
+
+  // A navigation about to start, before the page it goes to has a document (webNavigation fires onBeforeNavigate as the
+  // browser starts it, before any request, response or commit): the debugger lets go then, so nothing a client set up on
+  // the session (new-document scripts, commands on their way) runs in this extension's pages. The main frame: any page
+  // no agent may drive. A child frame: only this extension's own pages (no web page may frame them; other extensions'
+  // frames and about:srcdoc ones are everyday, and the child-target checks cover them).
+  async function onBeforeNavigate({ tabId, frameId, url }) {
+    await ready;
+    if (owners.has(tabId) && (frameId === 0 ? offTheWeb(url) : isOwnPage(url))) return leftTheWeb(tabId, url);
+  }
+
+  // That navigation never committed (blocked, cancelled, replaced): the tab is the agent's to drive again.
+  async function onNavigationError({ tabId, url }) {
+    await ready;
+    if (offWeb.get(tabId) === url) offWeb.delete(tabId);
+  }
+
+  function offWebSession(tabId, sessionId, off) {
+    if (off) {
+      if (!offWebSessions.has(tabId)) offWebSessions.set(tabId, new Set());
+      offWebSessions.get(tabId).add(sessionId);
+    } else offWebSessions.get(tabId)?.delete(sessionId);
   }
 
   // --- Downloads ---
@@ -1145,6 +1347,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function onDebuggerDetach(source, reason) {
     await ready;
     childTargets.delete(source.tabId);
+    offWebSessions.delete(source.tabId);
     const owner = owners.get(source.tabId);
     log('debugger detached', { source, reason, owned: !!owner });
     if (!owner) return;
@@ -1155,15 +1358,22 @@ export function createCore({ chrome, send, timers = globalThis }) {
     emitToOwner(owner, 'chrome.debugger.onDetach', [source, reason]);
   }
 
-  // A tabs.openChild child's first page other than about:blank: its downloads are its own from now on (openedFor).
+  // A tabs.openChild child's first page other than about:blank: its downloads are its own from now on (openedFor). A main
+  // frame's commit also decides whether agents may drive the tab (leftTheWeb); only a commit ends that.
   async function onNavigationCommitted({ tabId, frameId, url }) {
     await ready;
-    if (frameId === 0 && url !== 'about:blank') openedFor.delete(tabId);
+    if (frameId !== 0) return;
+    if (url !== 'about:blank') openedFor.delete(tabId);
+    if (offTheWeb(url)) return leftTheWeb(tabId);
+    offWeb.delete(tabId);
   }
 
   async function onTabRemoved(tabId, removeInfo) {
     await ready;
     childTargets.delete(tabId);
+    offWeb.delete(tabId);
+    offWebSessions.delete(tabId);
+    blankedByUs.delete(tabId);
     expectations.delete(tabId);
     windowOf.delete(tabId);
     folded.delete(tabId);
@@ -1184,6 +1394,9 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function onTabReplaced(addedTabId, removedTabId) {
     await ready;
     folded.delete(removedTabId);
+    offWeb.delete(removedTabId);
+    offWebSessions.delete(removedTabId);
+    blankedByUs.delete(removedTabId);
     forgetInput(removedTabId);
     if (adoptedFrom.has(removedTabId)) {
       adoptedFrom.set(addedTabId, adoptedFrom.get(removedTabId));
@@ -1442,6 +1655,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     onTabCreated,
     onNavigationTarget,
     onNavigationCommitted,
+    onBeforeNavigate,
+    onNavigationError,
     onTabRemoved,
     onTabReplaced,
     onTabActivated,

@@ -132,3 +132,24 @@ test('agent tab: a late cross-origin iframe is not counted as holding the main f
   assert.deepEqual(refsOf(second), ['s1=101']);
   assert.ok(!/cannot reach/.test(second), `a note about roots that do not exist:\n${second}`);
 });
+
+test('closed shadow controls: a password input shows a mask instead of its value; other fields keep theirs', async () => {
+  const tab = fakeTab();
+  const answers = {
+    'DOM.getDocument': () => ({ root: { backendNodeId: 1, children: [{ backendNodeId: 10, shadowRoots: [{ backendNodeId: 11, shadowRootType: 'closed',
+      children: [{ backendNodeId: 101 }, { backendNodeId: 102 }, { backendNodeId: 103 }] }] }] } }),
+    'Accessibility.queryAXTree': () => ({ nodes: [101, 102, 103].map((id) => ({ backendDOMNodeId: id, role: { value: 'textbox' }, name: { value: `f${id}` },
+      value: { value: id === 101 ? 'me@example.com' : 'hunter2-test' } })) }),
+    // 101 is an email input, 102 a password input (type written in capitals), 103 can't be looked up (gone meanwhile).
+    'DOM.describeNode': ({ backendNodeId }) => {
+      if (backendNodeId === 103) throw new Error('No node with given id found');
+      return { node: { localName: 'input', attributes: ['name', 'x', 'type', backendNodeId === 101 ? 'email' : 'PASSWORD'] } };
+    },
+  };
+  tab.browser = { host: { request: async (_, [, method, params]) => answers[method]?.(params) ?? {} } };
+  const section = await closedShadowSection(tab);
+  assert.match(section, /- textbox "f101" \[ref=s\d+\]: "me@example\.com"/);
+  assert.match(section, /- textbox "f102" \[ref=s\d+\]: "••••••••"/);
+  assert.match(section, /- textbox "f103" \[ref=s\d+\]: "••••••••"/);
+  assert.doesNotMatch(section, /hunter2/);
+});

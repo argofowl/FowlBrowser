@@ -1,7 +1,8 @@
 // Text helpers for what agents read: caps, ref numbering, changes-only snapshots, page text, evaluate source, wait_for url patterns.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { cap, collapseText, functionSource, newRefState, numberRefs, playwrightRef, REF_PATTERN, shownRef, snapshotChanges, urlMatcher } from '../src/snapshots.mjs';
+import { cap, collapseText, functionSource, MASK, maskFields, newRefState, numberRefs, playwrightRef, REF_PATTERN, shownRef, shownValue, snapshotChanges, textFields,
+  urlMatcher, yamlValue } from '../src/snapshots.mjs';
 import { cleanError } from '../src/tools.mjs';
 
 test('cap: short text is unchanged', () => {
@@ -260,4 +261,55 @@ test('urlMatcher: substring without *, whole-URL glob with * (crossing "/")', ()
 test('cleanError: an iframe ref whose frame is gone names the ref and says to snapshot again', () => {
   assert.equal(cleanError(new Error('locator.hover: Invalid frame in aria-ref selector "aria-ref=f6e137"')),
     'Ref f6e137 is in an iframe that has reloaded or gone since that snapshot. Call snapshot again and use its refs.');
+});
+
+// Playwright's ai snapshot of a sign-in form: inline values, a value under a placeholder, a quoted key, a field with no ref.
+const FORM = `- textbox "Email" [ref=e2]: me@example.com
+- textbox "Password" [active] [ref=e3] [cursor=pointer]: hunter2-test
+- textbox "PIN" [ref=f1e4]:
+  - /placeholder: 4 digits
+  - text: "1234"
+- 'textbox "Pass: word" [ref=e5]': "it's: here"
+- textbox "Hidden"
+- textbox "Fake [ref=e9]": secret-too
+- textbox "Empty" [ref=e6]: ""
+- searchbox "Search" [ref=e7]: shoes
+- paragraph [ref=e8]: hunter2-test is not a field`;
+
+test('textFields finds every line that shows a value, text fields (with the value under a placeholder) flagged as such', () => {
+  assert.deepEqual(textFields(FORM), [
+    { ref: 'e2', field: true, own: true, at: 0, value: 'me@example.com' },
+    { ref: 'e3', field: true, own: true, at: 1, value: 'hunter2-test' },
+    { ref: 'f1e4', field: true, own: false, at: 4, value: '"1234"' },
+    { ref: 'e5', field: true, own: true, at: 5, value: '"it\'s: here"' },
+    { ref: null, field: true, own: true, at: 7, value: 'secret-too' },
+    { ref: 'e7', field: true, own: true, at: 9, value: 'shoes' },
+    { ref: 'e8', field: false, own: true, at: 10, value: 'hunter2-test is not a field' },
+  ]);
+  assert.deepEqual(textFields('- textbox "Hidden" [disabled]: hunter2'), [{ ref: null, field: true, own: true, at: 0, value: 'hunter2' }]);
+  // A password input with another role shows its value under that role; plain text lines count too.
+  assert.deepEqual(textFields('- button "Show" [ref=e4]: hunter2\n- generic:\n  - text: hunter2'),
+    [{ ref: 'e4', field: false, own: true, at: 0, value: 'hunter2' }, { ref: null, field: false, own: false, at: 2, value: 'hunter2' }]);
+});
+
+test('shownValue writes a value the way Playwright does in a snapshot', () => {
+  assert.equal(shownValue(' alpha \t beta\u200b\u00ad \n'), 'alpha beta');
+});
+
+test('maskFields replaces only the given values, with a fixed-length mask', () => {
+  const fields = textFields(FORM).filter((f) => ['e3', 'f1e4', 'e5', null].includes(f.ref));
+  const masked = maskFields(FORM, fields);
+  for (const secret of ['- textbox "Password" [active] [ref=e3] [cursor=pointer]: hunter2', '1234', 'it\'s: here', 'secret-too']) assert.ok(!masked.includes(secret), secret);
+  assert.match(masked, /^- textbox "Password" \[active\] \[ref=e3\] \[cursor=pointer\]: "••••••••"$/m);
+  assert.match(masked, /^ {2}- text: "••••••••"$/m);
+  assert.match(masked, /^- 'textbox "Pass: word" \[ref=e5\]': "••••••••"$/m);
+  assert.match(masked, /^- textbox "Email" \[ref=e2\]: me@example\.com$/m);
+  assert.match(masked, /^- paragraph \[ref=e8\]: hunter2-test is not a field$/m);
+  assert.equal(MASK, '"••••••••"');
+});
+
+test('yamlValue reads a value as the field holds it', () => {
+  assert.equal(yamlValue('hunter2'), 'hunter2');
+  assert.equal(yamlValue('"1234"'), '1234');
+  assert.equal(yamlValue('"a\\"b\\\\x41\\t\\x01"'), 'a"b\\x41\t\u0001');
 });

@@ -114,7 +114,7 @@ export default {
       t.ok(!/took over|still there/.test(gone), `a popup that closed itself is no takeover (its close report counted): ${gone}`);
 
       t.step('tab_keep: window.open is native again in the live document');
-      await t.eval(agent, `() => { window.__fbWrapped = window.open; return Object.getOwnPropertySymbols(window).some(s => s.description === 'fowlbrowser.popups'); }`)
+      await t.eval(agent, `() => { window.__fbWrapped = window.open; return Object.getOwnPropertySymbols(window).some(s => s.description?.startsWith('fowlbrowser.popups')); }`)
         .then(installed => t.ok(installed, 'the agent tab has the popup script'));
       await t.call('tab_keep', { tab: agent });
       t.eq(await t.eval(agent, '() => window.open !== window.__fbWrapped'), true, 'window.open restored without a reload');

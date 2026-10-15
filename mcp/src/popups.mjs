@@ -14,7 +14,12 @@
 //   whether the debugger is still attached: after a detach nothing can switch the MAIN script off over CDP, so it
 //   switches itself off at its next decision.
 // Only for tabs the user hasn't been given; removed (scripts, binding, and a live off-switch in the current
-// documents) before a tab goes back to the user.
+// documents) before a tab goes back to the user. The page can find MAIN's control (and so tell an agent is here) but
+// can't switch it off: that takes a secret of this install that only the server has, sent only at removal. Opening and
+// closing the hidden-modifier window takes a second secret (it travels with every background click, through
+// Playwright's evaluate, which page code can see into; so it opens nothing more than that window). The control is
+// frozen, and named per install, so a page that knew an earlier name can't plant a fake one before a claimed tab's
+// install.
 import crypto from 'node:crypto';
 import { cdp } from './cdp.mjs';
 import { debug } from './debug.mjs';
@@ -34,8 +39,8 @@ const OFF_CAP_MS = 400;
 // An opaque origin (a sandbox without allow-same-origin, which may also lack allow-popups) is left to the browser. Once
 // an activation went to the extension, every later window.open for a new context in it gets null, whatever its
 // features: the browser's own open would have used the activation up and blocked them.
-function main(event) {
-  const CONTROL = Symbol.for('fowlbrowser.popups');
+function main(event, key, secret, clickSecret) {
+  const CONTROL = Symbol.for(`fowlbrowser.popups:${key}`);
   if (window[CONTROL]) return window[CONTROL].on();
   // Taken before the page's scripts run: a page that replaced dispatchEvent would learn the event name.
   const { apply } = Reflect;
@@ -103,10 +108,16 @@ function main(event) {
   apply(listen, window, ['keydown', stopModifierKey, true]);
   apply(listen, window, ['keyup', stopModifierKey, true]);
 
-  // Synchronous: the isolated world's listener runs inside dispatchEvent. True when it took the request. Refused
-  // (the debugger is gone, or no isolated world in this frame): off for good, the page's own call goes ahead natively.
-  const dispatch = (data) => !apply(dispatchEvent, document, [new Custom(event, { detail: stringify(data), cancelable: true })]);
-  const send = (data) => dispatch(data) || (control.off(), false);
+  // Synchronous: the isolated world's listener runs inside dispatchEvent. True when it took the request. Refused, the
+  // isolated world says whether it is there: if so the debugger is gone (a detach, a takeover), off for good and the
+  // page's own call goes ahead natively. No answer at all is a page that took the listener away (document.open erases
+  // every listener): refused as if taken, unreported, so a page can't switch the guards off that way.
+  // A message is built by hand from string primitives, never an object: JSON.stringify of an object honours a toJSON
+  // the page can put on Object.prototype, which could turn a request into one the isolated world refuses while 'here'
+  // still answers. The event's init dictionary has no prototype: it reads inherited members too.
+  const encode = (type, field, value) => `{"type":${stringify(type)}${field ? `,${stringify(field)}:${stringify(typeof value === 'string' ? value : '')}` : ''}}`;
+  const dispatch = (type, field, value) => !apply(dispatchEvent, document, [new Custom(event, { __proto__: null, detail: encode(type, field, value), cancelable: true })]);
+  const send = (type, field, value) => dispatch(type, field, value) || (dispatch('here') ? (switchOff(), false) : true);
   const httpUrl = (value) => {
     try {
       const url = new URL(value, document.baseURI);
@@ -139,12 +150,12 @@ function main(event) {
         return apply(target, self, args);
       }
       if (feature(features, 'noreferrer') || feature(features, 'noopener')) {
-        if (!send({ type: 'open', url: httpUrl(url) })) return apply(target, self, args);
+        if (!send('open', 'url', httpUrl(url))) return apply(target, self, args);
         spent = true;
         return null;
       }
       // Needs its opener: a real window.open, as a tab (no popup, width, height, left, top...).
-      if (!send({ type: 'live' })) return apply(target, self, args);
+      if (!send('live')) return apply(target, self, args);
       const opened = apply(target, self, [args[0], args[1], '']);
       if (opened && !/^_blank$/i.test(name)) names.set(name, opened);
       return opened;
@@ -154,7 +165,7 @@ function main(event) {
     apply(target, self, args) {
       apply(target, self, args);
       // Reported once it really closes (the isolated world checks window.closed), so it can't be faked.
-      if (on && (self === undefined || self === window) && window === window.top) dispatch({ type: 'close' });
+      if (on && (self === undefined || self === window) && window === window.top) dispatch('close');
     },
   });
   // Page calls that would put the browser's or the Mac's own UI in front of the user from an agent's tab: the screen
@@ -194,7 +205,7 @@ function main(event) {
       apply(target, self, args) {
         // Refused only while the debugger is attached (send: after a detach, a takeover, the wrappers switch off and the
         // page gets what it asked for).
-        if (!on || (when && !apply(when, self, args)) || !send({ type: 'blocked', what })) return apply(target, self, args);
+        if (!on || (when && !apply(when, self, args)) || !send('blocked', 'what', what)) return apply(target, self, args);
         if (!error) return undefined;
         const refusal = error === 'TypeError' ? new TypeError(`${what} was refused`) : new DOMException(`${what} was refused`, error);
         if (sync) throw refusal;
@@ -209,7 +220,7 @@ function main(event) {
   apply(listen, window, ['click', (e) => {
     const target = apply(composedPath, e, [])[0];
     if (!on || e.isTrusted || !InputElement || !(target instanceof InputElement) || target.type !== 'color' || target.disabled) return;
-    if (send({ type: 'blocked', what: 'the colour window' })) e.preventDefault();
+    if (send('blocked', 'what', 'the colour window')) e.preventDefault();
   }, true]);
   const fakes = new Map([[open, nativeOpen], [close, nativeClose], [modifierState, nativeModifierState], ...keyGetters.map(([, native, fake]) => [fake.get, native.get]),
     ...declined.map(({ native, fake }) => [fake, native])]);
@@ -228,7 +239,7 @@ function main(event) {
     // Only links without an opener: _blank, or rel=noopener|noreferrer (a link to any other name keeps its opener).
     const noopener = rel.includes('noopener') || rel.includes('noreferrer') || /^_blank$/i.test(target);
     if (!url || rel.includes('opener') || !noopener || !newContext(target)) return;
-    if (send({ type: 'open', url })) e.preventDefault();
+    if (send('open', 'url', url)) e.preventDefault();
   }
   apply(listen, window, ['click', (e) => {
     if (!on || !e.isTrusted) return;
@@ -236,45 +247,53 @@ function main(event) {
     apply(listen, window, ['click', onLink]);
   }, true]);
 
+  const switchOff = () => {
+    on = false;
+    unhide();
+    if (window.open === open) window.open = nativeOpen;
+    if (window.close === close) window.close = nativeClose;
+    if (Function.prototype.toString === toString) Function.prototype.toString = nativeToString;
+    for (const [name, native, fake] of keyGetters) if (Object.getOwnPropertyDescriptor(mouse, name)?.get === fake.get) Object.defineProperty(mouse, name, native);
+    if (mouse.getModifierState === modifierState) mouse.getModifierState = nativeModifierState;
+    for (const { owner, method, native, fake } of declined) if (owner[method] === fake) owner[method] = native;
+  };
   const control = {
     on() {
       on = true;
       window.open = open;
       window.close = close;
       Function.prototype.toString = toString;
-      for (const [key, , fake] of keyGetters) Object.defineProperty(mouse, key, fake);
+      for (const [name, , fake] of keyGetters) Object.defineProperty(mouse, name, fake);
       mouse.getModifierState = modifierState;
       for (const { owner, method, fake } of declined) owner[method] = fake;
     },
-    off() {
-      on = false;
-      control.show();
-      if (window.open === open) window.open = nativeOpen;
-      if (window.close === close) window.close = nativeClose;
-      if (Function.prototype.toString === toString) Function.prototype.toString = nativeToString;
-      for (const [key, native, fake] of keyGetters) if (Object.getOwnPropertyDescriptor(mouse, key)?.get === fake.get) Object.defineProperty(mouse, key, native);
-      if (mouse.getModifierState === modifierState) mouse.getModifierState = nativeModifierState;
-      for (const { owner, method, native, fake } of declined) if (owner[method] === fake) owner[method] = native;
+    // Only with the secret (compared, never handed to anything the page could have replaced).
+    off(given) {
+      if (given === secret) switchOff();
     },
-    hide(capMs, element, token) {
-      if (!on || closedTokens.includes(token)) return false;
-      control.show();
+    hide(given, capMs, element, token) {
+      if (given !== clickSecret || !on || closedTokens.includes(token)) return false;
+      unhide();
       hidden = { element, token };
       hiddenTimer = later(() => { hidden = null; }, capMs);
       return true;
     },
     // With a token: closes that window only, and for good.
-    show(token) {
-      if (token !== undefined) {
-        closedTokens.push(token);
-        if (closedTokens.length > 20) closedTokens.shift();
-        if (hidden && hidden.token !== token) return;
-      }
-      hidden = null;
-      cancel(hiddenTimer);
+    show(given, token) {
+      if (given === clickSecret) unhide(token);
     },
   };
-  Object.defineProperty(window, CONTROL, { value: control });
+  const unhide = (token) => {
+    if (token !== undefined) {
+      closedTokens.push(token);
+      if (closedTokens.length > 20) closedTokens.shift();
+      if (hidden && hidden.token !== token) return;
+    }
+    hidden = null;
+    cancel(hiddenTimer);
+  };
+  Object.freeze(control); // its methods can't be swapped for the page's own
+  Object.defineProperty(window, CONTROL, { value: control }); // nor the property: not writable, not configurable
   control.on();
 }
 
@@ -294,7 +313,7 @@ function isolated(event, binding) {
   const privately = (node, fn) => {
     const host = document.createElement('span');
     host.attachShadow({ mode: 'closed' }).append(node);
-    document.documentElement.append(host);
+    (document.documentElement ?? document).append(host); // a page that removed its root must not read as a detach
     try {
       return fn();
     } finally {
@@ -310,7 +329,9 @@ function isolated(event, binding) {
   document.addEventListener(event, (e) => {
     let data;
     try { data = JSON.parse(e.detail); } catch { return; }
-    if (data?.type === 'live') {
+    if (data?.type === 'here') {
+      e.preventDefault(); // MAIN asking after a refusal: this world is here, so the refusal was the debugger's
+    } else if (data?.type === 'live') {
       if (attached()) e.preventDefault();
     } else if (data?.type === 'open') {
       const url = httpUrl(data.url);
@@ -332,7 +353,7 @@ function isolated(event, binding) {
 // must be the target or inside it, and everything around that: never links (tier 1, or their own meaning of a
 // modified click), form submits, editable or selectable things, labels and toggles, nor with focus inside a frame (the
 // modifier's key events would go there). Everything else (buttons, role=button, elements with click handlers) qualifies.
-export const BACKGROUND_CLICK_FN = (el, { capMs, token }) => {
+export const BACKGROUND_CLICK_FN = (el, { capMs, token, control, secret }) => {
   const skipRoles = ['checkbox', 'radio', 'switch', 'option', 'menuitemcheckbox', 'menuitemradio', 'row', 'gridcell', 'treeitem'];
   const up = (node) => node.parentElement ?? node.getRootNode().host;
   let focused = document.activeElement;
@@ -357,12 +378,12 @@ export const BACKGROUND_CLICK_FN = (el, { capMs, token }) => {
     if (/^(textarea|select|option|label)$/.test(tag)) return false;
     if (skipRoles.includes((node.getAttribute('role') ?? '').trim().toLowerCase().split(/\s+/)[0])) return false;
   }
-  return window[Symbol.for('fowlbrowser.popups')]?.hide?.(capMs, el, token) === true;
+  return window[Symbol.for(control)]?.hide?.(secret, capMs, el, token) === true;
 };
 
 export const pageScripts = { main, isolated }; // for tests
 
-const installed = new Map(); // Tab -> identifiers of its two scripts
+const installed = new Map(); // Tab -> { identifiers of its two scripts, control: MAIN's control name, secret, clickSecret }
 const heard = new WeakSet(); // Tabs whose reports are listened to (once, however often they are installed)
 
 // Call when an agent tab comes under control, before it navigates. Reports: 'close' sets tab.closedByPageAt; 'open' (a
@@ -374,7 +395,10 @@ export const popupsInstalled = (tab) => installed.has(tab);
 
 export async function installPopups(tab) {
   if (installed.has(tab)) return;
-  installed.set(tab, []);
+  const key = crypto.randomBytes(8).toString('hex');
+  const [secret, clickSecret] = [crypto.randomBytes(16).toString('hex'), crypto.randomBytes(16).toString('hex')];
+  const install = { identifiers: [], control: `fowlbrowser.popups:${key}`, secret, clickSecret };
+  installed.set(tab, install);
   if (!heard.has(tab)) {
     heard.add(tab);
     tab.on('binding', (name, payload) => {
@@ -394,10 +418,10 @@ export async function installPopups(tab) {
   }
   await cdp(tab, 'Runtime.addBinding', { name: BINDING, executionContextName: WORLD });
   const scripts = await Promise.all([
-    cdp(tab, 'Page.addScriptToEvaluateOnNewDocument', { source: `(${main})(${JSON.stringify(EVENT)})`, runImmediately: true }),
+    cdp(tab, 'Page.addScriptToEvaluateOnNewDocument', { source: `(${main})(${[EVENT, key, secret, clickSecret].map((v) => JSON.stringify(v)).join(', ')})`, runImmediately: true }),
     cdp(tab, 'Page.addScriptToEvaluateOnNewDocument', { source: `(${isolated})(${JSON.stringify(EVENT)}, ${JSON.stringify(BINDING)})`, worldName: WORLD, runImmediately: true }),
   ]);
-  if (installed.has(tab)) installed.set(tab, scripts.map((s) => s.identifier));
+  if (installed.get(tab) === install) install.identifiers = scripts.map((s) => s.identifier);
 }
 
 // The extension opens a blank background child (tabs.openChild); once it is attached it goes to the URL, so a download
@@ -435,10 +459,11 @@ export async function openingLines(openings, ms) {
 // tab that still has them closes): new documents get nothing, and window.open is native again in the current ones.
 // Best effort and capped, so it never holds up the release (after a detach every command fails).
 export async function uninstallPopups(tab) {
-  const identifiers = installed.get(tab);
-  if (!identifiers) return;
+  const install = installed.get(tab);
+  if (!install) return;
   installed.delete(tab);
-  const off = `window[Symbol.for('fowlbrowser.popups')]?.off()`;
+  const { identifiers, control, secret } = install;
+  const off = `window[Symbol.for(${JSON.stringify(control)})]?.off(${JSON.stringify(secret)})`;
   let timer;
   await Promise.race([
     Promise.allSettled([
@@ -458,12 +483,13 @@ export async function uninstallPopups(tab) {
 // probe can't arm it again.
 const PROBE_MS = 300;
 export async function backgroundClick(tab, loc, capMs, click) {
-  if (!installed.has(tab)) return click();
+  const { control, clickSecret } = installed.get(tab) ?? {};
+  if (!control) return click();
   const token = crypto.randomUUID();
   // In the main frame's current document (after a navigation the new one never had it).
-  const close = () => capped(cdp(tab, 'Runtime.evaluate', { expression: `window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(token)})` }).catch(() => {}));
+  const close = () => capped(cdp(tab, 'Runtime.evaluate', { expression: `window[Symbol.for(${JSON.stringify(control)})]?.show(${JSON.stringify(clickSecret)}, ${JSON.stringify(token)})` }).catch(() => {}));
   // Bounded here too: the locator's timeout covers finding the element, not a page that stalls after.
-  const background = await within(loc.evaluate(BACKGROUND_CLICK_FN, { capMs, token }, { timeout: PROBE_MS }).then((yes) => yes === true), PROBE_MS, null);
+  const background = await within(loc.evaluate(BACKGROUND_CLICK_FN, { capMs, token, control, secret: clickSecret }, { timeout: PROBE_MS }).then((yes) => yes === true), PROBE_MS, null);
   if (background === null) await close();
   if (!background) return click();
   try {

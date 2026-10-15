@@ -41,13 +41,20 @@ export const macOS = {
   // every browser it finds, used with FowlBrowser or not.
   installed: ({ key, dir }) => fs.existsSync(path.join(SUPPORT, dir, 'NativeMessagingHosts', 'com.fowl.browser.json'))
     && fs.existsSync(path.join(SOCKET_DIR, 'logs', `${key}.log`)),
-  // Every process's executable path.
+  // This user's processes' executable paths.
   processes: () => {
-    try { return execFileSync('ps', ['-axo', 'comm='], { encoding: 'utf8' }).split('\n').map((line) => line.trim()); } catch { return []; }
+    try { return ownProcesses(execFileSync('ps', ['-axo', 'uid=,comm='], { encoding: 'utf8' })); } catch { return []; }
   },
   // What a click on its Dock icon sends, without bringing it to the front (-g): a browser with no window opens one.
   reopen: (bundle) => execFile('open', ['-g', bundle], () => {}),
 };
+
+// The executable paths of `ps -axo uid=,comm=` lines run by this user. ps lists every account's processes, and a
+// "Google Chrome.app" another account runs (from /Users/Shared, say) must never be what reopen launches as this user.
+export function ownProcesses(psOutput, uid = process.getuid()) {
+  return psOutput.split('\n').map((line) => line.trim().match(/^(\d+)\s+(.+)$/))
+    .filter((match) => match && Number(match[1]) === uid).map((match) => match[2]);
+}
 
 // The bundle of the app's running main process, or null (its helpers are .apps of other names inside it).
 function runningBundle(app, processes) {

@@ -12,20 +12,34 @@ function show(part) {
 
 // Text an agent types (passwords, messages) and every form value (a PIN or code may be a number) stay out of the log:
 // it gets attached to bug reports.
-function redact(parts) {
-  const [kind, name, args] = parts;
-  if (kind !== 'tool >' || !args) return parts;
-  if ((name === 'type' || name === 'dialog') && typeof args.text === 'string') return [kind, name, { ...args, text: '[redacted]' }];
+// Also record.mjs's, for its journal.
+export function redactArgs(name, args) {
+  if (!args) return args;
+  if ((name === 'type' || name === 'dialog') && typeof args.text === 'string') return { ...args, text: '[redacted]' };
   if (name === 'fill_form' && Array.isArray(args.fields)) {
-    return [kind, name, { ...args, fields: args.fields.map((f) => (f && 'value' in f ? { ...f, value: '[redacted]' } : f)) }];
+    return { ...args, fields: args.fields.map((f) => (f && 'value' in f ? { ...f, value: '[redacted]' } : f)) };
   }
-  return parts;
+  return args;
 }
 
+function redact(parts) {
+  const [kind, name, args] = parts;
+  return kind === 'tool >' && args ? [kind, name, redactArgs(name, args), ...parts.slice(3)] : parts;
+}
+
+// Page text (titles) goes in, so never through a symlink (another user's in /tmp, pointing at a shell profile) nor
+// into a file others can read: created 0600, an older one of ours made 0600 too, and one another user owns (or a FIFO,
+// a device) is left alone. Non-blocking: a FIFO there with no reader fails to open instead of hanging the server.
+const FLAGS = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
 export const debug = file
   ? (...parts) => {
+    let fd;
     try {
-      fs.appendFileSync(file, `${new Date().toISOString().slice(11, 23)} [${process.pid}] ${redact(parts).map(show).join(' ').slice(0, 400)}\n`);
-    } catch {}
+      fd = fs.openSync(file, FLAGS, 0o600);
+      const stat = fs.fstatSync(fd);
+      if (stat.uid !== process.getuid() || !stat.isFile()) return;
+      if (stat.mode & 0o077) fs.fchmodSync(fd, 0o600);
+      fs.writeSync(fd, `${new Date().toISOString().slice(11, 23)} [${process.pid}] ${redact(parts).map(show).join(' ').slice(0, 400)}\n`);
+    } catch {} finally { if (fd !== undefined) fs.closeSync(fd); }
   }
   : () => {};

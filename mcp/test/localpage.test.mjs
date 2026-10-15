@@ -8,7 +8,7 @@ import { registerTools } from '../src/tools.mjs';
 
 const SECRET = 'file:///Users/me/notes/secret.html';
 
-function setup() {
+function setup(local = SECRET) {
   let url = 'https://example.com/';
   let tab;
   const go = (to) => { url = to; tab._newDocument(to); page.emit('framenavigated', page); };
@@ -16,7 +16,7 @@ function setup() {
     setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => url, mainFrame: () => page, isClosed: () => false,
     async evaluate(fn) {
       const source = String(fn);
-      if (source.includes('history.back')) return go(SECRET);
+      if (source.includes('history.back')) return go(local);
       // A page that jumps into a local file and straight back while the agent's own read runs.
       if (source.includes('innerText')) { go(SECRET); const text = 'SECRET PLANS'; go('https://example.com/'); return text; }
       if (source.includes('canGoBack')) return { url, can: true };
@@ -25,7 +25,7 @@ function setup() {
     waitForEvent: (name) => new Promise((resolve) => page.once(name, resolve)),
     waitForLoadState: async () => {},
     async goto(to) { go(to); return null; },
-    ariaSnapshot: async () => (url.startsWith('file:') ? '- heading "SECRET PLANS"' : '- link "Back to my notes"'),
+    ariaSnapshot: async () => (url === local ? '- heading "SECRET PLANS"' : '- link "Back to my notes"'),
     screenshot: async () => Buffer.from('jpeg'),
     // A click on the page that lands on a local file (a link from one local file to another).
     mouse: { click: async () => go(SECRET), move: async () => {} },
@@ -36,7 +36,7 @@ function setup() {
     async request(method, params) {
       if (method === 'tabs.isShown') return { shown: false, focused: false };
       if (method === 'tabs.expectChild') return {};
-      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: url.startsWith('file:') ? 'SECRET PLANS' : 'Example' } };
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: url === local ? 'SECRET PLANS' : 'Example' } };
       throw new Error(`not in this double: ${method}`);
     },
   };
@@ -96,4 +96,19 @@ test('a read during which the page went to a local file and back is discarded; n
   page.emit('console', { type: () => 'log', text: () => 'SECRET PLANS', location: () => ({ url: SECRET }) });
   page.emit('pageerror', new Error('SECRET PLANS'));
   assert.equal(tab.console.length, 0);
+});
+
+test('back into an extension or browser page: nothing of it is read, and tools refuse the tab as for a local file', async () => {
+  for (const page of ['chrome-extension://lpfcnmmimgcillacmnibffooadlofjhj/popup.html', 'chrome://settings/passwords', 'devtools://devtools/x.html']) {
+    const { call, url } = setup(page);
+    const back = await call('navigate', { action: 'back' });
+    assert.equal(url(), page);
+    assert.match(back.text, /this tab shows a browser or extension page, not a web page, which FowlBrowser doesn't read; navigate it to a web page or close it/);
+    assert.doesNotMatch(back.text, /SECRET PLANS/);
+    for (const [name, args] of [['snapshot', {}], ['snapshot', { mode: 'text' }], ['evaluate', { function: '() => 1' }], ['click', { x: 5, y: 5 }]]) {
+      const result = await call(name, args);
+      assert.ok(result.error, `${page} ${name}: ${result.text}`);
+      assert.doesNotMatch(result.text, /SECRET PLANS/, name);
+    }
+  }
 });

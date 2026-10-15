@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { privateTmp } from '../bin/turn-ended.mjs';
 import * as cursor from './cursor/index.mjs';
 import { SOCKET_DIR } from './hostClient.mjs';
 import { uninstallPopups } from './popups.mjs';
@@ -14,12 +15,15 @@ import { tabInfo, within } from './util.mjs';
 import { clearViewport } from './viewport.mjs';
 
 // In the FowlBrowser folder (0700; its own subfolder, as *.sock there are browsers), not the shared /tmp. When that
-// is too long for a socket (104 bytes on macOS), in the user's temp folder (macOS gives each user a private one); the
-// hook looks in both, then in /tmp for servers from before.
+// is too long for a socket (104 bytes on macOS), in the user's temp folder if it is theirs alone (macOS gives each user
+// a private one), else none: turn ends then go unhandled, as without the hook. The hook looks in the same two places.
 export const turnSocketPath = (pid = process.ppid, dir = SOCKET_DIR, tmp = os.tmpdir()) => {
   const socketPath = path.join(dir, 'turns', `${pid}.sock`);
-  return Buffer.byteLength(socketPath) < 104 ? socketPath : path.join(tmp, `fowlbrowser-turn-${pid}.sock`);
+  if (Buffer.byteLength(socketPath) < 104) return socketPath;
+  const fallback = path.join(tmp, `fowlbrowser-turn-${pid}.sock`);
+  return Buffer.byteLength(fallback) < 104 && privateTmp(tmp) ? fallback : null;
 };
+const MAX_LINE = 256; // the hook sends one short word and a newline
 
 // Tool calls running per tab id string ("chrome:52"), counted by the registration wrapper in tools.mjs.
 export const callsByTab = new Map();
@@ -110,6 +114,7 @@ export async function endTurn(manager) {
 
 // Lines from bin/turn-ended.mjs: turn_ended (Stop), subagent_start, subagent_stop. Concurrent turn ends share one run.
 export function listenForTurns(manager, socketPath = turnSocketPath()) {
+  if (!socketPath) return null;
   let running = null;
   const run = () => (running ??= endTurn(manager).finally(() => { running = null; }));
   const reply = (socket, result) => socket.end(`${JSON.stringify(result)}\n`);
@@ -120,6 +125,7 @@ export function listenForTurns(manager, socketPath = turnSocketPath()) {
     let buffer = '';
     socket.on('data', (chunk) => {
       buffer += chunk;
+      if (buffer.length > MAX_LINE) return socket.destroy();
       if (!buffer.includes('\n')) return;
       const line = buffer.split('\n')[0].trim();
       if (line === 'subagent_start') return reply(socket, { subagents: countSubagents(1) });

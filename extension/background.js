@@ -65,6 +65,8 @@ chrome.debugger.onDetach.addListener(core.onDebuggerDetach);
 chrome.tabs.onCreated.addListener(core.onTabCreated);
 chrome.webNavigation.onCreatedNavigationTarget.addListener(core.onNavigationTarget);
 chrome.webNavigation.onCommitted.addListener(core.onNavigationCommitted);
+chrome.webNavigation.onBeforeNavigate.addListener(core.onBeforeNavigate);
+chrome.webNavigation.onErrorOccurred.addListener(core.onNavigationError);
 chrome.tabs.onRemoved.addListener(core.onTabRemoved);
 chrome.tabs.onReplaced.addListener(core.onTabReplaced);
 chrome.tabs.onActivated.addListener(core.onTabActivated);

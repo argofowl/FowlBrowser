@@ -5,6 +5,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import fs from 'node:fs';
 import path from 'node:path';
+import { redactArgs } from './debug.mjs';
 
 const MAX_FRAMES = 400;
 // Record mode only (rounds): a busy browser answers the overlay's state in seconds, and a point without it would read
@@ -25,13 +26,15 @@ function shortArgs(value) {
 
 // A journal in dir: record(entry) appends one line (synchronously, so lines keep the order they were made in),
 // frame(tab) captures the next frame.
+// Frames show the user's pages: the folder and files are this user's alone.
 export function openJournal(dir) {
-  fs.mkdirSync(path.join(dir, 'frames'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'frames'), { recursive: true, mode: 0o700 });
+  for (const folder of [dir, path.join(dir, 'frames')]) fs.chmodSync(folder, 0o700); // mkdir's mode skips existing ones
   const file = path.join(dir, 'journal.jsonl');
   let frames = 0;
   return {
     record(entry) {
-      fs.appendFileSync(file, `${JSON.stringify({ t: Date.now(), ...entry })}\n`);
+      fs.appendFileSync(file, `${JSON.stringify({ t: Date.now(), ...entry })}\n`, { mode: 0o600 });
     },
     // A viewport JPEG with the cursor in it (agent screenshots hide it), waited for at most capMs.
     // frame is null once MAX_FRAMES are taken or when the capture is late or fails.
@@ -44,7 +47,7 @@ export function openJournal(dir) {
         tab.page.screenshot({ type: 'jpeg', quality: 60, scale: 'css' }).catch(() => null),
         new Promise((resolve) => { timer = setTimeout(resolve, capMs, null); }),
       ]).finally(() => clearTimeout(timer));
-      if (image) fs.writeFileSync(path.join(dir, name), image);
+      if (image) fs.writeFileSync(path.join(dir, name), image, { mode: 0o600 });
       return { frame: image ? name : null, captureMs: Date.now() - started };
     },
   };
@@ -77,9 +80,10 @@ export async function recordCall(name, args, handler) {
   }
 }
 
-// evaluate keeps its script source (function or expression) up to SOURCE_MAX_CHARS, so a harness can read it.
+// evaluate keeps its script source (function or expression) up to SOURCE_MAX_CHARS, so a harness can read it. Typed
+// text and form values (passwords) are redacted as in the debug log.
 function callArgs(name, args) {
-  const short = shortArgs(args);
+  const short = shortArgs(redactArgs(name, args));
   if (name !== 'evaluate') return short;
   for (const key of ['function', 'expression']) if (typeof args[key] === 'string') short[key] = cut(args[key], SOURCE_MAX_CHARS);
   return short;

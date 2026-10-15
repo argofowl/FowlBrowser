@@ -9,7 +9,7 @@
 <script>
   const params = new URLSearchParams(location.search);
   const wrapped = window.open;
-  const installed = Object.getOwnPropertySymbols(window).some((s) => s.description === 'fowlbrowser.popups');
+  const installed = Object.getOwnPropertySymbols(window).some((s) => s.description?.startsWith('fowlbrowser.popups'));
   let n = 0;
   document.getElementById('later').addEventListener('click', () => {
     const via = `detach-${++n}`;

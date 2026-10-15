@@ -12,6 +12,7 @@ import { sleep } from './util.mjs';
 
 const INSIGHT_MAX_CHARS = 20_000;
 const gunzip = promisify(zlib.gunzip);
+const gzip = promisify(zlib.gzip);
 
 // DevTools' default timeline categories plus JS sampling and screenshots (what DevTools and chrome-devtools-mcp record).
 const CATEGORIES = ['-*', 'blink.console', 'blink.user_timing', 'loading', 'devtools.timeline', 'disabled-by-default-devtools.target-rundown',
@@ -60,6 +61,79 @@ export async function resetEngine() {
   const Trace = await traceEngine();
   Trace.TraceModel.Model.createWithAllHandlers().resetProcessor();
   Trace.Helpers.SyntheticEvents.SyntheticEventsManager.reset();
+}
+
+// --- The traced tab only ---
+
+// Chrome traces the whole browser: other tabs' renderer processes, and browser process events about every tab's
+// navigations (their URLs, origins, frame tree nodes and processes). Before a trace is saved or read, everything that
+// isn't the traced tab's goes: kept are the renderer processes of its frames (TracingStartedInBrowser lists them at the
+// start, FrameCommittedInBrowser adds the ones committed later, children included) without events about other frames,
+// and the browser, GPU and other non-renderer processes' events that name only its frames, frame tree node, renderer
+// processes and pages (an event with URLs and none of those: only its frames' URLs and origins; another tab of the same
+// site has other URLs). A renderer process it shares with a same-site tab still holds that tab's frameless events
+// (JS samples). A trace without TracingStartedInBrowser can't be told apart, so nothing of it is kept.
+const FRAME_KEYS = new Set(['frame', 'frameId', 'parent', 'page']);
+const NODE_KEYS = new Set(['frame_tree_node_id', 'frameTreeNodeId']);
+const PROCESS_KEYS = new Set(['child_process_id', 'processId']);
+// URLs: a value under a URL key (url, documentLoaderURL, latest_url, site_url, origin...), a value that starts with a
+// scheme (data:, blob:, about:, javascript:... have no //), and any scheme:// inside other text.
+const URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'{},]*/gi;
+const URL_KEY = /url|uri|origin|site|href|location|filename/i;
+const SCHEME = /^[a-z][a-z0-9+.-]*:\S/i;
+
+function references(args) {
+  const found = { frames: [], nodes: [], processes: [], urls: [] };
+  const walk = (value, key) => {
+    if (typeof value === 'string') {
+      if (FRAME_KEYS.has(key)) found.frames.push(value);
+      if (URL_KEY.test(key) || SCHEME.test(value)) found.urls.push(value);
+      else found.urls.push(...(value.match(URL_PATTERN) ?? []));
+    } else if (typeof value === 'number') {
+      if (NODE_KEYS.has(key)) found.nodes.push(value);
+      if (PROCESS_KEYS.has(key)) found.processes.push(value);
+    } else if (value && typeof value === 'object') {
+      for (const [k, v] of Object.entries(value)) walk(v, Array.isArray(value) ? key : k);
+    }
+  };
+  walk(args, '');
+  return found;
+}
+
+const originOf = (u) => { try { const { origin } = new URL(u); return origin === 'null' ? null : origin; } catch { return null; } };
+
+export function tracedTabOnly(json) {
+  const events = json.traceEvents ?? json;
+  const started = events.find((e) => e.name === 'TracingStartedInBrowser')?.args?.data;
+  const keep = (kept) => (Array.isArray(json) ? kept : { ...json, traceEvents: kept });
+  if (!started) return keep([]);
+  const node = started.frameTreeNodeId;
+  const frames = new Set();
+  const pids = new Set();
+  const urls = new Set(); // its frames' URLs and origins
+  const add = (f) => {
+    frames.add(f.frame);
+    if (f.processId) pids.add(f.processId);
+    if (typeof f.url === 'string') urls.add(f.url); // about:blank and data: frames too
+    const origin = originOf(f.url);
+    if (origin) urls.add(origin).add(`${origin}/`);
+  };
+  for (const f of started.frames ?? []) add(f);
+  // Frames committed later (a navigation to another process, a child frame), in one pass per level of the tree.
+  const commits = events.filter((e) => e.name === 'FrameCommittedInBrowser' && e.args?.data?.frame);
+  for (let size = -1; size !== frames.size + pids.size;) {
+    size = frames.size + pids.size;
+    for (const { args: { data } } of commits) if (frames.has(data.frame) || frames.has(data.parent)) add(data);
+  }
+  const renderers = new Set(events.filter((e) => e.ph === 'M' && e.name === 'process_name' && /renderer/i.test(e.args?.name ?? '')).map((e) => e.pid));
+  return keep(events.filter((e) => {
+    if (renderers.has(e.pid) && !pids.has(e.pid)) return false; // another tab's renderer
+    const refs = references(e.args);
+    if (!refs.frames.every((f) => frames.has(f))) return false;
+    if (pids.has(e.pid)) return true;
+    if (!refs.nodes.every((n) => n === node) || !refs.processes.every((p) => pids.has(p))) return false;
+    return refs.frames.length > 0 || refs.nodes.length > 0 || refs.urls.every((u) => urls.has(u));
+  }));
 }
 
 // --- Formatting ---
@@ -376,8 +450,9 @@ async function stop(tab, header, text) {
   try {
     const { gz, dataLoss } = recording;
     const file = path.join(outputDir('traces'), `trace-${stamp()}-${fileTab(tab)}.json.gz`);
-    await fs.writeFile(file, gz); // as Chrome wrote it: gzipped
-    const parsed = await parseTrace(JSON.parse((await gunzip(gz)).toString('utf8')));
+    const trace = tracedTabOnly(JSON.parse((await gunzip(gz)).toString('utf8')));
+    await fs.writeFile(file, await gzip(JSON.stringify(trace))); // gzipped, as Chrome wrote it
+    const parsed = await parseTrace(trace);
     tab.trace.last = { parsed, file };
     const waited = tab.trace.waitedMs >= 1000 ? `Waited ${Math.round(tab.trace.waitedMs / 1000)} s for another session's trace to end before recording.\n` : '';
     return text(`${await header(tab)}\n${waited}${summaryText(parsed, { file, dataLoss })}`);

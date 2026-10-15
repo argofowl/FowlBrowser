@@ -15,10 +15,10 @@ import { backgroundClick, openingLines, uninstallPopups } from './popups.mjs';
 import * as record from './record.mjs';
 import * as takeover from './takeover.mjs';
 import { callsByTab } from './turns.mjs';
-import { sleep, tabInfo, within } from './util.mjs';
+import { isLocalUrl, sleep, tabInfo, within } from './util.mjs';
 import { clearViewport, MAX_SIZE, MIN_SIZE, setMedia, setViewport } from './viewport.mjs';
-import { cap as capText, collapseText, findInSnapshot, functionSource, newRefState, numberRefs, playwrightRef, REF_PATTERN, shownRef, SNAPSHOT_MAX_CHARS,
-  SNAPSHOT_MAX_CHARS_LIMIT, snapshotChanges, urlMatcher } from './snapshots.mjs';
+import { cap as capText, collapseText, findInSnapshot, functionSource, mainFramePrefixes, maskFields, newRefState, numberRefs, playwrightRef, REF_PATTERN,
+  shownRef, shownValue, SNAPSHOT_MAX_CHARS, SNAPSHOT_MAX_CHARS_LIMIT, snapshotChanges, textFields, urlMatcher, yamlValue } from './snapshots.mjs';
 
 const MAX_CHARS = 40_000; // for evaluate, console and network output: like snapshots, under what Claude Code takes uncounted (snapshots.mjs)
 const POPUP_WAIT_MS = 2000; // after an action the page asked for a new tab: how long to wait for the extension to announce it
@@ -67,22 +67,35 @@ async function resolveTab(manager, value) {
   return browser.waitForTab(tabId);
 }
 
-// Parsed like the browser does (it drops tabs, newlines and leading control characters), so "fi\tle:" is file: too.
-export function refuseLocalFile(url) {
-  const protocol = URL.parse(url ?? '')?.protocol;
-  if (protocol === 'file:') {
+// Agents open web pages only: an extension's own page runs with its powers, chrome:/devtools: pages are the browser's
+// settings and tools, and app schemes (mailto:, slack:...) launch other apps. Parsed like the browser does (it drops
+// tabs, newlines and leading control characters), so "fi\tle:" is file: too.
+const isWebUrl = (parsed) => ['http:', 'https:', 'data:'].includes(parsed?.protocol) || (parsed?.protocol === 'about:' && parsed.pathname.toLowerCase() === 'blank');
+export function refuseNonWeb(url) {
+  if (!url) return url;
+  const parsed = URL.parse(url);
+  if (isWebUrl(parsed)) return url;
+  if (parsed?.protocol === 'file:') {
     throw new Error(`${url.trim()} is a local file: local files can't be opened in the browser. Read the file from disk instead (it is on this Mac).`);
   }
-  if (protocol === 'view-source:') throw new Error(`${url.trim()}: view-source: pages can't be opened. Open the page itself instead.`);
-  return url;
+  if (parsed?.protocol === 'view-source:') throw new Error(`${url.trim()}: view-source: pages can't be opened. Open the page itself instead.`);
+  const instead = !parsed ? 'Pass a full address, e.g. https://example.com/ or http://localhost:3000/.'
+    : parsed.protocol === 'javascript:' ? 'To run a script in a page, use evaluate.'
+      : 'The browser\'s own pages, extensions and links that open other apps are the user\'s: tell them instead.';
+  throw new Error(`${url.trim()} can't be opened: agents open web pages only (http:, https:, about:blank and data: URLs). ${instead}`);
 }
 
-// However a tab came to show a local file (history, a page's own history.back(), a link from one local file to another),
-// FowlBrowser doesn't read or act in it: it may only be navigated away, released, kept or closed.
-const LOCAL_PAGE = 'this tab shows a local file, which FowlBrowser doesn\'t read; navigate it to a web page or close it';
-const isLocalPage = (url) => ['file:', 'view-source:'].includes(URL.parse(url)?.protocol);
+// However a tab came to show a page that isn't a web page (history, a page's own history.back(), a link from one local
+// file to another), FowlBrowser doesn't read or act in it: it may only be navigated away, released, kept or closed.
+// Chrome's error page for a web address that didn't load (chrome-error:) and a site's own blob: pages are web pages too.
+const localPage = (url) => (isLocalUrl(url) ? 'this tab shows a local file' : 'this tab shows a browser or extension page, not a web page') +
+  ', which FowlBrowser doesn\'t read; navigate it to a web page or close it';
+const isLocalPage = (url) => {
+  const parsed = URL.parse(url);
+  return !!parsed && !isWebUrl(parsed) && !['about:', 'chrome-error:'].includes(parsed.protocol) && !(parsed.protocol === 'blob:' && /^https?:/.test(parsed.origin));
+};
 function refuseLocalPage(tab) {
-  if (isLocalPage(tab.page.url())) throw new Error(`Tab ${tab.id}: ${LOCAL_PAGE}.`);
+  if (isLocalPage(tab.page.url())) throw new Error(`Tab ${tab.id}: ${localPage(tab.page.url())}.`);
 }
 
 // Hidden files and folders (~/.ssh, ~/.aws, .env, ~/.config), ~/Library and system configuration are never uploaded,
@@ -97,7 +110,7 @@ export function uploadPaths(paths, home = os.homedir()) {
   // The Data volume's firmlinks name the same folders: /System/Volumes/Data/Users/me/Downloads is /Users/me/Downloads.
   const unalias = (real) => (real.startsWith(DATA_VOLUME) ? real.slice(DATA_VOLUME.length - 1) : real);
   const library = path.join(unalias(fs.realpathSync.native(home)), 'Library');
-  const refusedDirs = [library, '/etc', '/private/etc', '/System', '/private/var/db'];
+  const refusedDirs = [library, '/etc', '/private/etc', '/System', '/private/var/db', '/Library/Keychains', '/private/var/log'];
   const cloudDirs = [path.join(library, 'Mobile Documents'), path.join(library, 'CloudStorage')];
   const inside = (real, d) => real === d || real.startsWith(d + path.sep);
   // Why a resolved path can't be uploaded, or null.
@@ -110,6 +123,11 @@ export function uploadPaths(paths, home = os.homedir()) {
   const refuse = (p, real, why) => {
     throw new Error(`${p}${real === p ? '' : ` (${real})`} can't be uploaded: ${why}, where keys, passwords and app data live. ` +
       'If the user really wants it uploaded, ask them to move or copy it somewhere like ~/Downloads first.');
+  };
+  // A device (/dev/zero, /dev/stdin), pipe or socket never ends or blocks the read: the upload would hang or crash the session.
+  const special = (stat) => !stat.isFile() && !stat.isDirectory();
+  const refuseSpecial = (p, what) => {
+    throw new Error(`${p} can't be uploaded: ${what} not a regular file or folder (a device, pipe or socket). Upload the user's files themselves.`);
   };
   // Everything in a folder, walked without following links blindly: a link is resolved and checked like a path given
   // itself, and a linked folder is walked too (once).
@@ -131,7 +149,9 @@ export function uploadPaths(paths, home = os.homedir()) {
           const why = refusal(real);
           if (why) refuse(p, folder, `it holds ${shown}, a link to ${real}: ${why}`);
         }
-        if ((entry.isDirectory() || (entry.isSymbolicLink() && fs.statSync(real).isDirectory())) && !seen.has(real)) {
+        const stat = entry.isSymbolicLink() ? fs.statSync(real) : entry;
+        if (special(stat)) refuseSpecial(p, `it holds ${shown}, which is`);
+        if (stat.isDirectory() && !seen.has(real)) {
           seen.add(real);
           walk(real, shown);
         }
@@ -143,7 +163,9 @@ export function uploadPaths(paths, home = os.homedir()) {
     const real = fs.realpathSync.native(path.resolve(p));
     const why = refusal(real);
     if (why) refuse(p, real, why);
-    if (fs.statSync(real).isDirectory()) checkFolder(p, real);
+    const stat = fs.statSync(real);
+    if (special(stat)) refuseSpecial(p, 'it is');
+    if (stat.isDirectory()) checkFolder(p, real);
     return real;
   });
 }
@@ -508,6 +530,49 @@ async function header(tab) {
 const cap = (body, note) => capText(body, MAX_CHARS, note);
 const CUT_NOTE = 'To read them, call snapshot with ref=<eN> of a section, or with a larger max_chars';
 
+// A password input's value never reaches the agent: not in a snapshot, find, the changes after an action, nor the tab's
+// baseline they come from (the browser autofills saved passwords, and the page can read them after any click). A text
+// field line (textbox, searchbox...) with a ref is checked through Playwright (all at once). Every other line showing a
+// value or text is compared, as Playwright writes it (shownValue), with the password inputs' values, read once from every
+// frame: a field Playwright gives no ref (no pointer events, no box), or a password input with another role (role="button").
+// When that read fails (a frame didn't answer), every line with a ref is looked up through Playwright instead, and one
+// without a ref that shows a value on its element's own line is masked. A text field, or a line with a ref, that can't
+// be checked is masked too. mainPrefixes: see locator().
+const IS_PASSWORD_FN = (el) => el.localName === 'input' && el.type === 'password';
+const PASSWORD_VALUES_FN = () => {
+  const values = [];
+  const walk = (root) => {
+    for (const el of root.querySelectorAll('*')) {
+      if (el.localName === 'input' && el.type === 'password' && el.value) values.push(el.value);
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  };
+  walk(document);
+  return values;
+};
+async function maskPasswords(tab, yaml, mainPrefixes) {
+  const fields = textFields(yaml);
+  if (!fields.length) return yaml;
+  // Null when a frame didn't answer.
+  const passwords = (async () => {
+    const lists = await Promise.all(tab.page.frames().map((frame) => within(frame.evaluate(PASSWORD_VALUES_FN), STALE_REF_MS, null)));
+    return lists.includes(null) ? null : new Set(lists.flat().map(shownValue));
+  })().catch(() => null);
+  const secret = await Promise.all(fields.map(async ({ ref, field, own, value }) => {
+    if (!ref || !field) {
+      const known = await passwords;
+      if (known) return known.has(yamlValue(value));
+      // The scan failed: a ref'd line of any role is looked up as text fields are; a value on its element's own line
+      // (an input's, whatever its role) is masked; page text (`- text:` lines) stays.
+      if (!ref) return field || own;
+    }
+    const prefix = /^f\d+/.exec(ref)?.[0];
+    const loc = prefix && mainPrefixes.has(prefix) ? tab.page.locator(`:root >> aria-ref=${ref}`) : tab.page.getByRef(ref);
+    return loc.evaluate(IS_PASSWORD_FN, null, { timeout: STALE_REF_MS });
+  }).map((check) => check.catch(() => true)));
+  return maskFields(yaml, fields.filter((_, i) => secret[i]));
+}
+
 // Every snapshot an agent receives fits in maxChars. Each whole-page snapshot becomes the tab's baseline (the full
 // text: the agent was told how to read a cut part) for `changes`: after an action on the same document and URL,
 // only what changed since then is returned, unless that is not much shorter than the page.
@@ -524,9 +589,11 @@ async function snapshotText(tab, { ref, changes = false, maxChars = SNAPSHOT_MAX
     generation = tab.documentGeneration;
     frameGeneration = tab.frameGeneration;
     url = tab.page.url();
-    if (isLocalPage(url)) return `Snapshot unavailable: ${LOCAL_PAGE}.`;
+    if (isLocalPage(url)) return `Snapshot unavailable: ${localPage(url)}.`;
     const target = ref ? locator(tab, ref) : tab.page;
     yaml = await target.ariaSnapshot({ mode: 'ai', timeout: ACTION_TIMEOUT_MS });
+    // Before anything keeps or shows it, and while Playwright's ref table is this snapshot's.
+    yaml = await maskPasswords(tab, yaml, ref ? tab.refs?.mainPrefixes ?? new Set() : new Set(mainFramePrefixes(yaml)));
     // Playwright resolves refs through its last snapshot's table, a section's only of the section: the whole page is read
     // again (text unused), so the refs shown before outside it keep working.
     if (ref) await tab.page.ariaSnapshot({ mode: 'ai', timeout: ACTION_TIMEOUT_MS }).catch((error) => debug('ref table restore failed', error.message));
@@ -855,7 +922,7 @@ async function withGesture(tab, fn) {
 // claimed tab), and opens for them as usual. Reads hold choosers too: an evaluate right after an action still has its
 // user activation (a script click on a file input opens a chooser then), and media may click the player.
 async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenTabs = false, read = false, waited = false, input = true } = {}) {
-  if (tab.dialog) throw new Error(dialogLine(tab) ?? `A dialog is open, and ${LOCAL_PAGE}.`);
+  if (tab.dialog) throw new Error(dialogLine(tab) ?? `A dialog is open, and ${localPage(tab.page.url())}.`);
   // A tab this action opens from the user's claimed tab is adopted (ours, in the background) instead of being the user's.
   // Only for actions that can open tabs (a shorter window means fewer chances to catch the user's own Cmd-click, and
   // such a tab is handed back to them, never closed). Older extensions don't know the command; that only loses
@@ -1609,7 +1676,7 @@ export function registerTools(server, manager) {
       muted: z.boolean().optional().describe('Mute the tab\'s audio (default true; ignored with for_user).'),
       snapshot: snapshotArg, screenshot: screenshotArg, timeout_ms: timeoutArg },
     async ({ browser: key, url, for_user, focus, group, muted, snapshot, screenshot, timeout_ms }) => {
-      refuseLocalFile(url);
+      refuseNonWeb(url);
       const browser = await manager.get(key);
       await browser.playwright();
       const created = await browser.host.request('tabs.open', { group, muted, forUser: for_user === true });
@@ -1805,7 +1872,7 @@ export function registerTools(server, manager) {
           'navigated any more. Close it with tab_close (and open a new tab).');
       }
       let response;
-      if (args.url) response = await tab.page.goto(refuseLocalFile(args.url), options);
+      if (args.url) response = await tab.page.goto(refuseNonWeb(args.url), options);
       else if (args.action === 'back' || args.action === 'forward') {
         if (!(await historyStep(tab, args.action, options.timeout))) return `No ${args.action} history entry.`;
       } else if (args.action === 'reload') response = await tab.page.reload(options);
@@ -2083,7 +2150,8 @@ export function registerTools(server, manager) {
   const CHOOSER_MS = 1500; // after a click on what is no file input: how long a chooser has to open before the files are dropped instead
   tool('upload_files',
     'Upload local files: ref is a file input, a button that opens a file chooser, or a drop zone (drag files here): files are ' +
-    'dropped on what opens no chooser. Without ref, fills the file chooser the last action opened (its result said so). paths are absolute paths on this Mac.',
+    'dropped on what opens no chooser. Without ref, fills the file chooser the last action opened (its result said so). paths are absolute paths on this Mac. ' +
+    'Ask the user first before uploading a file they didn\'t name for this site.',
     { tab: tabArg, ref: refArg.optional(), paths: z.array(z.string()).min(1), snapshot: snapshotArg, screenshot: screenshotArg, timeout_ms: timeoutArg },
     withTab(manager, (tab, args) => act(tab, args, async () => {
       const files = uploadPaths(args.paths);

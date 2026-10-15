@@ -1,18 +1,33 @@
-// What an agent may open and upload from this Mac: no local file pages, and no uploads of hidden files, ~/Library or
-// system configuration, also not through a symlink.
+// What an agent may open and upload from this Mac: web pages only, and no uploads of hidden files, ~/Library or
+// system configuration (also not through a symlink), devices, pipes or sockets.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { refuseLocalFile, uploadPaths } from '../src/tools.mjs';
+import { execFileSync } from 'node:child_process';
+import { refuseNonWeb, uploadPaths } from '../src/tools.mjs';
 
 test('local file and view-source: URLs are refused however they are written; web URLs pass', () => {
   for (const url of ['file:///Users/me/.ssh/id_ed25519', 'fi\tle:///etc/passwd', 'fi\nle:///etc/passwd', '\u0001file:///etc/passwd',
     ' FILE:///etc/passwd', 'view-source:file:///etc/passwd', 'view-source:https://example.com/']) {
-    assert.throws(() => refuseLocalFile(url), /local file|view-source/, JSON.stringify(url));
+    assert.throws(() => refuseNonWeb(url), /local file|view-source/, JSON.stringify(url));
   }
-  for (const url of [undefined, 'about:blank', 'https://example.com/file:///x', 'http://localhost:3000/']) assert.equal(refuseLocalFile(url), url);
+  for (const url of [undefined, 'about:blank', 'https://example.com/file:///x', 'http://localhost:3000/']) assert.equal(refuseNonWeb(url), url);
+});
+
+test('only web pages open: extension, browser and app URLs are refused however they are written', () => {
+  for (const url of ['chrome-extension://lpfcnmmimgcillacmnibffooadlofjhj/popup.html', ' CHROME-EXTENSION://abc/x.html', 'chrome://settings',
+    'chr\tome://settings/passwords', 'devtools://devtools/bundled/inspector.html', 'javascript:alert(1)', 'java\nscript:alert(1)', '\u0001JavaScript:alert(1)',
+    'blob:https://example.com/0f3c', 'filesystem:https://example.com/temporary/x', 'mailto:x@example.com', 'slack://open', 'about:settings',
+    'about:blankx', 'localhost:3000', 'example.com']) {
+    assert.throws(() => refuseNonWeb(url), /can't be opened: agents open web pages only \(http:, https:, about:blank and data: URLs\)/, JSON.stringify(url));
+  }
+  assert.throws(() => refuseNonWeb('javascript:alert(1)'), /use evaluate/);
+  assert.throws(() => refuseNonWeb('example.com'), /Pass a full address/);
+  for (const url of ['https://example.com/', ' HTTP://example.com', 'about:blank#top', 'data:text/html,<p>hi</p>', 'http://192.168.1.10:8080/']) {
+    assert.equal(refuseNonWeb(url), url);
+  }
 });
 
 test('uploads refuse hidden files and folders, ~/Library and system folders, also through a symlink', (t) => {
@@ -98,4 +113,25 @@ test('a path on the Data volume counts as the same path without /System/Volumes/
   assert.throws(() => uploadPaths(['/System/Library/CoreServices/SystemVersion.plist']), /inside \/System/);
   const library = path.join(os.homedir(), 'Library');
   if (fs.existsSync(library)) assert.throws(() => uploadPaths([`/System/Volumes/Data${library}`]), /inside .*\/Library/);
+});
+
+test('uploads refuse devices, pipes and sockets, also inside a folder, and system keychains and logs', (t) => {
+  fs.mkdirSync('/tmp/fb-fix/B', { recursive: true });
+  const dir = fs.realpathSync.native(fs.mkdtempSync('/tmp/fb-fix/B/upload-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fifo = path.join(dir, 'pipe');
+  execFileSync('mkfifo', [fifo]);
+  for (const p of ['/dev/zero', '/dev/stdin', fifo]) assert.throws(() => uploadPaths([p]), /can't be uploaded: it is not a regular file or folder/, p);
+  const folder = path.join(dir, 'folder');
+  fs.mkdirSync(folder);
+  fs.writeFileSync(path.join(folder, 'notes.txt'), 'x');
+  assert.deepEqual(uploadPaths([folder]), [folder]);
+  fs.symlinkSync('/dev/zero', path.join(folder, 'zero'));
+  assert.throws(() => uploadPaths([folder]), /it holds zero, which is not a regular file or folder/);
+  fs.rmSync(path.join(folder, 'zero'));
+  fs.renameSync(fifo, path.join(folder, 'pipe'));
+  assert.throws(() => uploadPaths([folder]), /it holds pipe, which is not a regular file or folder/);
+  for (const p of ['/Library/Keychains/System.keychain', '/var/log/system.log']) {
+    if (fs.existsSync(p)) assert.throws(() => uploadPaths([p]), /inside \/(Library\/Keychains|private\/var\/log)/, p);
+  }
 });

@@ -53,8 +53,9 @@ Chunking (Chrome caps host->extension messages at 1 MB): any host->extension mes
 the extension concatenates `data` in order and parses the result as the original message. Extension->host has
 no practical limit (no chunking needed that way).
 
-Socket auth: the host keeps a random token in `~/.fowlbrowser/token` (0600, created on first run). A socket client's
-first message must be `{method:"host.auth", params:{token}}`; anything else, or a wrong token, closes the socket
+Socket auth: the host keeps a random token in `~/.fowlbrowser/token` (0600, 64 hex characters, created on first run;
+a file holding anything else is replaced at host start, in one step, and the token is read again at every auth, so two
+hosts replacing it at once still agree). A socket client's first message must be `{method:"host.auth", params:{token}}`; anything else, or a wrong token, closes the socket
 before any message reaches the extension. Only after auth does the host send `host.hello`.
 
 On connect the extension sends `{method:"extension.hello", params:{version, instanceId, userAgent, label}}` (instanceId: random
@@ -77,7 +78,7 @@ before `extension.hello` arrived gets `host.hello` once it arrives, or after 5 s
 normally see the real user agent.
 
 Host limits (one host serves every session, so no client can make it hold unbounded memory): socket frames over
-64 MB and a client's unread backlog over 64 MB drop that client; at most 256 requests per client wait for the
+64 MB (4 KB before `host.auth`; a client that hasn't authenticated in 5 s is dropped) and a client's unread backlog over 64 MB drop that client; at most 256 requests per client wait for the
 extension, and while 64 MB of output wait for the browser to read them, further requests get
 `{error:{message:"Request refused: ..."}}` (events are dropped); a request the extension hasn't answered in 120 s gets
 `{error:{message:"No reply from the extension in 120 s"}}` and its route is dropped.
@@ -96,7 +97,7 @@ writes every "Tab N" of an extension error as the agent's id ("Tab helium:N").
 | `client.hello` | `{label}` | registers label; replies `{ok:true}`; then emits to that client `chrome.tabs.onCreated [tab]` for each tab it owns (normally none) and then `extension.initialized []` |
 | `tabs.listAll` | `{}` | every tab in non-incognito normal, popup and app windows (never DevTools): `{id, windowId, windowType, index, url, title, active, pinned, audible, muted, groupTitle, owner: "you"|"other"|null, origin, handedOver, kept, parked: "takeover"|"handoff"|null}` |
 | `tabs.info` | `{tabId}` | one tab in the `tabs.listAll` shape, from `chrome.tabs.get` and `chrome.windows.get` (cost does not grow with the tab count); `null` when the tab is gone, incognito or in a window `tabs.listAll` leaves out |
-| `tabs.open` | `{url?, group?, muted?=true, forUser?}` | new tab, `active:false`, in the last focused normal window (if none: `chrome.windows.create({focused:false, url})`), muted unless `muted:false`, `autoDiscardable:false`, added to the client's tab group for `group` (default: client label); owned, origin agent. With `forUser:true` the tab is the user's from the start: not in the client's group (see "Tabs given to the user" under Tab groups), autoDiscardable left alone, kept and already handed over (the client drives it until it disconnects); it is muted right away and its owner record marked `agentMuted`, so nothing plays while the client drives it, and when control ends (release, disconnect) it is unmuted if this extension's mute is still on (`mutedInfo.reason` `extension` with our id; the user's own mute or unmute stays). Emits `chrome.tabs.onCreated [tab]` to the client, then returns the tab. A `url` that parses to `file:` or `view-source:` is refused before any tab exists (also for `chrome.tabs.create`). If any step after creating the tab fails, the tab is closed again and the error returned (no tab the client wasn't told about) |
+| `tabs.open` | `{url?, group?, muted?=true, forUser?}` | new tab, `active:false`, in the last focused normal window (if none: `chrome.windows.create({focused:false, url})`), muted unless `muted:false`, `autoDiscardable:false`, added to the client's tab group for `group` (default: client label); owned, origin agent. With `forUser:true` the tab is the user's from the start: not in the client's group (see "Tabs given to the user" under Tab groups), autoDiscardable left alone, kept and already handed over (the client drives it until it disconnects); it is muted right away and its owner record marked `agentMuted`, so nothing plays while the client drives it, and when control ends (release, disconnect) it is unmuted if this extension's mute is still on (`mutedInfo.reason` `extension` with our id; the user's own mute or unmute stays). Emits `chrome.tabs.onCreated [tab]` to the client, then returns the tab. A `url` that doesn't parse to `http:`, `https:`, `about:blank` or `data:` is refused before any tab exists ("<url> can't be opened: agents only open web pages (http and https)"; also for `chrome.tabs.create`). If any step after creating the tab fails, the tab is closed again and the error returned (no tab the client wasn't told about) |
 | `chrome.tabs.create` | `[createProperties]` | Playwright v2 path (`page.context().newPage()`): same as `tabs.open` with `url`, returns tab. Does NOT emit onCreated (the relay model attaches itself) |
 | `chrome.tabs.remove` | `[tabIds, {usersTab?}]` | closes owned tabs; a parked one only with `usersTab: true` (the user asked for it: MCP `tab_close confirm_close_users_tab`), checked in the tab's queue |
 | `tabs.claim` | `{tabId, resume?}` | owns a user tab (origin user); on a parked tab of the same client it un-parks it only with `resume: true` (see `tabs.park`), refused without. Errors: owned by another client; an incognito tab; URL scheme chrome:, chrome-extension:, devtools:, edge:, file:, view-source:, about: other than about:blank, or the Web Store. A new-tab page (chrome://newtab, chrome-search://, Helium's new tab) is first navigated to about:blank. Never activates. Emits `chrome.tabs.onCreated [tab]` to the client, returns tab |
@@ -105,14 +106,14 @@ writes every "Tab N" of an extension error as the agent's id ("Tab helium:N").
 | `tabs.openChild` | `{tabId, url}` | owner only, `tabId` must pass children on (an agent tab not handed over, or a claimed tab inside its expectChild window), http(s) `url`: `chrome.tabs.create({windowId and index right after the opener, url:"about:blank", active:false, openerTabId})`, then adopted like any child (background, muted like its opener, its group, `chrome.tabs.onCreated` with `openerTabId`); the client navigates it (the server: `Page.navigate {url}`, no referrer, once attached). For popups without an opener (Popups (session 5), tier 1). The opener's ownership (its owner record and that record's kept, handedOver, parked, origin and releasing values) is taken before anything is awaited: if, once the tab exists, someone else owns the new tab or it is being closed, the command fails and leaves the tab alone; if the client is gone or the opener's ownership changed (released, claimed by another client, kept, handed over, parked), the tab is closed and the command fails. An opener that closed still gets its child, at the end of its last window, without `openerTabId`: its record is kept 5 s (checked on lookup) for its client on the same native port, and dropped when that client disconnects or the port closes; an opener that closes after the lookup makes `tabs.create` fail on its `openerTabId`, and creation is tried once more in the same window without it if the ownership is unchanged. Until a page other than about:blank commits in the child, its `Page.downloadWillBegin` names the opener (so a target=_blank download is the opener's) and the child is closed, as Chrome closes a new tab whose first navigation became a download. Replies `{tabId}`. During the user's turn of `tabId` (see "The user's turn" below; checked first, for the owner of a tab not being released, or the closed record of an opener that closed in its user's turn) it opens the tab for the user instead, as Chrome does for their click: `chrome.tabs.create({windowId: the opener's, index right after it, url, active:true, openerTabId})`, not reserved, adopted, muted or grouped (one Chrome put into the opener's agent group is ungrouped, so nothing of the user's keeps that group alive), and replies `{tabId, user:true}` |
 | `tabs.keep` | `{tabId}` | marks a tab to stay open after the client disconnects and hands an agent tab over now (ungroup, discardable, then into the client's given-to-the-user group, see Tab groups; unmuted, except a tab this extension muted stays muted as `agentMuted` until control ends); the client keeps driving it until it disconnects |
 | `tabs.closeUnowned` | `{tabId}` | closes a tab nobody owns (the user's) without attaching the debugger (a claim would wake it). Errors: owned by another client, owned by this client (use `chrome.tabs.remove`), incognito |
-| `tabs.focus` | `{tabId}` | the only call that activates a tab and focuses its window (explicit user-visible request); ends an `agentMuted` tab's mute first (unmuted if still ours, flag cleared) |
+| `tabs.focus` | `{tabId}` | the only call that activates a tab and focuses its window (explicit user-visible request); refused for an incognito tab (any other tab: focusing hands the caller nothing, and the MCP server's `tab_focus` takes only the session's own tabs); ends an `agentMuted` tab's mute first (unmuted if still ours, flag cleared) |
 | `tabs.isShown` | `{tabId}` | owner only; `{shown, focused}`: shown is true only when the tab is the active tab of a normal, app or popup window that is not minimized (the user can see it); focused when that window also has the focus. The MCP server's agent cursor uses shown, its check of the user's input both |
 | `tabs.userInput` | `{tabId, at}` | owner only; the server saw the user's own input in the tab at `at` (ms since epoch, from the page's report): kept as the tab's latest user input (never later than now), which starts the user's turn of the tab (see "The user's turn" below); children of the tab adopted after `at` are given back to the user (late reports). Replies `{ok:true}` |
 | `tabs.park` | `{tabId, kind: "takeover"|"handoff"}` | owner only; the tab stays the client's but is the user's for now (see "Taking a tab back" below). Replies `{ok:true}` |
 | `tabs.setMuted` | `{tabId, muted}` | owner only; clears `agentMuted`, so the client's choice stays after release |
-| `chrome.debugger.attach` | `[{tabId}, "1.3"]` | refused for a parked tab unless a resume is under way (then it ends the parking, see `tabs.park`); attach (an "already attached" error counts as success), then send `Emulation.setFocusEmulationEnabled {enabled:true}` so the background tab keeps rendering (rAF, screenshots) and `Page.setWebLifecycleState {state:"active"}` (ignore errors) |
+| `chrome.debugger.attach` | `[{tabId}, "1.3"]` | refused for a parked tab unless a resume is under way (then it ends the parking, see `tabs.park`); refused for a tab showing a page no agent may drive (see `chrome.debugger.sendCommand`); attach (an "already attached" error counts as success), then read the tab's navigation history once: if any entry is this extension's own page (`chrome-extension://<id>/`, also behind `blob:`/`filesystem:`), detach and refuse ("Tab N has a FowlBrowser page in its history, which agents can't control: open its URL in a new tab instead"), as a script installed for new documents would otherwise run in that page on a `history.back()` before its commit is seen (an agent tab can't gain such an entry later: navigation is web-only and Chrome keeps web pages off this extension's pages); at a tab's first attach, a blank page this extension asked for (`tabs.open`, `tabs.openChild`, a claimed New Tab page) is replaced by a browser-initiated `Page.navigate` to about:blank (no initiator, a fresh opaque origin) before the reply, so no client command runs in an extension-initiated document (a failed navigate detaches and refuses); then send `Emulation.setFocusEmulationEnabled {enabled:true}` so the background tab keeps rendering (rAF, screenshots) and `Page.setWebLifecycleState {state:"active"}` (ignore errors) |
 | `chrome.debugger.detach` | `[{tabId}]` | |
-| `downloads.start` | `{tabId, url}` | owner only; `chrome.downloads.download({url, saveAs:false, conflictAction:"uniquify"})` with the browser's own session, into the user's Downloads folder; the download is the client's (tab `tabId`). Returns it as `downloads.list` describes it |
+| `downloads.start` | `{tabId, url}` | owner only; http(s) `url` only (a `file:` one would copy any local file into Downloads, a `chrome-extension:` one this extension's files); `chrome.downloads.download({url, saveAs:false, conflictAction:"uniquify"})` with the browser's own session, into the user's Downloads folder; the download is the client's (tab `tabId`). Returns it as `downloads.list` describes it |
 | `downloads.expect` | `{tabId, ms}` | owner only; for the next `ms` (capped at 300000; 0 ends it) a download that no tab's CDP event names goes to this client, once attribution settles, only if this tab is the one tab in the whole browser (any owner or none) whose URL (without `#...`) is the download's `referrer`. The MCP server sets it around a click that should download (a `target=_blank` download tab closes before it is attached). Replies `{ok:true}` |
 | `downloads.list` | `{}` | this client's downloads only, oldest first: `{id, tabId, url, finalUrl, filename (absolute path), state ("in_progress", "interrupted" or "complete"), error, danger, mime, bytesReceived, totalBytes, fileSize, startTime, endTime, exists}`. Downloads are never opened, deleted or canceled; records end when the client disconnects (the files stay) |
 | `browserData.query` | `{kind: "history", "bookmarks", "recently_closed" or "top_sites", query?, maxResults?=25 (max 200), sinceHours?=168}` | read only, any client. history: `{title, url, lastVisit, visitCount}` (`chrome.history.search`, `query` matches title and URL); bookmarks: `{title, url, dateAdded, folder:"Bookmarks bar / Work"}` newest first; recently_closed: `{title, url, closed (ms), inWindow}`; top_sites: `{title, url}`. `query` filters by a case-insensitive substring of title or URL |
@@ -120,7 +121,7 @@ writes every "Tab N" of an extension error as the agent's id ("Tab helium:N").
 | `extension.reloadIfIdle` | `{}` | in one step: if any tab is owned or a tab creation or claim is under way, replies `{reloaded:false, ownedTabs, inFlight}`; else replies `{reloaded:true}`, refuses every later request ("The extension is reloading") and reloads. `tools/fb.mjs reload-if-idle` (run by install.sh) uses it |
 | `extension.info` | `{}` | `{version, instanceId, ownedTabs:<count per client>}` |
 | `tabs.watchActivity` | `{}` | any client (rounds monitors); replies `{ok:true}`, then emits to it, until it disconnects, `tabs.activity {kind: "activated" (tabs.onActivated), "created" (tabs.onCreated), "windowCreated" (windows.onCreated) or "windowFocus" (windows.onFocusChanged; windowId -1 when the browser lost focus), tabId (null for window events), windowId, active, windowType, at}` for every tab and window in the browser, in arrival order (`at`: when the event arrived) |
-| `chrome.debugger.sendCommand` | `[{tabId, sessionId?}, method, params?]` | pass-through; owner only; 30 s timeout -> error (do not detach on timeout), except commands that wait on the page itself (`Runtime.evaluate` and `Runtime.callFunctionOn` with `awaitPromise`, `Page.navigate`): their callers' own timeouts govern (evaluate's `timeout_ms`, a navigation's), up to the host's 120 s, and the MCP server's host client waits 135 s for a `chrome.debugger.sendCommand` reply (40 s for every other request). Playwright reads any error of an evaluation as "Execution context was destroyed, most likely because of a navigation", so a 30 s cut read as a navigation that never happened. Notes the send time of every `Input.*` method as the tab's latest agent input (see "The user's turn"). A client drives its tab and that tab's child targets, never the browser, other tabs, the user's focus or the whole profile, so these are refused for every client ("<method> is blocked: ..."): the `Browser` domain; `Page.bringToFront`; every `Target` method except `setAutoAttach`, `getTargetInfo`, `detachFromTarget`, and `attachToTarget`/`sendMessageToTarget` whose `targetId`/`sessionId` is one of the tab's own children (seen in its `Target.attachedToTarget` events); `Network.clearBrowserCookies/clearBrowserCache/setCookie/setCookies/deleteCookies/getCookies/getAllCookies` (no cookie reads: any same-user process holding the token could dump every site's cookies); in `Storage` everything but `getUsageAndQuota` (Lighthouse's quota read), `enable` and `disable` (no profile-wide storage metadata: trust tokens, other origins' databases); in `ServiceWorker` everything but reads (`get*`, `request*`), `track*`/`untrack*`, `enable` and `disable`; in `DOMStorage`, `IndexedDB` and `CacheStorage` everything but `enable` and `disable` (no other site's stored data); `Page.navigate` to a URL that parses (as Chrome parses it) to `file:` or `view-source:` |
+| `chrome.debugger.sendCommand` | `[{tabId, sessionId?}, method, params?]` | pass-through; owner only; 30 s timeout -> error (do not detach on timeout), except commands that wait on the page itself (`Runtime.evaluate` and `Runtime.callFunctionOn` with `awaitPromise`, `Page.navigate`): their callers' own timeouts govern (evaluate's `timeout_ms`, a navigation's), up to the host's 120 s, and the MCP server's host client waits 135 s for a `chrome.debugger.sendCommand` reply (40 s for every other request). Playwright reads any error of an evaluation as "Execution context was destroyed, most likely because of a navigation", so a 30 s cut read as a navigation that never happened. Notes the send time of every `Input.*` method as the tab's latest agent input (see "The user's turn"). A client drives its tab and that tab's child targets, never the browser, other tabs, the user's focus or the whole profile: CDP is an allowlist (`ALLOWED_CDP` in core.js), derived from what Playwright 1.64's page sessions, the MCP server and Lighthouse send. Whole domains: Accessibility, Audits, CSS, Debugger, DOM, DOMDebugger, Emulation, Fetch, Input, Inspector, Log, Performance, Profiler, Runtime; plus the listed methods of HeapProfiler, IO, Network, Page, Storage (`getUsageAndQuota`, Lighthouse's quota read), Target (`setAutoAttach`, `getTargetInfo`, `detachFromTarget`, and `attachToTarget` flattened for one of the tab's own children, seen in its `Target.attachedToTarget` events; no `sendMessageToTarget`), Tracing and WebMCP. Everything else is refused for every client ("<method> is blocked: ..."), including `Browser.*`, `Page.bringToFront`, `Page.setDownloadBehavior`, `Security.*`, `Extensions.*`, `PWA.*`, cookie and storage-data methods (any same-user process holding the token could otherwise dump every site's cookies) and any domain Chrome adds later. `Page.navigate` and `Page.navigateToHistoryEntry` (whose entry URL is looked up first) only go to `http:`, `https:`, `about:blank` or `data:` (parsed as Chrome parses them): Chrome lets an extension debug its own pages, with all of its powers. `Network.loadNetworkResource` only loads http(s). A tab, or a child session, whose main frame commits a browser, extension, DevTools or local page (also behind `blob:`/`filesystem:`) is detached at once (`chrome.debugger.onDetach` `target_closed`); its attach, commands and events are refused until it commits a web page, and a child target attached on such a page is detached and never reported. The same happens as a navigation starts, before the new document exists: `webNavigation.onBeforeNavigate` toward a non-web page (main frame) or this extension's own pages (any frame), or `Page.frameRequestedNavigation` (current tab) toward this extension's own pages, detaches the tab at once and refuses it like a committed one; an error for that same navigation (blocked, cancelled) gives the tab back. Forwarded events and `loadNetworkResource`'s result carry cookie names with the value `hidden` (Cookie and Set-Cookie headers, raw header text, ExtraInfo cookie lists, Fetch headers, Audits `rawCookieLine`). Two things stay open to a raw client by design, as they give a process that holds the token (one running as the user) nothing it can't read directly: `DOM.setFileInputFiles` takes any path (it is how uploads work; the MCP server checks the paths), and `Tracing` records the whole browser (the MCP server keeps only the traced tab's events) |
 
 Events to the owning client: `chrome.debugger.onEvent [source, method, params]`, `chrome.debugger.onDetach [source, reason]`,
 `chrome.tabs.onRemoved [tabId, removeInfo]` (owned tab closed by anyone; `removeInfo.replacedBy` when Chrome swapped it for
@@ -226,10 +227,23 @@ and Chrome would have shown it.
   within about 1 s ("Ref eN is from an older snapshot ..."); an iframe ref whose frame is gone fails at once ("Ref fNeM is in
   an iframe that has reloaded or gone since that snapshot ...").
   Action tools return the new URL/title, any open dialog, new tabs opened by the action, and the updated snapshot
-  (`snapshot:false` skips it). A tab whose page is a local file (its URL parses to `file:` or `view-source:`, reached by
-  history or a link between local files) is never read: its title, dialog and snapshot are left out of results, and every
-  tab tool but `navigate` with a `url`, `tab_release`, `tab_close`, `tab_keep`, `tab_mute` and `tab_focus` refuses it ("this
-  tab shows a local file, which FowlBrowser doesn't read; navigate it to a web page or close it"). Whole-page snapshots are numbered per tab ("Snapshot 7 of this tab:"). On the same
+  (`snapshot:false` skips it). `tab_open` and `navigate` load web pages only: a `url` must parse (as Chrome parses it) to
+  `http:`, `https:`, `about:blank` or `data:`; extension pages, `chrome:`/`devtools:` pages, `javascript:`, `blob:`,
+  `filesystem:`, `file:`, `view-source:` and app links (`mailto:` and the like) are refused with what to do instead (a
+  local file: read it from disk). A tab whose page isn't a web page (a local file, `view-source:`, a browser or extension
+  page, reached by history or a link between local files; Chrome's `chrome-error:` page for a web address that didn't
+  load, `about:` pages and a site's own `blob:` pages count as web pages) is never read: its title, dialog and snapshot
+  are left out of results, and every tab tool but `navigate` with a `url`, `tab_release`, `tab_close`, `tab_keep`,
+  `tab_mute` and `tab_focus` refuses it ("this tab shows a local file" or "a browser or extension page, not a web page",
+  "which FowlBrowser doesn't read; navigate it to a web page or close it"). In practice the extension lets go of a tab
+as it heads to such a page (see `chrome.debugger.sendCommand`), so the agent hears a takeover and stops; the user
+navigates it back (an agent can still release, keep or close it). The masking below protects the user's passwords on
+honest pages; a page can always show its own field's value, so a page faking its own input's type is out of scope. The value of a password input never appears
+  in tool output: snapshots (whole, `ref`, `find`), changes-only results and closed shadow root controls show
+  `"••••••••"` instead (fixed length), masked right after Playwright reads the page, before the tab's baseline is kept;
+  a field with a ref is checked through its element, one without (no pointer events, no box) by its value against the
+  password inputs of every frame, and a field that can't be checked is masked. Text mode is innerText (no input values);
+  evaluate can still read a value explicitly. Whole-page snapshots are numbered per tab ("Snapshot 7 of this tab:"). On the same
   document and URL as the tab's last whole-page snapshot, the action's snapshot is changes only ("Changes since snapshot 6
   of this tab; this is snapshot 7 ...": new/changed lines marked `+` with their parent lines, a capped Removed list; a line
   counts as unchanged only under the same parent lines, so a move is a removal plus an addition), unless that is over ~60%
@@ -288,9 +302,10 @@ and Chrome would have shown it.
   control ends. Not shown: nothing is injected. Best effort: never fails an action or delays it more than 1050 ms
   (900 ms to arrive, 150 ms to land on the target fully shown).
 - Turn end (`mcp/src/turns.mjs`, Codex's per-turn cleanup): the server listens on `~/.fowlbrowser/turns/<parent pid>.sock`
-  (its parent is the Claude Code process; the folder is the user's own 0700 one, not the shared /tmp; `<os.tmpdir()>/fowlbrowser-turn-<pid>.sock`,
-  the user's private temp folder on macOS, only if that path is too long for a socket; the hook looks in both, then in `/tmp/fowlbrowser-turn-<pid>.sock`
-  for servers started before 2026-10-13). `mcp/bin/turn-ended.mjs`, registered by install.sh in
+  (its parent is the Claude Code process; the folder is the user's own 0700 one, not the shared /tmp; `<os.tmpdir()>/fowlbrowser-turn-<pid>.sock`
+  only if that path is too long for a socket and the temp folder is the user's alone (owned by them, not group or world
+  writable; macOS gives each user one), else no socket and turn ends go unhandled; the hook looks in the same two places,
+  never in /tmp). A line over 256 bytes drops the connection. `mcp/bin/turn-ended.mjs`, registered by install.sh in
   `~/.claude/settings.json` for Stop, SubagentStart and SubagentStop, walks up to its first ancestor named `claude`, checks
   only that pid's socket (never further up), and sends `turn_ended\n`, `subagent_start\n` or `subagent_stop\n` (from the
   hook input's `hook_event_name`; an unknown or unreadable event sends nothing). While subagents run (start minus stop, never
@@ -306,7 +321,8 @@ and Chrome would have shown it.
   tabs are cleaned only when its session ends.
   Session end still cleans up everything (client disconnect). On exit the socket is removed only if it is still ours.
 - Record mode, for test runs only (`mcp/src/record.mjs`, env `FOWLBROWSER_RECORD=<dir>`): the cursor shows in every tab
-  the session controls, background tabs too, and `<dir>/journal.jsonl` gets a line per tool call, per pointer action
+  the session controls, background tabs too, and `<dir>/journal.jsonl` (the folder 0700, its files 0600: frames show the
+  user's pages) gets a line per tool call (typed text and form values redacted as in the debug log), per pointer action
   (target, the overlay's own `state()` right after arrival and landing, `late: true` when the target came after the
   budget and was shown during the action, a frame with the cursor in `<dir>/frames/`, capture capped at
   2.5 s with the state read: a browser kept busy by six agents answers in seconds, and a point without its state would
@@ -343,8 +359,9 @@ and Chrome would have shown it.
   nothing there can move that way; ref and
   direction: the ref's own box if it scrolls that way, else its nearest scrolling ancestor, by `pages` of that box's
   height (80% each, like page scrolls); with no such box, the mouse wheel over the ref; ref alone: into view), `drag {tab, from_ref, to_ref}`, `upload_files {tab, ref, paths}` (paths resolved through symlinks, `/System/Volumes/Data/<x>` counted as `/<x>`; hidden files and folders, `~/Library` other than iCloud
-  Drive and `~/Library/CloudStorage`, `/etc`, `/System` and `/private/var/db` are refused; a folder is refused if anything in it is hidden or
-  a link into those places, or it holds more than 10,000 entries),
+  Drive and `~/Library/CloudStorage`, `/etc`, `/System`, `/private/var/db`, `/Library/Keychains` and `/private/var/log` are refused, and so is
+  anything that isn't a regular file or folder (a device like `/dev/zero`, a pipe, a socket); a folder is refused if anything in it is hidden,
+  not a regular file or folder, or a link into those places, or it holds more than 10,000 entries),
   `dialog {tab, accept, text?}`, `wait_for {tab, text? | text_gone? | url? | seconds?}` (text: until a visible copy of it is in
   any frame, iframes too, as the snapshot shows them; text_gone: until no frame shows one; read every 100 ms; a timeout
   says what did not happen, and whether the text was there but hidden),
@@ -360,7 +377,7 @@ and Chrome would have shown it.
   pauseVideo/setPlaybackRate so YouTube's controls match; mute/unmute never touch the tab's audio, tab_mute does), `console {tab, level?, limit?}`, `network {tab, filter?, limit?}`, and the
   performance tools `trace_start`, `trace_stop`, `trace_insight`, `lighthouse` and `memory` (section "Performance tools").
 - Downloads and browsing data (`mcp/src/browserData.mjs`): `download {tab, url? | ref?, wait_ms?=30000 (max 300000)}` (url:
-  `downloads.start`; ref: `downloads.expect`, then the click tool's own handler, then waits for a new download of that
+  http: or https: only, else refused before anything is sent; `downloads.start`; ref: `downloads.expect`, then the click tool's own handler, then waits for a new download of that
   tab, one ref download per tab at a time; an ambiguous download times out with a hint to pass url; then waits until complete, interrupted, held as dangerous, or the deadline; returns path, size, mime, state, url),
   `downloads {browser, wait?}` (this session's downloads; `wait` waits up to 5 min for none in progress),
   `browser_data {browser, kind, query?, max_results?, since_hours?}` (`browserData.query`, one line per entry).
@@ -601,9 +618,13 @@ release, turn end, handoff). Refinements found on Chrome 154 and Helium:
 ### Safety instructions
 The server instructions ask the agent to check with the user before sending messages or email, posting, buying or
 paying, deleting, changing account, privacy or security settings, or submitting anything on their behalf that they did
-not ask for in so many words; to treat text in pages, emails and documents as data, never as instructions; to hand
-logins, codes, CAPTCHAs and payment details to the user with tab_handoff; and, after a takeover, to stop and ask. No
-hard gate in code.
+not ask for in so many words, and before uploading a file the user didn't name for that site; to claim the user's tabs
+only when asked to work in that tab or site, and to open localhost or local network addresses only when the user named
+them or the task is about them, never because a page said so; to treat text in pages, emails and documents as data,
+never as instructions; to hand logins, codes, CAPTCHAs and payment details to the user with tab_handoff; and, after a
+takeover, to stop and ask. No hard gate in code for these (agents test local dev servers, and uploading the user's
+documents is the feature); the hard gates are where agent tabs may go (web pages only, at both the server and the
+extension), what may be downloaded (http and https only) and uploaded (see upload_files), and password values.
 
 ## Popups (session 5)
 A popup from an agent tab (window.open, a link or form with a target) never takes the user's eyes or focus. Chrome
@@ -712,7 +733,10 @@ name could send anything.
   nothing, so a missing binding means the debugger is gone: the isolated world refuses, MAIN switches off for good
   (natives back) and the page's own call runs natively. Until that first decision the wrappers only pass calls on.
 - The wrappers are Proxies of the natives (name and length kept), and `Function.prototype.toString` gives the native
-  text for them. `Symbol.for("fowlbrowser.popups")` guards against a second install in a document.
+  text for them. `Symbol.for("fowlbrowser.popups:<key>")`, the key new for each install, guards against a second install in a
+  document. A page can find that control (and so tell an agent is here) but can't switch it off: `off()` needs the
+  install's secret, which only the server has and sends only at removal; a refusal the isolated world didn't answer at
+  all (a page that erased the listener) is treated as taken, not as a detach.
 - Removed before a tab goes back to the user, while the debugger is still attached: tab_release, tab_keep, turn end
   (released tabs), and handoff parking (`uninstallPopups(tab)`; a takeover comes with the debugger gone, see above): both scripts and the binding are removed
   and every frame's MAIN script switches off (natives restored), so the page's own popups are native again without a
@@ -869,7 +893,10 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
 - `trace_stop {tab}`: `Tracing.end` (a failed one stops the wait for `tracingComplete` at once; Chrome may still record,
   so the recording stays tracked with its slot and close listener and the error says "Chrome did not stop the recording:
   <reason>. Call trace_stop again.", unless the tab is gone), reads the gzipped
-  stream (`IO.read`, 1 MB chunks; `IO.close` whatever happens), saves it as Chrome wrote it to
+  stream (`IO.read`, 1 MB chunks; `IO.close` whatever happens), keeps only the traced tab's events (its frames, the renderer processes of its frames, and browser, GPU and other
+  processes' events that name only its frames, frame tree node, processes or URLs: Chrome traces the whole browser, so
+  other tabs' processes, URLs and navigations go; a renderer shared with a same-site tab still holds that tab's frameless
+  JS samples), saves that gzipped to
   `os.tmpdir()/fowlbrowser-traces/trace-<stamp>-<tab>.json.gz` (loads in DevTools' Performance panel), parses it with the
   trace engine (then resets the engine's module state, which otherwise keeps the raw events; the parsed data kept per tab
   is untouched) and returns the summary: the URL, the trace length and event count, the file path, CPU and network

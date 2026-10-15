@@ -11,7 +11,7 @@ import { test } from 'node:test';
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-revive-'));
 fs.writeFileSync(path.join(dir, 'token'), 'token');
 process.env.FOWLBROWSER_DIR = dir;
-const { BrowserManager } = await import('../src/browsers.mjs');
+const { BrowserManager, ownProcesses } = await import('../src/browsers.mjs');
 
 function frame(message) {
   const body = Buffer.from(JSON.stringify(message));
@@ -87,6 +87,20 @@ test('a reopen that brings no host back fails after the wait and is not repeated
   assert.ok(Date.now() - started >= 4900, `waited ${Date.now() - started} ms`);
   await assert.rejects(manager.get('chrome'), /didn't come up/);
   assert.deepEqual(mac.reopened, [CHROME], 'not reopened again');
+});
+
+test("another account's running Chrome bundle is never reopened as this user: only our own processes count", async () => {
+  const uid = process.getuid();
+  const planted = `/Users/Shared/x/Google Chrome.app`;
+  const ps = [`${uid + 1} ${planted}/Contents/MacOS/Google Chrome`, `  0 /usr/sbin/cfprefsd`, `${uid} ${HELPER}`].join('\n');
+  const theirs = fakeMac({ processes: ownProcesses(ps) });
+  const manager = new BrowserManager({ system: theirs });
+  await assert.rejects(manager.get('chrome'), /Chrome isn't running/);
+  assert.deepEqual(theirs.reopened, []);
+
+  const ours = ownProcesses(`${ps}\n${uid} ${CHROME}/Contents/MacOS/Google Chrome\n`);
+  assert.deepEqual(ours, [HELPER, `${CHROME}/Contents/MacOS/Google Chrome`]);
+  assert.deepEqual(new BrowserManager({ system: fakeMac({ processes: ours }) }).asleep().map((s) => s.bundle), [CHROME, null]);
 });
 
 test('with its own FOWLBROWSER_DIR the server looks at no real browser', async () => {

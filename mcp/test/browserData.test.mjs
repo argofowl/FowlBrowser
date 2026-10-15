@@ -71,3 +71,12 @@ test('a queued ref download whose wait ran out never clicks', async () => {
   assert.deepEqual(clicked, ['e1']);
   assert.deepEqual(list.map((d) => d.url), ['https://example.com/e1']);
 });
+
+test('download takes web URLs only: a file: URL would copy a local file into Downloads', async () => {
+  const { tools, list } = harness();
+  for (const url of ['file:///etc/hosts', 'fi\tle:///etc/hosts', ' FILE:///etc/hosts', 'chrome://settings', 'data:text/plain,x', 'blob:https://example.com/1']) {
+    await assert.rejects(tools.download({ tab: 'chrome:7', url }), /can't be downloaded: download takes http: and https: URLs only/, JSON.stringify(url));
+  }
+  assert.equal(list.length, 0);
+  assert.match((await tools.download({ tab: 'chrome:7', url: 'HTTPS://example.com/report', wait_ms: 5000 })).content[0].text, /report\.txt/);
+});

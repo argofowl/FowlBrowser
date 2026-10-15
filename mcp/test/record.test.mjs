@@ -46,7 +46,7 @@ function fakeTab({ state = { visible: true, x: 10, y: 20, opacity: 1 }, screensh
 
 test('a call line per tool call: tab, time, ok, and string args cut at 200 chars (nested too)', async () => {
   const long = 'x'.repeat(500);
-  const result = await record.recordCall('fill_form', { tab: 'chrome:1', fields: [{ ref: 'e1', value: long }], snapshot: false }, async () => 'done');
+  const result = await record.recordCall('fill_form', { tab: 'chrome:1', fields: [{ ref: long, value: 'v' }], snapshot: false }, async () => 'done');
   assert.equal(result, 'done');
   const line = lastOf('call');
   assert.equal(line.tool, 'fill_form');
@@ -54,8 +54,29 @@ test('a call line per tool call: tab, time, ok, and string args cut at 200 chars
   assert.equal(line.ok, true);
   assert.equal(line.error, undefined);
   assert.ok(Number.isFinite(line.t) && Number.isFinite(line.ms));
-  assert.equal(line.args.fields[0].value.length, 200);
+  assert.equal(line.args.fields[0].ref.length, 200);
   assert.equal(line.args.snapshot, false);
+});
+
+test('typed text and form values are redacted as in the debug log; the folder is 0700 and its files 0600', async () => {
+  await record.recordCall('type', { tab: 'chrome:1', ref: 'e2', text: 'hunter2' }, async () => 'ok');
+  assert.deepEqual(lastOf('call').args, { tab: 'chrome:1', ref: 'e2', text: '[redacted]' });
+  await record.recordCall('fill_form', { tab: 'chrome:1', fields: [{ ref: 'e3', value: 'secret@example.com' }, { ref: 'e4', value: 482916 }] }, async () => 'ok');
+  assert.deepEqual(lastOf('call').args.fields, [{ ref: 'e3', value: '[redacted]' }, { ref: 'e4', value: '[redacted]' }]);
+  const journal = fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8');
+  for (const secret of ['hunter2', 'secret@example.com', '482916']) assert.ok(!journal.includes(secret), secret);
+
+  const mode = (file) => fs.statSync(file).mode & 0o777;
+  const fresh = path.join(dir, 'fresh');
+  const existing = fs.mkdtempSync(path.join(dir, 'existing-'));
+  fs.chmodSync(existing, 0o755); // made by a harness with the usual umask
+  for (const folder of [fresh, existing]) {
+    const journal = record.openJournal(folder);
+    journal.record({ type: 'x' });
+    await journal.frame(fakeTab().tab);
+    assert.deepEqual([mode(folder), mode(path.join(folder, 'frames'))], [0o700, 0o700], folder);
+    assert.deepEqual([mode(path.join(folder, 'journal.jsonl')), mode(path.join(folder, 'frames', '0001.jpg'))], [0o600, 0o600], folder);
+  }
 });
 
 test('a failed call: an error result or a throw, the error cut at 300 chars', async () => {

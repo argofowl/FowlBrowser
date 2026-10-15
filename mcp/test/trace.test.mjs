@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import { test } from 'node:test';
 import zlib from 'node:zlib';
 import { TRACE_WAIT, tracingSlot } from '../src/perf.mjs';
-import { insightText, parseTrace, registerTrace, summaryText } from '../src/trace.mjs';
+import { insightText, parseTrace, registerTrace, summaryText, tracedTabOnly } from '../src/trace.mjs';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -104,6 +104,60 @@ test('parsing resets the engine\'s module state without touching the parsed trac
   assert.throws(() => Trace.Helpers.SyntheticEvents.SyntheticEventsManager.getActiveManager(), /without initializing/);
 });
 
+// --- The traced tab only ---
+
+const fixture = (name) => JSON.parse(zlib.gunzipSync(fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url))));
+// Another tab's renderer process, as a whole-browser trace has it.
+const otherRenderer = [
+  { ph: 'M', name: 'process_name', pid: 777, tid: 0, args: { name: 'Renderer' } },
+  { ph: 'X', cat: 'devtools.timeline', name: 'RunTask', pid: 777, tid: 1, ts: 1, dur: 60_000, args: {} },
+  { ph: 'I', cat: 'devtools.timeline', name: 'ResourceSendRequest', pid: 777, tid: 1, ts: 2, args: { data: { url: 'https://mail.example/inbox?id=7' } } },
+];
+const FOREIGN = /example\.com|example\.org|google\.com|user-lighthouse|mail\.example/;
+
+test('a trace keeps only the traced tab: other tabs\' URLs, frame tree nodes and renderer processes go', () => {
+  const json = fixture('trace-load.json.gz');
+  json.traceEvents.push(...otherRenderer);
+  assert.match(JSON.stringify(json.traceEvents), FOREIGN, 'the fixture has other tabs in it');
+  const kept = tracedTabOnly(json);
+  const text = JSON.stringify(kept.traceEvents);
+  assert.doesNotMatch(text, FOREIGN);
+  assert.ok(!kept.traceEvents.some((e) => e.pid === 777), 'another tab\'s renderer');
+  assert.ok(!kept.traceEvents.some((e) => e.args?.render_frame_host?.frame_tree_node_id === 222), 'another tab\'s frame tree node');
+  assert.match(text, /perf\.html\?t=trace-chrome/, 'the traced page stays');
+  assert.deepEqual(kept.metadata, json.metadata);
+  assert.deepEqual(tracedTabOnly({ traceEvents: otherRenderer }).traceEvents, [], 'no TracingStartedInBrowser: nothing can be told apart');
+});
+
+test('URLs without // (data:, blob:, about:, javascript:) of another tab are recognized too, by key or by scheme', () => {
+  const json = fixture('trace-load.json.gz');
+  const browser = json.traceEvents.find((e) => e.name === 'TracingStartedInBrowser').pid;
+  const at = (name, args) => ({ ph: 'I', cat: 'loading', name, pid: browser, tid: 1, ts: 1, s: 't', args });
+  json.traceEvents.push(
+    at('UkmPageLoadTimingUpdate', { ukm_page_load_timing_update: { latest_url: 'data:text/html,<p>secret-inbox</p>' } }),
+    at('SomeBrowserEvent', { data: { documentLoaderURL: 'blob:https://mail.example/1234' } }),
+    at('AnotherBrowserEvent', { data: { target: 'javascript:alert(\'secret-script\')' } }),
+    at('YetAnother', { info: { href: 'about:srcdoc#secret-anchor' } }));
+  const text = JSON.stringify(tracedTabOnly(json).traceEvents);
+  assert.doesNotMatch(text, /secret-inbox|mail\.example|secret-script|secret-anchor/);
+  assert.match(text, /about:blank/, 'the traced tab\'s own about:blank frame stays');
+});
+
+test('the traced tab\'s summary and every insight are the same before and after the filter', async () => {
+  for (const name of ['trace-load.json.gz', 'trace-click.json.gz']) {
+    const before = await parseTrace(fixture(name));
+    const after = await parseTrace(tracedTabOnly(fixture(name)));
+    const summary = (parsed) => summaryText(parsed, { file: 'f' }).replace(/[\d,]+ events/, 'events');
+    assert.equal(summary(after), summary(before), name);
+    for (const [set, { model }] of before.insights) {
+      for (const insight of Object.keys(model)) {
+        const details = (parsed) => { try { return insightText(parsed, insight, set); } catch (error) { return error.message; } };
+        assert.equal(details(after), details(before), `${name} ${set} ${insight}`);
+      }
+    }
+  }
+});
+
 // --- Recording, through a fake tab whose host answers the CDP commands ---
 
 const clickTrace = zlib.gunzipSync(fs.readFileSync(new URL('./fixtures/trace-click.json.gz', import.meta.url))).toString('utf8');
@@ -111,7 +165,8 @@ const tools = {};
 registerTrace((name, description, shape, handler) => { tools[name] = handler; }, null,
   { withTab: (handler) => handler, header: async () => 'Tab: chrome:1', text: (body) => body, tabArg: undefined });
 
-const clickTraceGz = zlib.gzipSync(clickTrace); // as Chrome streams it (streamCompression gzip)
+// As Chrome streams it (streamCompression gzip), with another tab's renderer process in it.
+const clickTraceGz = zlib.gzipSync(JSON.stringify((({ traceEvents, ...rest }) => ({ ...rest, traceEvents: [...traceEvents, ...otherRenderer] }))(JSON.parse(clickTrace))));
 const BUSY = 'Tracing has already been started (possibly in another tab).';
 Object.assign(TRACE_WAIT, { waitMs: 100, retryMs: 5 }); // a busy browser is waited for this long here
 
@@ -171,7 +226,9 @@ test('trace_start: busy at first, then free: the empty probe trace ends, the pag
   tab.trace.waitedMs = 3000;
   const out = await tools.trace_stop(tab);
   const file = /^File: (\S+)/m.exec(out)[1];
-  assert.equal(zlib.gunzipSync(fs.readFileSync(file)).toString('utf8'), clickTrace, 'saved as Chrome wrote it');
+  const saved = zlib.gunzipSync(fs.readFileSync(file)).toString('utf8');
+  assert.deepEqual(JSON.parse(saved), tracedTabOnly(JSON.parse(clickTrace)), 'saved gzipped, the traced tab only');
+  assert.doesNotMatch(saved, FOREIGN);
   fs.rmSync(file);
   assert.match(out, /^Waited 3 s for another session's trace to end before recording\.$/m);
   assert.notEqual(await slotIsFree(), null, 'slot released');

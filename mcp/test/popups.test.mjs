@@ -13,7 +13,8 @@ import { registerTools } from '../src/tools.mjs';
 
 // A window with a native-looking open/close, and an isolated world that takes every open it is handed (unless
 // `take` is false). Returns the vm context plus what reached the isolated world and the native functions.
-function page({ active = true, take = true, frames = [], origin = 'https://site.example', before = '' } = {}) {
+// `isolated` false: no isolated world answers at all (a page that erased its listener with document.open).
+function page({ active = true, take = true, isolated = true, frames = [], origin = 'https://site.example', before = '', controlKey = 'k', secret = 'secret', clickSecret = 'click' } = {}) {
   const handed = [];
   const native = [];
   const order = []; // both, in turn
@@ -28,7 +29,13 @@ function page({ active = true, take = true, frames = [], origin = 'https://site.
     },
     // What reaches the isolated world (document only); window's listeners like the DOM: the same one is added once.
     hooks: {
-      dispatch: (e) => { handed.push(JSON.parse(e.detail)); order.push(`handed ${handed.at(-1).type}`); return !(take && e.cancelable); },
+      dispatch: (e) => {
+        if (!isolated) return true;
+        if (JSON.parse(e.detail).type === 'here') return !e.cancelable; // there, so a refusal was the debugger's
+        // Like the real one, it takes only requests it knows.
+        handed.push(JSON.parse(e.detail)); order.push(`handed ${handed.at(-1).type}`);
+        return !(take && e.cancelable && ['open', 'live', 'close', 'blocked'].includes(handed.at(-1).type));
+      },
       listen: (type, fn, capture) => listeners.some((l) => l.type === type && l.fn === fn && l.capture === !!capture) || listeners.push({ type, fn, capture: !!capture }),
       unlisten: (type, fn, capture) => { const i = listeners.findIndex((l) => l.type === type && l.fn === fn && l.capture === !!capture); if (i >= 0) listeners.splice(i, 1); },
     },
@@ -64,7 +71,7 @@ function page({ active = true, take = true, frames = [], origin = 'https://site.
     globalThis.nativeOpen = open; globalThis.nativeClose = close; globalThis.realToString = Function.prototype.toString;
   `, context);
   vm.runInContext(before, context);
-  vm.runInContext(`(${pageScripts.main})('fowlbrowser-test')`, context);
+  vm.runInContext(`(${pageScripts.main})('fowlbrowser-test', ${JSON.stringify(controlKey)}, ${JSON.stringify(secret)}, ${JSON.stringify(clickSecret)})`, context);
   const run = (code) => vm.runInContext(code, context);
   // A trusted click on a link: the capture listener arms the bubble one, which decides.
   const clickLink = (attributes, init = {}) => {
@@ -209,14 +216,95 @@ test('window.close is reported once it ran; the wrappers look native and the off
   assert.equal(p.run('window.open.toString()'), p.run('realToString.call(nativeOpen)'));
   assert.equal(p.run('Function.prototype.toString.toString()'), p.run('realToString.call(realToString)'));
 
-  p.run(`(${pageScripts.main})('fowlbrowser-test')`); // a second install changes nothing
+  p.run(`(${pageScripts.main})('fowlbrowser-test', 'k', 'secret', 'click')`); // a second install changes nothing
   p.run(`window.open('x.html', '_blank', 'noopener')`);
   assert.equal(p.handed.length, 2);
 
-  p.run(`window[Symbol.for('fowlbrowser.popups')].off()`);
+  p.run(`window[Symbol.for('fowlbrowser.popups:k')].off('secret')`);
   assert.equal(p.run('window.open === nativeOpen && window.close === nativeClose && Function.prototype.toString === realToString'), true);
-  p.run(`(${pageScripts.main})('fowlbrowser-test')`); // installed again (a resumed tab): on again
+  p.run(`(${pageScripts.main})('fowlbrowser-test', 'k', 'secret', 'click')`); // installed again (a resumed tab): on again
   assert.equal(p.run('window.open === nativeOpen'), false);
+});
+
+test('the page can find the control but not switch the guards off: only the server\'s secret does', async () => {
+  const p = page(); // installed with the secret 'secret'
+  // What a page can do: find the control, read its source, and call it with whatever it has.
+  p.run(`globalThis.found = Object.getOwnPropertySymbols(window).filter((s) => s.description.startsWith('fowlbrowser.popups'));`);
+  assert.equal(p.run('found.length'), 1);
+  const source = p.run('Object.values(window[found[0]]).map((fn) => Function.prototype.toString.call(fn)).join()');
+  assert.ok(!source.includes('secret\''), 'the secret is not in its source');
+  for (const call of ['off()', 'off(undefined)', `off('k')`, 'off({ toString: () => "secret" })', 'off.call(null)']) {
+    p.run(`window[found[0]].${call}`);
+    assert.equal(p.run('window.open === nativeOpen || window.close === nativeClose || Function.prototype.toString === realToString'), false, call);
+  }
+  p.run(`window.open('next.html', '_blank', 'noopener')`);
+  assert.deepEqual([p.handed.length, p.native], [1, []], 'still guarded');
+
+  // The server's call (uninstallPopups, with this install's secret) switches everything off.
+  const { tab, commands } = fakeTab();
+  await installPopups(tab);
+  const { control, secret } = installedControl(commands);
+  const q = page({ controlKey: control.split(':')[1], secret });
+  q.run(`window[Symbol.for(${JSON.stringify(control)})].off()`);
+  assert.equal(q.run('window.open === nativeOpen'), false, 'the page\'s call did nothing');
+  commands.length = 0;
+  await uninstallPopups(tab);
+  q.run(commands.find(([m]) => m === 'evaluate')[1]);
+  assert.equal(q.run('window.open === nativeOpen && window.close === nativeClose && Function.prototype.toString === realToString'), true);
+});
+
+test('a page\'s toJSON can\'t change what MAIN tells the isolated world, so it can\'t switch the guards off', () => {
+  const p = page({ before: `globalThis.print = function print() { record('print'); };` });
+  // Every request but 'here' turned into one the isolated world refuses, while 'here' still answers: before, that
+  // switched everything off.
+  p.run(`const mangle = function () { return this.type === 'here' ? this : { type: 'nonsense' }; };
+    Object.prototype.toJSON = mangle; Array.prototype.toJSON = mangle; String.prototype.toJSON = mangle;`);
+  p.run('window.print()');
+  assert.deepEqual(p.native, [], 'print refused');
+  assert.deepEqual(p.handed.at(-1), { type: 'blocked', what: 'the print dialog' });
+  assert.equal(p.run(`window.open('next.html', '_blank', 'noopener')`), null);
+  assert.deepEqual(p.handed.at(-1), { type: 'open', url: 'https://site.example/dir/next.html' });
+  assert.equal(p.run('window.open === nativeOpen || Function.prototype.toString === realToString'), false, 'still on');
+});
+
+test('the control is frozen, and hide and show need the click secret: a page can neither swap its methods nor work the window', () => {
+  const p = page();
+  p.run(`globalThis.target = {}; globalThis.c = window[Symbol.for('fowlbrowser.popups:k')]; globalThis.methods = { ...c };`);
+  // Swapping, redefining or replacing: nothing changes.
+  p.run(`c.hide = () => true; c.show = () => {}; c.off = () => {};
+    try { Object.defineProperty(c, 'hide', { value: () => true }); } catch {}
+    window[Symbol.for('fowlbrowser.popups:k')] = { hide: () => true }; delete window[Symbol.for('fowlbrowser.popups:k')];`);
+  assert.equal(p.run(`window[Symbol.for('fowlbrowser.popups:k')] === c && Object.isFrozen(c)
+    && Object.keys(methods).every((name) => c[name] === methods[name])`), true);
+  const meta = () => p.key({ type: 'keydown', key: 'Meta' }); // true: the page gets it, nothing is hidden
+  // Without the secret: no window opens, and one the server opened stays open.
+  for (const call of [`hide(10000, target, 'p1')`, `hide('secret', 10000, target, 'p1')`, `hide(undefined, 10000, target, 'p1')`]) {
+    assert.equal(p.run(`c.${call}`), false, call);
+    assert.equal(meta(), true, call);
+  }
+  assert.equal(p.run(`c.hide('click', 10000, target, 't1')`), true, 'the server opens it');
+  for (const call of [`show('t1')`, `show()`, `show('secret', 't1')`]) p.run(`c.${call}`);
+  assert.equal(meta(), false, 'still open after the page\'s calls');
+  p.run(`c.show('click', 't1')`);
+  assert.equal(meta(), true, 'the server closes it');
+  assert.equal(p.run(`c.hide('click', 10000, target, 't1')`), false, 'and for good');
+});
+
+test('each install names its control afresh: a fake planted under an earlier name doesn\'t stop a claimed tab\'s install', async () => {
+  const { tab, commands } = fakeTab();
+  await installPopups(tab);
+  const first = installedControl(commands);
+  await uninstallPopups(tab);
+  await installPopups(tab);
+  const second = installedControl(commands);
+  assert.notEqual(first.control, second.control);
+  assert.notEqual(first.secret, second.secret);
+  // A page that saw the first name plants a do-nothing control under it before the second install runs in its document.
+  const p = page({ before: `window[Symbol.for(${JSON.stringify(first.control)})] = { on() {}, off() {} };`,
+    controlKey: second.control.split(':')[1], secret: second.secret });
+  p.run(`window.open('next.html', '_blank', 'noopener')`);
+  assert.deepEqual(p.native, [], 'the open is still taken by the guards');
+  await uninstallPopups(tab);
 });
 
 test('one open per activation, as the browser consumes it: later ones in it get null, whatever their features; an opaque origin is left to the browser', () => {
@@ -256,7 +344,7 @@ test('one open per activation, as the browser consumes it: later ones in it get 
 test('hidden-modifier window: opened by the agent click\'s own modifier keydown, for a moment; the page reads no Cmd or Ctrl on its trusted mouse events and never gets the key', async () => {
   const p = page();
   p.run(`globalThis.target = { id: 'button' }; globalThis.elsewhere = { id: 'other' };`);
-  const control = (call) => p.run(`window[Symbol.for('fowlbrowser.popups')].${call}`);
+  const control = (call) => p.run(`window[Symbol.for('fowlbrowser.popups:k')].${call}`);
   // A Cmd-click as the browser dispatches it: the window capture listeners see it first, then the page reads it.
   const dispatch = (on, { isTrusted = true, metaKey = true, type = 'mousedown' } = {}) => {
     const e = p.input(type, { metaKey, ctrlKey: metaKey, isTrusted, path: p.run(on) ? [{ id: 'child' }, p.run(on), p.context] : [] });
@@ -270,7 +358,7 @@ test('hidden-modifier window: opened by the agent click\'s own modifier keydown,
   assert.deepEqual([...read(dispatch('target'))], held, 'closed: everything as is');
   assert.equal(meta('keydown'), true);
 
-  assert.equal(control(`hide(10000, target, 't1')`), true);
+  assert.equal(control(`hide('click', 10000, target, 't1')`), true);
   // Armed while Playwright waits for the element: the user's own Cmd-click and keys still read as they are.
   assert.deepEqual([...read(dispatch('target'))], held, 'before the click starts');
   assert.equal(meta('keyup'), true);
@@ -288,13 +376,13 @@ test('hidden-modifier window: opened by the agent click\'s own modifier keydown,
   p.run(`window.open('https://idp.example/auth', 'idp', 'popup')`);
   assert.deepEqual(p.native.at(-1), ['open', 'https://idp.example/auth', 'idp', '']);
 
-  control(`show('t1')`);
+  control(`show('click', 't1')`);
   assert.deepEqual([...read(agents)], plain, 'an event the page kept reads the same after the window closed');
   assert.deepEqual([...read(dispatch('target'))], held, 'closed again');
   assert.equal(meta('keydown'), true);
 
   // The window is short: after a second nothing is hidden, and only another modifier keydown (a retried click) opens it.
-  control(`hide(10000, target, 't5')`);
+  control(`hide('click', 10000, target, 't5')`);
   p.run(`clock = Date.now()`);
   meta('keydown');
   p.run(`clock += 1001`);
@@ -303,48 +391,48 @@ test('hidden-modifier window: opened by the agent click\'s own modifier keydown,
   assert.equal(meta('keydown'), false);
   assert.deepEqual([...read(dispatch('target'))], plain);
   p.run(`clock = null`);
-  control(`show('t5')`);
+  control(`show('click', 't5')`);
 
   // Never left armed: disarmed by itself after capMs (a detach mid-click), and on the off-switch.
-  control(`hide(20, target, 't2')`);
+  control(`hide('click', 20, target, 't2')`);
   meta('keydown');
   assert.deepEqual([...read(dispatch('target'))], plain);
   await sleepMs(40);
   assert.deepEqual([...read(dispatch('target'))], held);
   assert.equal(meta('keydown'), true);
-  control(`hide(10000, target, 't3')`);
+  control(`hide('click', 10000, target, 't3')`);
   meta('keydown');
-  control('off()');
+  control(`off('secret')`);
   assert.deepEqual([...read(dispatch('target'))], held);
-  assert.equal(control(`hide(10000, target, 't4')`), false, 'off: no window');
+  assert.equal(control(`hide('click', 10000, target, 't4')`), false, 'off: no window');
   assert.equal(meta('keydown'), true);
 });
 
 test('hidden-modifier window: a probe that lands after its window was closed never opens it again', () => {
   const p = page();
   p.run(`globalThis.target = {};`);
-  const control = (call) => p.run(`window[Symbol.for('fowlbrowser.popups')].${call}`);
-  control(`show('late')`); // the click gave up on its probe and closed the window first
-  assert.equal(control(`hide(10000, target, 'late')`), false);
+  const control = (call) => p.run(`window[Symbol.for('fowlbrowser.popups:k')].${call}`);
+  control(`show('click', 'late')`); // the click gave up on its probe and closed the window first
+  assert.equal(control(`hide('click', 10000, target, 'late')`), false);
   assert.equal(p.key({ type: 'keydown', key: 'Meta' }), true, 'nothing masked');
   // A stale close leaves the current click's window open.
-  control(`hide(10000, target, 'now')`);
-  control(`show('late')`);
+  control(`hide('click', 10000, target, 'now')`);
+  control(`show('click', 'late')`);
   assert.equal(p.key({ type: 'keydown', key: 'Meta' }), false);
-  control(`show('now')`);
+  control(`show('click', 'now')`);
   assert.equal(p.key({ type: 'keydown', key: 'Meta' }), true);
 });
 
 test('hidden-modifier window: the patched getters look native and the off-switch puts the originals back', () => {
   const p = page();
-  p.run(`(${pageScripts.main})('fowlbrowser-test')`); // already installed: no second patch
+  p.run(`(${pageScripts.main})('fowlbrowser-test', 'k', 'secret', 'click')`); // already installed: no second patch
   assert.equal(p.run('mouseNow().every((fn, i) => fn !== mouseNatives[i])'), true, 'patched while on');
   assert.equal(p.run('mouseNow().every((fn, i) => fn.toString() === realToString.call(mouseNatives[i]))'), true);
   assert.equal(p.run('mouseNow().every((fn, i) => fn.name === mouseNatives[i].name && fn.length === mouseNatives[i].length)'), true);
   assert.equal(p.run('mouseNow()[0].name'), 'get metaKey');
-  p.run(`window[Symbol.for('fowlbrowser.popups')].off()`);
+  p.run(`window[Symbol.for('fowlbrowser.popups:k')].off('secret')`);
   assert.equal(p.run('mouseNow().every((fn, i) => fn === mouseNatives[i])'), true, 'originals back');
-  p.run(`(${pageScripts.main})('fowlbrowser-test')`);
+  p.run(`(${pageScripts.main})('fowlbrowser-test', 'k', 'secret', 'click')`);
   assert.equal(p.run('mouseNow().every((fn, i) => fn !== mouseNatives[i])'), true, 'on again');
 });
 
@@ -368,8 +456,8 @@ function probe(tree, { focused = null, control = { hide: () => true }, target = 
   Object.assign(el, { scrollIntoViewIfNeeded: () => { seen.scrolled = true; }, getClientRects: () => [box] });
   const hit = covered ?? nodes.at(-1);
   context.document = { activeElement: focused, elementFromPoint: (x, y) => { seen.point = [x, y]; return hit; } };
-  if (control) context[Symbol.for('fowlbrowser.popups')] = control;
-  return vm.runInContext(`(${BACKGROUND_CLICK_FN})`, context)(el, { capMs: 10000, token: 'tok' });
+  if (control) context[Symbol.for('fowlbrowser.popups:k')] = control;
+  return vm.runInContext(`(${BACKGROUND_CLICK_FN})`, context)(el, { capMs: 10000, token: 'tok', control: 'fowlbrowser.popups:k', secret: 'click' });
 }
 
 test('background click probe: plain buttons and click-handler elements qualify; links, submits, fields, labels, toggles and rows do not', () => {
@@ -419,7 +507,7 @@ test('background click probe: plain buttons and click-handler elements qualify; 
   assert.equal(probe([{ tag: 'button', type: 'button' }], { control: { hide: () => false } }), false);
   let asked;
   probe([{ tag: 'button', type: 'button' }], { control: { hide: (...args) => { asked = args; return true; } } });
-  assert.deepEqual([asked[0], asked[1].localName, asked[2]], [10000, 'button', 'tok'], 'the window is opened for this element, with its cap and token');
+  assert.deepEqual([asked[0], asked[1], asked[2].localName, asked[3]], ['click', 10000, 'button', 'tok'], 'the window is opened for this element, with the secret, its cap and token');
 });
 
 test('background click probe: judged on the element the click really hits, which must be the target or inside it', () => {
@@ -449,12 +537,13 @@ test('background click: only in tabs with the scripts; the modifier is lifted an
   assert.equal(await backgroundClick(tab, loc(() => true), 15000, click), 'clicked');
   assert.deepEqual([asked, clicks], [[], [undefined]], 'no scripts: no probe, no modifier');
   await installPopups(tab);
+  const { control, clickSecret } = installedControl(commands);
   commands.length = 0;
 
   assert.equal(await backgroundClick(tab, loc(() => true), 15000, click), 'clicked');
   const { token } = asked.at(-1);
-  assert.deepEqual([asked.at(-1).capMs, clicks.at(-1), keys], [15000, ['ControlOrMeta'], ['ControlOrMeta']]);
-  assert.deepEqual(shown(), [`window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(token)})`]);
+  assert.deepEqual([asked.at(-1).capMs, asked.at(-1).control, clicks.at(-1), keys], [15000, control, ['ControlOrMeta'], ['ControlOrMeta']]);
+  assert.deepEqual(shown(), [`window[Symbol.for(${JSON.stringify(control)})]?.show(${JSON.stringify(clickSecret)}, ${JSON.stringify(token)})`]);
 
   // A probe that timed out (the page may have armed it): closed for good before the plain click, which has no modifier.
   commands.length = 0;
@@ -462,7 +551,7 @@ test('background click: only in tabs with the scripts; the modifier is lifted an
   let shownAtClick;
   await backgroundClick(tab, loc(() => { throw new Error('Timeout 300ms exceeded'); }), 15000, async (modifiers) => { shownAtClick = shown(); return click(modifiers); });
   assert.notEqual(asked.at(-1).token, token, 'a token per click');
-  assert.deepEqual([clicks.at(-1), keys, shownAtClick], [undefined, [], [`window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(asked.at(-1).token)})`]]);
+  assert.deepEqual([clicks.at(-1), keys, shownAtClick], [undefined, [], [`window[Symbol.for(${JSON.stringify(control)})]?.show(${JSON.stringify(clickSecret)}, ${JSON.stringify(asked.at(-1).token)})`]]);
 
   // A click that failed after the modifier went down (Playwright lifts it only on success): lifted here, then closed.
   commands.length = 0;
@@ -493,7 +582,7 @@ test('background click: only in tabs with the scripts; the modifier is lifted an
 // The isolated world with a stand-in DOM: `attached` says whether a new context of the world gets the binding (only
 // while the debugger is attached). Returns how to send it a request as MAIN would (true when taken), the clicks it
 // made on its private link, its reports, and the nodes it left in the document.
-function isolatedWorld({ attached = true, active = true, closed = false } = {}) {
+function isolatedWorld({ attached = true, active = true, closed = false, root = true } = {}) {
   const clicks = [];
   const reports = [];
   const tree = new Set();
@@ -510,7 +599,8 @@ function isolatedWorld({ attached = true, active = true, closed = false } = {}) 
     navigator: { platform: 'MacIntel', userActivation: { isActive: active } },
     document: {
       createElement: element,
-      documentElement: { append: (node) => tree.add(node) },
+      documentElement: root ? { append: (node) => tree.add(node) } : null, // root false: the page removed it
+      append: (node) => tree.add(node),
       addEventListener: (type, fn) => { listener = fn; },
     },
     __fowlbrowserPopup: (payload) => reports.push(JSON.parse(payload)),
@@ -551,6 +641,24 @@ test('isolated world: after a detach (no binding in a new context) it refuses ev
   assert.deepEqual([w.clicks, w.reports, w.tree.size], [[], [], 0]);
 });
 
+test('isolated world: it answers MAIN\'s "here" whatever the debugger, and a page that removed its root element is no detach', () => {
+  assert.equal(isolatedWorld().send({ type: 'here' }), true);
+  assert.equal(isolatedWorld({ attached: false }).send({ type: 'here' }), true, 'there, so MAIN switches off after a detach');
+  const rootless = isolatedWorld({ root: false });
+  assert.equal(rootless.send({ type: 'blocked', what: 'the print dialog' }), true, 'still refused and reported');
+  assert.deepEqual([rootless.reports, rootless.tree.size], [[{ type: 'blocked', what: 'the print dialog' }], 0]);
+  assert.equal(isolatedWorld({ root: false, attached: false }).send({ type: 'live' }), false);
+});
+
+test('a page that took the isolated world\'s listener away (document.open) gets refusals, never the native call: the guards stay on', () => {
+  const p = page({ isolated: false, before: `globalThis.print = function print() { record('print'); }; globalThis.nativePrint = print;` });
+  assert.equal(p.run(`window.open('next.html', '_blank', 'noopener')`), null);
+  assert.equal(p.clickLink({ href: 'target.html', target: '_blank' }), true, 'link default action replaced, not run');
+  assert.equal(p.run('try { print(); } catch (e) { e.name }'), undefined, 'print refused as a cancel');
+  assert.deepEqual(p.native, []);
+  assert.equal(p.run('window.open === nativeOpen || window.print === nativePrint || Function.prototype.toString === realToString'), false, 'still on');
+});
+
 test('isolated world: a close is reported only when the window really is closing', () => {
   const open = isolatedWorld();
   open.send({ type: 'close' }); // forged: the page is not closing
@@ -559,6 +667,13 @@ test('isolated world: a close is reported only when the window really is closing
   closing.send({ type: 'close' });
   assert.deepEqual(closing.reports, [{ type: 'close' }]);
 });
+
+// The control name and secret of the tab's latest install, from the MAIN script it added.
+function installedControl(commands) {
+  const source = commands.filter(([m, p]) => m === 'Page.addScriptToEvaluateOnNewDocument' && !p.worldName).at(-1)[1].source;
+  const [, key, secret, clickSecret] = source.match(/\)\("fowlbrowser-[0-9a-f]+", "([0-9a-f]+)", "([0-9a-f]+)", "([0-9a-f]+)"\)$/);
+  return { control: `fowlbrowser.popups:${key}`, secret, clickSecret };
+}
 
 function fakeTab() {
   const commands = [];
@@ -608,15 +723,17 @@ test('installed over raw CDP: the binding first (isolated world only), then both
   tab.emit('binding', '__fowlbrowserPopup', '{"type":"close"}');
   assert.ok(tab.closedByPageAt >= before);
 
+  const { control, secret } = installedControl(commands);
   commands.length = 0;
   await uninstallPopups(tab);
   await uninstallPopups(tab);
+  const off = `window[Symbol.for(${JSON.stringify(control)})]?.off(${JSON.stringify(secret)})`;
   assert.deepEqual(commands.map(([m, p]) => [m, p?.identifier ?? p?.name ?? p]).sort(), [
     ['Page.removeScriptToEvaluateOnNewDocument', '3'],
     ['Page.removeScriptToEvaluateOnNewDocument', '4'],
     ['Runtime.removeBinding', '__fowlbrowserPopup'],
-    ['evaluate', `window[Symbol.for('fowlbrowser.popups')]?.off()`],
-    ['evaluate', `window[Symbol.for('fowlbrowser.popups')]?.off()`],
+    ['evaluate', off],
+    ['evaluate', off],
   ].sort());
 });
 
