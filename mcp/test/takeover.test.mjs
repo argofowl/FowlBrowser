@@ -16,7 +16,7 @@ const clock = (at) => new Date(at).toTimeString().slice(0, 5);
 function fakePage(url = 'https://shop.example/checkout') {
   const page = Object.assign(new EventEmitter(), {
     setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => url, isClosed: () => false,
-    mainFrame: () => page, ariaSnapshot: async () => '- button "Pay now" [ref=e1]',
+    mainFrame: () => page, frames: () => [page], ariaSnapshot: async () => '- button "Pay now" [ref=e1]',
   });
   return page;
 }
@@ -224,6 +224,16 @@ test('detaches: Cancel and a browser page are takeovers; a crash and a closing t
   assert.deepEqual(parks(browser), [{ tabId: 2, kind: 'takeover' }]);
   const text = (await toolsFor(browser)('console', { tab: `${browser.key}:2` })).text;
   assert.match(text, /\(opened a browser page \(chrome:\/\/settings\/\)\)/);
+});
+
+test('a detach for a refused local file (in the page or a frame) is named as such, not as the user taking over', async () => {
+  const browser = await fakeBrowser({ ids: [1], listed: () => [{ id: 1, owner: 'you', url: 'file:///Users/me/proto.html' }] });
+  browser.host.emit('event', 'chrome.debugger.onDetach', [{ tabId: 1 }, 'target_closed', { url: 'file:///Users/me/.ssh/id.html' }]);
+  await sleep(400);
+  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }]);
+  const text = (await toolsFor(browser)('console', { tab: `${browser.key}:1` })).text;
+  assert.match(text, /FowlBrowser let go of \S+:1 at \d\d:\d\d \(it showed a local file agents can't open: (it is hidden|there is no such file)/);
+  assert.ok(!text.includes(`The user took over ${browser.key}:1 `), text);
 });
 
 // Measured on a test Mac (Chrome 155, Helium 0.19, 2026-10-14): a page navigating to zoommtg:, mailto: or a scheme no app

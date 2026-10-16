@@ -27,7 +27,7 @@ function setup() {
     return null;
   };
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => url, mainFrame: () => page, childFrames: () => [], isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => url, mainFrame: () => page, frames: () => [page], childFrames: () => [], isClosed: () => false,
     async evaluate(fn) {
       if (state.stuck) return never;
       if (state.read) return state.read; // a slow read the test settles itself

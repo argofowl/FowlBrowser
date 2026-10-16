@@ -1,6 +1,7 @@
 // install.sh then uninstall.sh in a temp HOME with spaces in its path, run from a copy of the repo that has spaces too.
 // The user's own node (a folder first on PATH) is the one baked into the launchers; FOWLBROWSER_SKIP_CLAUDE=1 keeps
-// Claude Code's settings untouched; uninstall.sh leaves HOME exactly as it found it. Needs the network (npm ci).
+// Claude Code's settings untouched; uninstall.sh leaves HOME exactly as it found it. A second round with Claude Code
+// registers the hooks and removes them again. Needs the network (npm ci).
 //   node --test test/install/
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -24,7 +25,7 @@ function tree(dir) {
   });
 }
 
-test('install.sh and uninstall.sh with spaces in every path, a fake node first on PATH and Claude Code skipped', { timeout: 600_000 }, async () => {
+test('install.sh and uninstall.sh with spaces in every path, a fake node first on PATH, Claude Code skipped, then not', { timeout: 600_000 }, async () => {
   const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fb install ')));
   const home = path.join(tmp, 'home with spaces');
   const repo = path.join(tmp, 'my code', 'FowlBrowser');
@@ -69,5 +70,19 @@ test('install.sh and uninstall.sh with spaces in every path, a fake node first o
 
   execFileSync('sh', [path.join(repo, 'uninstall.sh')], { env, encoding: 'utf8' });
   assert.deepEqual(tree(home), before);
+
+  // Again with Claude Code (a stand-in `claude` that accepts the mcp commands): the old Stop hook gets the current node,
+  // the other hooks and the shell guard are added, and uninstall.sh takes all of them out again.
+  fs.writeFileSync(path.join(fakeBin, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const withClaude = { ...env };
+  delete withClaude.FOWLBROWSER_SKIP_CLAUDE;
+  execFileSync('sh', [path.join(repo, 'install.sh'), '--lite'], { env: withClaude, encoding: 'utf8' });
+  const hooks = JSON.parse(fs.readFileSync(settings, 'utf8')).hooks;
+  const run = (script) => `'${node}' '${path.join(app, 'mcp', 'bin', script)}'`;
+  for (const event of ['Stop', 'SubagentStart', 'SubagentStop']) assert.equal(hooks[event][0].hooks[0].command, run('turn-ended.mjs'));
+  assert.deepEqual(hooks.PreToolUse, [{ matcher: 'Bash', hooks: [{ type: 'command', command: run('shell-guard.mjs'), timeout: 5 }] }]);
+  execFileSync('sh', [path.join(repo, 'uninstall.sh')], { env: withClaude, encoding: 'utf8' });
+  assert.equal(fs.readFileSync(settings, 'utf8'), '{}\n');
+  assert.ok(!fs.existsSync(app));
   fs.rmSync(tmp, { recursive: true, force: true });
 });

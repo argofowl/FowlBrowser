@@ -163,7 +163,10 @@ test('the traced tab\'s summary and every insight are the same before and after 
 const clickTrace = zlib.gunzipSync(fs.readFileSync(new URL('./fixtures/trace-click.json.gz', import.meta.url))).toString('utf8');
 const tools = {};
 registerTrace((name, description, shape, handler) => { tools[name] = handler; }, null,
-  { withTab: (handler) => handler, header: async () => 'Tab: chrome:1', text: (body) => body, tabArg: undefined });
+  { withTab: (handler) => handler, header: async () => 'Tab: chrome:1', text: (body) => body, tabArg: undefined,
+    // As tools.mjs's, over blockedPageAt alone (these tabs show a web page).
+    blockedSince: (tab, before) => tab.blockedPageAt !== before,
+    refuseBlockedPage: (tab, before) => { if (before !== undefined && tab.blockedPageAt !== before) throw new Error(`Tab ${tab.id}: discarded.`); } });
 
 // As Chrome streams it (streamCompression gzip), with another tab's renderer process in it.
 const clickTraceGz = zlib.gzipSync(JSON.stringify((({ traceEvents, ...rest }) => ({ ...rest, traceEvents: [...traceEvents, ...otherRenderer] }))(JSON.parse(clickTrace))));
@@ -299,10 +302,35 @@ test('trace_stop end to end: summary and file, and the close listener goes with 
 test('trace_stop: a recording during which the tab showed a local file is discarded, not saved', async () => {
   const tab = fakeTab();
   assert.match(await tools.trace_start(tab, { reload: false, auto_stop: false }), /Trace recording\./);
-  tab.localPageAt = Date.now(); // history back into a local file page, then away again
-  await assert.rejects(tools.trace_stop(tab), /showed a local file during the recording.*trace was discarded/);
+  tab.blockedPageAt = Date.now(); // history back into a local file page, then away again
+  await assert.rejects(tools.trace_stop(tab), /showed or loaded a local file agents can't open during the recording.*trace was discarded/);
   assert.ok(!tab.trace.startedAt && !tab.trace.last, 'nothing kept');
   assert.equal(tab.page.listenerCount('close'), 0);
+  assert.equal(await slotState(), 'free', 'slot released');
+});
+
+test('trace_start: a refused file the page loads while the recording is set up voids it, auto-stop or not', async () => {
+  for (const autoStop of [true, false]) {
+    const tab = fakeTab();
+    tab.blockedPageAt = 5;
+    const request = tab.browser.host.request;
+    tab.browser.host.request = async (method, args) => {
+      if (args?.[1] === 'Tracing.start') tab.blockedPageAt = 6; // a timer loads a refused <script> while Chrome starts
+      return request(method, args);
+    };
+    await assert.rejects(tools.trace_start(tab, { reload: false, auto_stop: autoStop, seconds: 0.01 }), /discarded/);
+    assert.deepEqual(tab.sent, ['Tracing.start', 'Tracing.end', 'IO.read', 'IO.close'], 'the recording was ended');
+    assert.ok(!tab.trace.startedAt && !tab.trace.last, 'nothing kept');
+    assert.equal(await slotState(), 'free', 'slot released');
+  }
+});
+
+test('trace_start with auto-stop: a refused file loaded during the recording discards it at the stop', async () => {
+  const tab = fakeTab();
+  tab.blockedPageAt = 5;
+  setTimeout(() => { tab.blockedPageAt = 6; }, 10);
+  await assert.rejects(tools.trace_start(tab, { reload: false, seconds: 0.05 }), /during the recording.*trace was discarded/);
+  assert.ok(!tab.trace.startedAt && !tab.trace.last, 'nothing kept');
   assert.equal(await slotState(), 'free', 'slot released');
 });
 

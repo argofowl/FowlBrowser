@@ -29,7 +29,7 @@ test('a request the old page made is the old page\'s, even when its answer comes
   const main = {};
   page.mainFrame = () => main;
   const tab = new Tab({ key: 'chrome' }, 1, page);
-  const request = (url, type) => ({ url: () => url, method: () => 'POST', resourceType: () => type, frame: () => main, failure: () => ({ errorText: 'net::ERR_ABORTED' }) });
+  const request = (url, type) => ({ url: () => url, method: () => 'POST', resourceType: () => type, frame: () => main, isNavigationRequest: () => false, failure: () => ({ errorText: 'net::ERR_ABORTED' }) });
   const beacon = request('https://a.example/log', 'fetch');
   const upload = request('https://a.example/upload', 'xhr');
   page.emit('request', beacon);

@@ -30,7 +30,7 @@ function setup({ origin = 'agent', kept = false, zoom } = {}) {
   const sent = [];
   const failing = new Set();
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'http://127.0.0.1:5411/mobile.html',
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'http://127.0.0.1:5411/mobile.html', frames: () => [page],
     evaluate: async () => ({ w: 390, h: 844, dpr: 3 }),
   });
   let owned = true;

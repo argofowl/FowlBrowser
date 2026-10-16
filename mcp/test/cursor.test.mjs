@@ -282,7 +282,7 @@ async function withTools(shape, methods) {
   const { Tab } = await import('../src/browsers.mjs');
   const { registerTools } = await import('../src/tools.mjs');
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://mail.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://mail.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     ...methods,
   });
   const host = {

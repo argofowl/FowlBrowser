@@ -8,7 +8,7 @@ import { registerTools } from '../src/tools.mjs';
 
 test('evaluate that runs past its timeout says the function may still be running and how to give it longer', async () => {
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     evaluate: () => new Promise(() => {}), // a loop with awaits that has not finished
     on: EventEmitter.prototype.on, off: EventEmitter.prototype.off,
   });

@@ -84,7 +84,8 @@ sh install.sh
 1. Open `chrome://extensions` and turn on **Developer mode** (top right).
 2. Click **Load unpacked** and pick `~/Library/Application Support/FowlBrowser/extension` (in the file picker, press
    Cmd-Shift-G and paste the path).
-3. Open the extension's **Details** and turn on **Allow access to file URLs**, so agents can upload files for you.
+3. Open the extension's **Details** and turn on **Allow access to file URLs**, so agents can upload files for you and
+   open local pages (like a prototype they made for you).
 
 **3. Start a new agent session** and ask away.
 
@@ -128,8 +129,11 @@ Name your browsers (Work, Personal) by clicking the FowlBrowser icon in the tool
 - **No open debugging port.** Chrome never opens its remote-debugging port. Agents go through the extension, one tab
   at a time, over a local channel only your Mac user can open. Programs running as you can open it too, just as they
   can read your files, so only run agents and tools you trust.
-- **Agents only open web pages.** http and https (plus blank and `data:` pages): never local files, browser settings or
-  extension pages. Downloads come only from the web.
+- **Agents only open web pages and your ordinary files.** http and https (plus blank and `data:` pages), and local
+  files like a prototype in `~/Downloads`, but never the files uploads refuse (below, also through a link), folders,
+  browser settings or extension pages. Pages you downloaded from the web aren't opened as files (open them from their
+  site), and a page that loads or frames a refused file isn't read at all. Uploads could already send the files agents
+  may view to a page, so viewing them adds no new way out. Downloads come only from the web.
 - **Agents only touch their own tabs.** The tabs they opened and the ones they borrowed from you. They never close your
   tabs unless you asked, incognito windows are left alone, and commands that would reach other tabs, your window focus
   or your whole profile's cookies and storage are blocked. The browser's cookie headers reach agents with their values
@@ -151,6 +155,9 @@ Name your browsers (Work, Personal) by clicking the FowlBrowser icon in the tool
   another app. Everything else stays in the background.
 - With Claude Code, an agent's work tabs close when it finishes its reply. With other agents they close when the
   session ends.
+- With Claude Code, a hook stops agents opening pages in your browser from the shell (`open -a "Google Chrome" page.html`
+  and the like) so every page they show you goes through FowlBrowser. `sh uninstall.sh` or
+  `FOWLBROWSER_SKIP_CLAUDE=1 sh install.sh` leaves it out.
 - While an agent works, Chrome shows a "started debugging this browser" bar. To hide it, quit Chrome and start it with
   `open -a "Google Chrome" --args --silent-debugger-extension-api`. That hides it for every extension that uses the
   debugger, not only FowlBrowser.

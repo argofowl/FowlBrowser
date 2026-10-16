@@ -12,7 +12,7 @@ function setup(height) {
   const main = { x: 10, y: 300, w: 1180, h: height - 500 };
   const element = (scrollHeight) => ({ scrollWidth: 1200, scrollHeight, offsetWidth: 1200, offsetHeight: scrollHeight, clientWidth: 1200, clientHeight: 800 });
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://news.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://news.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     async evaluate(fn) {
       globalThis.document = { body: element(height), documentElement: element(height) };
       try { return fn(); } finally { delete globalThis.document; }

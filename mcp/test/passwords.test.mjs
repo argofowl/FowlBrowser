@@ -31,7 +31,7 @@ function setup({ scanFails = false } = {}) {
       ...Array.from({ length: 30 }, (_, i) => `- link "Help topic ${i}" [ref=e${i + 10}]`)].join('\n'), // a page big enough for a changes-only result
     getByRef: (ref) => ({ evaluate: async (fn) => fn(elements[ref]) }),
     locator: () => { throw new Error('no main-frame prefix here'); },
-    frames: () => [{ evaluate: async (fn) => {
+    frames: () => [{ url: () => 'https://example.com/login', evaluate: async (fn) => {
       if (!String(fn).includes('password')) return true;
       if (scanFails) throw new Error('Execution context was destroyed'); // a frame that didn't answer
       return filled ? [SECRET, ' alpha \t beta '] : [];

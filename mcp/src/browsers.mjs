@@ -11,8 +11,8 @@ import { debug } from './debug.mjs';
 import { HostClient, listSockets, SOCKET_DIR } from './hostClient.mjs';
 import { installPopups } from './popups.mjs';
 import { downloadDone, record } from './record.mjs';
-import { currentCall, heldBack, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
-import { isLocalUrl, sleep, tabInfo, within } from './util.mjs';
+import { currentCall, heldBack, notice, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
+import { isBlockedUrl, localFileBlock, sleep, tabInfo, within } from './util.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
 import { keepViewportSize } from './viewport.mjs';
 
@@ -104,6 +104,12 @@ export class Tab extends EventEmitter {
     this.network = [];
     this.documentGeneration = 0; // bumped when the main frame commits a new document (refs from older ones are void)
     this.frameGeneration = 0; // bumped when any iframe loads a new document (its refs from before are void; snapshots.mjs numberRefs)
+    this.refusedLoad = null; // { page, why }: document `page` loaded a local file agents can't open (loaded())
+    // A local document this Tab came to after it loaded (Browser._adopt): what it loaded before is unknown, so it is
+    // treated as refusedLoad is, until a new document commits.
+    this.unwatchedPage = null;
+    // When it last showed, framed or loaded a page agents can't read (blocked()): reads compare it before and after.
+    this.blockedPageAt = 0;
     this._queue = Promise.resolve();
     this._calls = 0; // run() calls not yet settled
     this._busy = null;
@@ -130,10 +136,13 @@ export class Tab extends EventEmitter {
     });
     // Answered by the user in the browser, or by the dialog tool: actions are no longer blocked.
     page.on('dialogclosed', (dialog) => { if (this.dialog === dialog) this.dialog = null; });
-    // Nothing a local file page logs or loads is kept: it could be read back after the tab leaves it. Each entry names
-    // its page (documentGeneration), so console and network show the current page's unless asked for older ones.
-    const local = () => isLocalUrl(page.url());
-    page.on('console', (message) => local() || push(this.console, {
+    // Nothing a page agents can't read (a refused local file, view-source:) logs or loads is kept, nor what a refused
+    // local file in a frame logs, nor a request for one (an allowed page can load <script src=file:///.../.ssh/x>): it
+    // could be read back after the tab leaves it. Checked as each entry comes in. Each entry names its page
+    // (documentGeneration), so console and network show the current page's unless asked for older ones.
+    // A document that loaded a refused file (refusedLoad) logs and loads nothing kept either: its script may be that file's.
+    const local = () => isBlockedUrl(page.url()) || this.refusedLoad?.page === this.documentGeneration || this.unwatchedPage === this.documentGeneration;
+    page.on('console', (message) => local() || isBlockedUrl(message.location()?.url) || push(this.console, {
       time: Date.now(), page: this.documentGeneration, level: message.type(), text: message.text(), url: message.location()?.url,
     }));
     page.on('pageerror', (error) => local() || push(this.console, { time: Date.now(), page: this.documentGeneration, level: 'error', text: `Uncaught ${error.message}` }));
@@ -142,17 +151,19 @@ export class Tab extends EventEmitter {
     const pageOf = (request) => madeBy.get(request) ?? this.documentGeneration;
     page.on('response', (response) => {
       const request = response.request();
-      if (local() || isLocalUrl(request.url())) return;
+      if (local() || isBlockedUrl(request.url())) return;
       push(this.network, { time: Date.now(), page: pageOf(request), method: request.method(), url: request.url(), status: response.status(), type: request.resourceType(),
         main: request.frame() === page.mainFrame() });
     });
-    page.on('requestfailed', (request) => local() || isLocalUrl(request.url()) || push(this.network, {
+    page.on('requestfailed', (request) => local() || isBlockedUrl(request.url()) || push(this.network, {
       time: Date.now(), page: pageOf(request), method: request.method(), url: request.url(), status: 'failed', type: request.resourceType(), failure: request.failure()?.errorText,
     }));
     const RENDERING = new Set(['document', 'script', 'stylesheet', 'fetch', 'xhr']);
     const ended = (request) => { if (this.inflight.delete(request)) this.requestAt = Date.now(); };
     page.on('request', (request) => {
       madeBy.set(request, this.documentGeneration);
+      // A page's own navigation to a refused file is its new document's (blocked by its URL once it commits).
+      if (!(request.isNavigationRequest() && request.frame() === page.mainFrame())) this.loaded(request.url(), request.resourceType() === 'document');
       if (!RENDERING.has(request.resourceType())) return;
       this.inflight.add(request);
       this.requestAt = Date.now();
@@ -225,9 +236,10 @@ export class Tab extends EventEmitter {
   }
 
   // A new document in the main frame (not same-document history): any dialog of the old one is gone, and so is a stuck script.
-  // url: the new document's, when known; a local file one is noted (localPageAt) so no result read meanwhile is kept.
+  // url: the new document's, when known; a blocked one (a refused local file) is noted (blockedPageAt) so no result
+  // read meanwhile is kept.
   _newDocument(url) {
-    if (isLocalUrl(url)) this.localPageAt = Date.now();
+    if (isBlockedUrl(url)) this.blocked();
     this.documentGeneration++;
     this.dialog = null;
     this.stuckAt = null;
@@ -236,6 +248,26 @@ export class Tab extends EventEmitter {
     if (own && own.url === url && own.page === this.documentGeneration - 1) own.page = this.documentGeneration;
     // The old document's requests are gone with it (the new one's own request has its response by now).
     for (const request of this.inflight) if (request.resourceType() !== 'document' || request.frame() !== this.page.mainFrame()) this.inflight.delete(request);
+  }
+
+  // The current document loaded url (an <img>, <script>, stylesheet, font, fetch or iframe): when it is a local file agents
+  // can't open, the file's content may now be in the page (drawn, run, framed) whatever the page's own URL, so nothing of
+  // this document is read (tools.mjs blockedTab), logged or kept, and reads running now are discarded (blockedPageAt).
+  // Chrome reports file: subresources to the Network domain as any other (Playwright's request event).
+  // document: url is a frame's document (a downloaded page is refused there too: localFileBlock), else a subresource.
+  loaded(url, document = true) {
+    const why = localFileBlock(url, undefined, { document });
+    if (!why) return;
+    this.blocked();
+    if (this.refusedLoad?.page === this.documentGeneration) return;
+    this.refusedLoad = { page: this.documentGeneration, why };
+    this.console = this.console.filter((e) => e.page !== this.documentGeneration);
+    this.network = this.network.filter((e) => e.page !== this.documentGeneration);
+  }
+
+  // Moves on every time, even twice within a millisecond, so a read that saw one value knows nothing came meanwhile.
+  blocked() {
+    this.blockedPageAt = Math.max(Date.now(), this.blockedPageAt + 1);
   }
 
   // An action returned early (a dialog opened) but is still running: once the dialog is resolved it goes on,
@@ -319,8 +351,10 @@ export class Browser {
   _onDebuggerEvent([source, method, params] = []) {
     const tab = this.tabs.get(source?.tabId) ?? this._settingUp.get(source?.tabId);
     if (!tab) return;
-    if (method === 'Page.frameNavigated' && (source.sessionId || params?.frame?.parentId)) tab.frameGeneration++;
-    else if (source.sessionId) return;
+    if (method === 'Page.frameNavigated' && (source.sessionId || params?.frame?.parentId)) {
+      tab.frameGeneration++;
+      tab.loaded(params?.frame?.url); // an allowed local file framing a refused one
+    } else if (source.sessionId) return;
     else if (method === 'Page.frameNavigated') {
       tab._newDocument(params?.frame?.url);
       prepareCursor(tab);
@@ -381,6 +415,9 @@ export class Browser {
       const { tabId } = await session.send('FowlBrowser.getTabId');
       session.detach().catch(() => {});
       tab = new Tab(this, tabId, page);
+      // A page already loaded (a claim, a reattach, a server restart): a local one may have loaded a refused file (an
+      // <img>, a <script>) before this Tab watched it, and nothing tells which. A tab_open tab starts at about:blank.
+      if (/^file:/i.test(page.url())) tab.unwatchedPage = tab.documentGeneration;
       this._settingUp.set(tabId, tab); // its page's new documents count while it is set up (_onDebuggerEvent)
       // keep and release wait for this (adopting) to take out the popup scripts it installs; it sees one that came first.
       let adopted;
@@ -422,6 +459,9 @@ export class Browser {
       timer = setTimeout(() => {
         this._waiters.get(tabId)?.delete(resolve);
         if (!this._waiters.get(tabId)?.size) this._waiters.delete(tabId);
+        // Let go meanwhile (the user took over, or it showed a local file agents can't open before it was ever attached): say so.
+        const parkedNotice = notice(`${this.key}:${tabId}`);
+        if (parkedNotice) return reject(new Error(parkedNotice));
         const detached = this.relay.model.hasTab(tabId) && !this.relay.model.isAttached(tabId);
         reject(new Error(`Tab ${this.key}:${tabId} did not become controllable within ${timeout / 1000} s.` + (detached
           ? ' Its debugger is detached (the user canceled debugging or opened DevTools on it); it is still yours. Call tab_claim on it to re-attach (DevTools must be closed).'

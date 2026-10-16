@@ -77,8 +77,8 @@ export default {
     const unknown = await callError('click', { tab, ref: 'e99999', timeout_ms: 2000, snapshot: false });
     t.ok(unknown.includes('Ref e99999 is from an older snapshot'), `errors name the ref the agent passed: ${unknown}`);
 
-    t.step('local files');
+    t.step('local files in system folders');
     const local = await callError('navigate', { tab, url: 'file:///etc/hosts' });
-    t.ok(local.includes("local files can't be opened in the browser"), `file:// refused: ${local}`);
+    t.ok(/is a local file that can't be opened: it is inside \/private\/etc/.test(local), `file:// in /etc refused: ${local}`);
   },
 };

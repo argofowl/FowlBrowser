@@ -2,9 +2,10 @@
 import assert from 'node:assert/strict';
 import EventEmitter from 'node:events';
 import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
 import zlib from 'node:zlib';
-import { formatResult, restore, rootSession } from '../src/lighthouse.mjs';
+import { auditor, formatResult, restore, rootSession } from '../src/lighthouse.mjs';
 import { TRACE_WAIT } from '../src/perf.mjs';
 import { tracedTabOnly } from '../src/trace.mjs';
 
@@ -397,7 +398,7 @@ test('lighthouse with a page dialog open says so at once instead of auditing a p
   const { Tab } = await import('../src/browsers.mjs');
   const { registerTools } = await import('../src/tools.mjs');
   const page = Object.assign(new Emitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
   });
   const sent = [];
   const host = {
@@ -422,4 +423,53 @@ test('lighthouse with a page dialog open says so at once instead of auditing a p
     assert.match(result.content[0].text, /A dialog is open on this tab; resolve it with the dialog tool first\./, mode);
   }
   assert.deepEqual(sent, []);
+});
+
+test('an audit during which the page loaded a refused local file is discarded: no report is made or written', async () => {
+  const { Tab } = await import('../src/browsers.mjs');
+  const { registerTools } = await import('../src/tools.mjs');
+  const page = Object.assign(new EventEmitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
+  });
+  const host = Object.assign(new EventEmitter(), {
+    async request(method, params) {
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'App', url: 'https://app.example/' } };
+      if (method === 'tabs.info') return { id: 12, owner: 'you', origin: 'agent' };
+      return {};
+    },
+  });
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  const tab = new Tab(browser, 12, page);
+  browser.tabs.set(12, tab);
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  const reports = [];
+  let during = () => {};
+  const real = auditor.load;
+  auditor.load = async () => ({
+    snapshot: async () => { during(); return { lhr: fakeLhr() }; },
+    generateReport: (lhr) => { reports.push(lhr); return '<html>'; },
+  });
+  try {
+    // A timer loads a refused <script> during gathering (it may write into nodes the report lists), or the page goes
+    // to a refused file and back.
+    for (const refused of [() => tab.loaded('file:///nowhere/private.js', false), () => { tab._newDocument('file:///nowhere/x.html'); tab._newDocument('https://app.example/'); }]) {
+      tab._newDocument('https://app.example/'); // a clean document each time
+      during = refused;
+      const result = await tools.lighthouse({ tab: tab.id, mode: 'snapshot' });
+      assert.equal(result.isError, true, result.content[0].text);
+      assert.match(result.content[0].text, /local file agents can't open|loaded a local file that agents can't open/);
+      assert.deepEqual(reports, [], 'no report generated');
+    }
+    // Without one, the same run saves its reports (the stand-in works).
+    tab._newDocument('https://app.example/');
+    during = () => {};
+    const ok = await tools.lighthouse({ tab: 'chrome:12', mode: 'snapshot' });
+    assert.equal(ok.isError, undefined, ok.content[0].text);
+    assert.equal(reports.length, 1);
+    fs.rmSync(path.dirname(/Report: (\S+)/.exec(ok.content[0].text)[1]), { recursive: true });
+  } finally {
+    auditor.load = real;
+  }
 });

@@ -73,6 +73,8 @@ chrome.tabs.onActivated.addListener(core.onTabActivated);
 chrome.windows.onCreated.addListener(core.onWindowCreated);
 chrome.windows.onFocusChanged.addListener(core.onWindowFocusChanged);
 chrome.windows.onRemoved.addListener(core.onWindowRemoved);
+chrome.tabGroups.onRemoved.addListener(core.onTabGroupRemoved);
+chrome.tabGroups.onUpdated.addListener(core.onTabGroupUpdated);
 chrome.downloads.onCreated.addListener(core.onDownloadCreated);
 chrome.downloads.onChanged.addListener(core.onDownloadChanged);
 

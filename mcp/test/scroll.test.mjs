@@ -30,7 +30,7 @@ function setup({ pageHeight, hit }) {
   const target = hit?.(body);
   const scroller = (n) => { for (; n && n !== body; n = n.parentElement) if (n.style.overflowY === 'auto') return n; return null; };
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     evaluate: async (fn, arg) => run(fn, arg),
     evaluateHandle: async (fn, arg) => {
       const value = run(fn, arg);

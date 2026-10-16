@@ -22,7 +22,7 @@ function setup(document, frames = []) {
   }));
   const page = Object.assign(new EventEmitter(), {
     setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://shop.example/', isClosed: () => false,
-    mainFrame: () => ({ childFrames: () => children }),
+    mainFrame: () => ({ childFrames: () => children }), frames: () => [page, ...children],
     async evaluate(fn, arg) {
       globalThis.document = document;
       try { return fn(arg); } finally { delete globalThis.document; }
@@ -97,7 +97,7 @@ test('snapshot mode "links" leaves out in-page anchors, "#" (the usual script-dr
     link('?page=2', 'Next page'), link('/item/1', 'Blue mug (again)')] };
   const document = { querySelector: () => null, body, documentElement: body };
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => base, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => base, frames: () => [page], isClosed: () => false,
     async evaluate(fn, arg) {
       Object.assign(globalThis, { document, location: { href: base } });
       try { return fn(arg); } finally { delete globalThis.document; delete globalThis.location; }

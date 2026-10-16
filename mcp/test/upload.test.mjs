@@ -18,7 +18,7 @@ function setup({ clickMs, chooserMs = 0 }) {
   const events = []; // 'native' (the Mac's panel: no one intercepted the chooser), 'chose <names>', 'dropped'
   const chooser = { isMultiple: () => false, setFiles: async (files) => { events.push(`chose ${files.map((f) => path.basename(f)).join(',')}`); } };
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://cms.example/media', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://cms.example/media', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     ariaSnapshot: async () => '- button "Upload image" [ref=e1]',
     waitForTimeout: sleep,
     // An evaluate right after an action: the page still has that action's user activation, so a script click on a file input opens its chooser.

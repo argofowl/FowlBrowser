@@ -13,7 +13,7 @@ const refsOf = (yaml) => new Set([...yaml.matchAll(/\[ref=(e\d+)\]/g)].map((m) =
 function setup() {
   let table = new Set(); // the refs aria-ref resolves: those of the last snapshot taken
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://shop.example/item', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://shop.example/item', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     async ariaSnapshot() { table = refsOf(PAGE); return PAGE; },
     getByRef: (ref) => ({
       count: async () => (table.has(ref) ? 1 : 0),

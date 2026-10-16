@@ -198,7 +198,7 @@ test('NATIVE_UI_FN: a colour input or dropdown is refused while disabled too (th
 test('a click on a page whose script hangs fails within its timeout, saying the page does not answer', async () => {
   let hung = false; // the page's main thread stuck in a script: nothing evaluated in it answers
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     ariaSnapshot: async () => '- button "Save" [ref=e1]',
     getByRef: () => ({ count: () => (hung ? new Promise(() => {}) : Promise.resolve(1)) }),
   });
@@ -229,7 +229,7 @@ test('a dropdown inside a closed shadow root (an s ref) is refused like any othe
   const clicks = [];
   const keys = [];
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://travel.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://travel.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     ariaSnapshot: async () => '- heading "Book" [level=1] [ref=e1]',
     mouse: { click: async (x, y) => { clicks.push([x, y]); } },
     keyboard: { press: async (key) => { keys.push(key); } },
@@ -288,7 +288,7 @@ test('a click x,y on a dropdown in an iframe shown scaled (a zoomed preview) is 
     evaluateHandle: async () => ({ asElement: () => ({ contentFrame: async () => child }), dispose: async () => {} }),
   };
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://storybook.example/', mainFrame: () => main, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://storybook.example/', mainFrame: () => main, frames: () => [page], isClosed: () => false,
     mouse: { click: async (x, y) => { clicks.push([x, y]); } },
   });
   const host = {
@@ -313,7 +313,7 @@ test('a click x,y on a dropdown in an iframe shown scaled (a zoomed preview) is 
 test('a click on a dropdown while the page stalls past a second is still refused: the check waits as the click would', async () => {
   const clicks = [];
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://plans.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://plans.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     ariaSnapshot: async () => '- combobox "Plan" [ref=e1]',
     getByRef: () => ({
       count: async () => 1,

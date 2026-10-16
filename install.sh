@@ -36,7 +36,7 @@ HOST_OUT=$(sh "$APP/host/install.sh") # a failed registration stops the install 
 REGISTERED=$(printf '%s\n' "$HOST_OUT" | grep '^registered ' || true)
 echo "${REGISTERED:-No supported browser found (Chrome, Chromium, Helium, Brave, Edge, Arc or Vivaldi).}"
 
-# Claude Code: the MCP server in user scope (~/.claude.json) and three hooks in ~/.claude/settings.json.
+# Claude Code: the MCP server in user scope (~/.claude.json) and four hooks in ~/.claude/settings.json.
 if [ "${FOWLBROWSER_SKIP_CLAUDE:-}" = 1 ]; then
   echo "Claude Code: skipped (FOWLBROWSER_SKIP_CLAUDE=1)."
 elif ! command -v claude >/dev/null; then
@@ -46,8 +46,10 @@ else
   env -u CLAUDE_CONFIG_DIR claude mcp add --scope user fowlbrowser -- "$APP/mcp/bin/fowlbrowser-mcp" >/dev/null
   echo "Claude Code: added MCP server fowlbrowser (user scope): $APP/mcp/bin/fowlbrowser-mcp"
   # Hooks: at each turn end the session's agent tabs close and claimed and kept tabs go back to the user; while a
-  # subagent runs (SubagentStart until SubagentStop) turn ends leave everything alone.
-  node "$SRC/tools/claude-hooks.mjs" add "${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}" "$NODE" "$APP/mcp/bin/turn-ended.mjs"
+  # subagent runs (SubagentStart until SubagentStop) turn ends leave everything alone. Before each Bash command, a
+  # guard refuses opening pages in a browser from the shell (`open -a "Google Chrome" x.html`): those go through tab_open.
+  node "$SRC/tools/claude-hooks.mjs" add "${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}" "$NODE" "$APP/mcp/bin/turn-ended.mjs" "$APP/mcp/bin/shell-guard.mjs"
+  echo "Claude Code: agents can't open pages in a browser from the shell (open, osascript, a browser's binary); they use tab_open."
   echo "To opt out: sh uninstall.sh removes these, and FOWLBROWSER_SKIP_CLAUDE=1 sh install.sh skips them."
 fi
 

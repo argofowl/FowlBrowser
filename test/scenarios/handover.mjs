@@ -1,7 +1,7 @@
 // Tabs for the user: tab_open for_user is out of the work group from the start and stays after the session ends; tab_keep
 // hands a work tab over right away (out of the work group) while the session still drives it. Both stay muted while
-// driven (nothing plays aloud before the user looks) and are unmuted when control ends. A lone one is ungrouped; two or
-// more given in one turn share a group of their own.
+// driven (nothing plays aloud before the user looks) and are unmuted when control ends. A lone one is ungrouped unless
+// its group is named; two or more given in one turn share a group of their own.
 import { connect } from '../lib.mjs';
 
 export default {
@@ -15,7 +15,7 @@ export default {
     t.step('several for_user tabs share a group');
     const title = `Given ${t.tag}`;
     const first = await t.open(`${t.site}/index.html?given=1-${t.tag}`, { for_user: true, group: title, snapshot: false });
-    t.eq((await t.listMine()).find((x) => x.tab === first).group, null, 'a lone one is ungrouped');
+    t.eq((await t.listMine()).find((x) => x.tab === first).group, title, 'a lone one with a named group is grouped at once');
     const second = await t.open(`${t.site}/index.html?given=2-${t.tag}`, { for_user: true, group: title, snapshot: false });
     mine = await t.listMine();
     t.eq([first, second].map((tab) => mine.find((x) => x.tab === tab).group), [title, title], 'both in one group, titled as asked');

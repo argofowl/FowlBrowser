@@ -15,7 +15,7 @@ import { backgroundClick, openingLines, uninstallPopups } from './popups.mjs';
 import * as record from './record.mjs';
 import * as takeover from './takeover.mjs';
 import { callsByTab } from './turns.mjs';
-import { isLocalUrl, sleep, tabInfo, within } from './util.mjs';
+import { isBlockedUrl, localFileBlock, localFileRefusal, sleep, tabInfo, within } from './util.mjs';
 import { clearViewport, MAX_SIZE, MIN_SIZE, setMedia, setViewport } from './viewport.mjs';
 import { cap as capText, collapseText, findInSnapshot, functionSource, mainFramePrefixes, maskFields, newRefState, numberRefs, playwrightRef, REF_PATTERN,
   shownRef, shownValue, SNAPSHOT_MAX_CHARS, SNAPSHOT_MAX_CHARS_LIMIT, snapshotChanges, textFields, urlMatcher, yamlValue } from './snapshots.mjs';
@@ -67,40 +67,72 @@ async function resolveTab(manager, value) {
   return browser.waitForTab(tabId);
 }
 
-// Agents open web pages only: an extension's own page runs with its powers, chrome:/devtools: pages are the browser's
-// settings and tools, and app schemes (mailto:, slack:...) launch other apps. Parsed like the browser does (it drops
-// tabs, newlines and leading control characters), so "fi\tle:" is file: too.
+// Agents open web pages, and local files localFileBlock allows (a prototype the agent made, a page the user saved), only:
+// an extension's own page runs with its powers, chrome:/devtools: pages are the browser's settings and tools, and app
+// schemes (mailto:, slack:...) launch other apps. Parsed like the browser does (it drops tabs, newlines and leading
+// control characters), so "fi\tle:" is file: too.
 const isWebUrl = (parsed) => ['http:', 'https:', 'data:'].includes(parsed?.protocol) || (parsed?.protocol === 'about:' && parsed.pathname.toLowerCase() === 'blank');
-export function refuseNonWeb(url) {
+export function refuseNonWeb(url, home = os.homedir()) {
   if (!url) return url;
   const parsed = URL.parse(url);
   if (isWebUrl(parsed)) return url;
   if (parsed?.protocol === 'file:') {
-    throw new Error(`${url.trim()} is a local file: local files can't be opened in the browser. Read the file from disk instead (it is on this Mac).`);
+    const why = localFileBlock(url, home);
+    if (!why) return url;
+    throw new Error(`${url.trim()} is a local file that can't be opened: ${why}. Agents open existing local files only outside hidden folders, ` +
+      '~/Library (iCloud Drive and cloud drives are fine) and system folders, where keys, passwords and app data live.');
   }
   if (parsed?.protocol === 'view-source:') throw new Error(`${url.trim()}: view-source: pages can't be opened. Open the page itself instead.`);
-  const instead = !parsed ? 'Pass a full address, e.g. https://example.com/ or http://localhost:3000/.'
+  const instead = !parsed ? 'Pass a full address, e.g. https://example.com/, http://localhost:3000/ or file:///Users/me/Downloads/page.html.'
     : parsed.protocol === 'javascript:' ? 'To run a script in a page, use evaluate.'
       : 'The browser\'s own pages, extensions and links that open other apps are the user\'s: tell them instead.';
-  throw new Error(`${url.trim()} can't be opened: agents open web pages only (http:, https:, about:blank and data: URLs). ${instead}`);
+  throw new Error(`${url.trim()} can't be opened: agents open web pages (http:, https:, about:blank and data: URLs) and local files (file: URLs) only. ${instead}`);
 }
 
-// However a tab came to show a page that isn't a web page (history, a page's own history.back(), a link from one local
-// file to another), FowlBrowser doesn't read or act in it: it may only be navigated away, released, kept or closed.
+const LOCAL_FILES = 'Local files open too (file:///... URLs, e.g. an HTML prototype you made for the task), except hidden files and folders, ~/Library (iCloud Drive and cloud drives are fine), system folders and folders themselves. ';
+
+// However a tab came to show a page that is neither a web page nor an allowed local file (history, a page's own
+// history.back(), a link from one local file to another, a symlink), FowlBrowser doesn't read or act in it: it may only
+// be navigated away, released, kept or closed. Checked against the URL it shows at each read, not when it was opened.
 // Chrome's error page for a web address that didn't load (chrome-error:) and a site's own blob: pages are web pages too.
-const localPage = (url) => (isLocalUrl(url) ? 'this tab shows a local file' : 'this tab shows a browser or extension page, not a web page') +
-  ', which FowlBrowser doesn\'t read; navigate it to a web page or close it';
-const isLocalPage = (url) => {
+const isBlockedPage = (url) => {
   const parsed = URL.parse(url);
-  return !!parsed && !isWebUrl(parsed) && !['about:', 'chrome-error:'].includes(parsed.protocol) && !(parsed.protocol === 'blob:' && /^https?:/.test(parsed.origin));
+  return !!parsed && !isWebUrl(parsed) && !['about:', 'chrome-error:'].includes(parsed.protocol) && !(parsed.protocol === 'blob:' && /^https?:/.test(parsed.origin)) &&
+    localFileBlock(url) !== null;
 };
-function refuseLocalPage(tab) {
-  if (isLocalPage(tab.page.url())) throw new Error(`Tab ${tab.id}: ${localPage(tab.page.url())}.`);
+const unread = ', which FowlBrowser doesn\'t read; navigate it to a web page or an allowed local file, or close it';
+// Why the tab can't be read, or null: its page is blocked, it loaded a refused local file (an <img>, a <script>, a frame:
+// browsers.mjs Tab.loaded) at any time, or one of its frames shows one now. Frames are checked whatever the page's own URL:
+// an about:blank or data: document opened by a file page can frame files too.
+function blockedTab(tab) {
+  const url = tab.page.url();
+  const why = localFileBlock(url);
+  if (why) return `this tab shows a local file that agents can't open (${why})${unread}`;
+  if (isBlockedPage(url)) return `this tab shows ${isBlockedUrl(url) ? 'a view-source: page' : 'a browser or extension page, not a web page'}${unread}`;
+  if (tab.refusedLoad && tab.refusedLoad.page === tab.documentGeneration) {
+    return `this page loaded a local file that agents can't open (${tab.refusedLoad.why}), so none of it is read until the tab shows another page; ` +
+      'navigate it to a web page or an allowed local file, or close it';
+  }
+  if (tab.unwatchedPage === tab.documentGeneration) {
+    return 'this local page was loaded before FowlBrowser watched it, so it isn\'t read; navigate it to its URL again to read it';
+  }
+  for (const frame of tab.page.frames()) {
+    const refused = localFileBlock(frame.url());
+    if (refused) return `a frame in this tab shows a local file that agents can't open (${refused})${unread}`;
+  }
+  return null;
+}
+// The tab showed, framed or loaded a refused local file since its blockedPageAt read `before` (when a read began): what
+// the read took may hold it, even when that frame or page is gone again by its end.
+const blockedSince = (tab, before) => tab.blockedPageAt !== before;
+const DISCARDED = 'a local file agents can\'t open showed in this tab while it was read, which FowlBrowser doesn\'t read, so the result was discarded';
+// before: tab.blockedPageAt when a read began; also refused when one showed since (blockedSince), for a check after it.
+function refuseBlockedPage(tab, before) {
+  const why = blockedTab(tab) ?? (before !== undefined && blockedSince(tab, before) ? DISCARDED : null);
+  if (why) throw new Error(`Tab ${tab.id}: ${why}.`);
 }
 
-// Hidden files and folders (~/.ssh, ~/.aws, .env, ~/.config), ~/Library and system configuration are never uploaded,
-// also not through a symlink: paths are resolved first (natively, so "~/library" is ~/Library too). iCloud Drive and the
-// cloud drives (Dropbox, Google Drive, OneDrive) live in ~/Library too and stay allowed. A folder (a webkitdirectory
+// What localFileRefusal refuses is never uploaded, also not through a symlink: paths are resolved first. A folder (a webkitdirectory
 // input) is uploaded with everything in it, so all of that is checked too.
 // The file is read by path later (after the page checks, the click and a chooser wait), so nothing on its way may be
 // swappable by another account on this Mac: every folder from / down is the user's or root's, and one that others can
@@ -109,21 +141,9 @@ function refuseLocalPage(tab) {
 const MAX_FOLDER_ENTRIES = 10_000;
 // Finder writes these into folders it shows: view settings, no content. A folder holding them uploads as before.
 const FINDER_FILES = new Set(['.DS_Store', '.localized']);
-const DATA_VOLUME = '/System/Volumes/Data/';
 export function uploadPaths(paths, home = os.homedir(), ids = null) {
-  // The Data volume's firmlinks name the same folders: /System/Volumes/Data/Users/me/Downloads is /Users/me/Downloads.
-  const unalias = (real) => (real.startsWith(DATA_VOLUME) ? real.slice(DATA_VOLUME.length - 1) : real);
-  const library = path.join(unalias(fs.realpathSync.native(home)), 'Library');
-  const refusedDirs = [library, '/etc', '/private/etc', '/System', '/private/var/db', '/Library/Keychains', '/private/var/log'];
-  const cloudDirs = [path.join(library, 'Mobile Documents'), path.join(library, 'CloudStorage')];
-  const inside = (real, d) => real === d || real.startsWith(d + path.sep);
   // Why a resolved path can't be uploaded, or null.
-  const refusal = (real) => {
-    real = unalias(real);
-    const dir = cloudDirs.some((d) => inside(real, d)) ? null : refusedDirs.find((d) => inside(real, d));
-    return real.split(path.sep).some((part) => part.startsWith('.')) ? 'it is hidden (a file or folder name starts with ".")'
-      : dir ? `it is inside ${dir}` : null;
-  };
+  const refusal = (real) => localFileRefusal(real, home);
   const refuse = (p, real, why) => {
     throw new Error(`${p}${real === p ? '' : ` (${real})`} can't be uploaded: ${why}, where keys, passwords and app data live. ` +
       'If the user really wants it uploaded, ask them to move or copy it somewhere like ~/Downloads first.');
@@ -551,7 +571,7 @@ const CONTENT_FN = ({ maxMs, quietMs }) => new Promise((resolve) => {
   };
   setTimeout(check, 50);
 });
-const contentReady = async (tab) => (isLocalPage(tab.page.url()) ? 0 : within(tab.page.evaluate(CONTENT_FN, { maxMs: CONTENT_MS, quietMs: 300 }), CONTENT_MS + 500, 0));
+const contentReady = async (tab) => (blockedTab(tab) ? 0 : within(tab.page.evaluate(CONTENT_FN, { maxMs: CONTENT_MS, quietMs: 300 }), CONTENT_MS + 500, 0));
 
 // Settled: loaded, then no request that renders the page in flight (the tab's own count, browsers.mjs inflight) and no
 // DOM change (nodes or text) for QUIET_MS, at most `timeout`. { settled, ms, pending: [urls] }.
@@ -586,8 +606,12 @@ async function pageSettled(tab, timeout) {
 }
 
 async function header(tab) {
-  if (isLocalPage(tab.page.url())) return `Browser: ${tab.browser.name} · Tab: ${tab.id} · ${tab.page.url()}`;
-  return `Browser: ${tab.browser.name} · Tab: ${tab.id} · ${(await tab.currentTitle()) || '(no title)'} · ${tab.page.url()}`;
+  if (blockedTab(tab)) return `Browser: ${tab.browser.name} · Tab: ${tab.id} · ${tab.page.url()}`;
+  const before = tab.blockedPageAt;
+  const title = await tab.currentTitle();
+  // A refused file the page loaded while the title was asked for may have set it.
+  if (blockedTab(tab) || blockedSince(tab, before)) return `Browser: ${tab.browser.name} · Tab: ${tab.id} · ${tab.page.url()}`;
+  return `Browser: ${tab.browser.name} · Tab: ${tab.id} · ${title || '(no title)'} · ${tab.page.url()}`;
 }
 
 const cap = (body, note) => capText(body, MAX_CHARS, note);
@@ -652,7 +676,9 @@ async function snapshotText(tab, { ref, changes = false, maxChars = SNAPSHOT_MAX
     generation = tab.documentGeneration;
     frameGeneration = tab.frameGeneration;
     url = tab.page.url();
-    if (isLocalPage(url)) return `Snapshot unavailable: ${localPage(url)}.`;
+    const blocked = blockedTab(tab);
+    if (blocked) return `Snapshot unavailable: ${blocked}.`;
+    const before = tab.blockedPageAt;
     const target = ref ? locator(tab, ref) : tab.page;
     yaml = await target.ariaSnapshot({ mode: 'ai', timeout: ACTION_TIMEOUT_MS });
     // Before anything keeps or shows it, and while Playwright's ref table is this snapshot's.
@@ -661,6 +687,9 @@ async function snapshotText(tab, { ref, changes = false, maxChars = SNAPSHOT_MAX
     // again (text unused), so the refs shown before outside it keep working.
     if (ref) await tab.page.ariaSnapshot({ mode: 'ai', timeout: ACTION_TIMEOUT_MS }).catch((error) => debug('ref table restore failed', error.message));
     shadow = ref ? '' : await closedShadowSection(tab).catch((error) => { debug('closed shadow scan failed', error.message); return ''; });
+    const framed = blockedTab(tab); // a frame went to a refused local file while it was read
+    if (framed) return `Snapshot unavailable: ${framed}.`;
+    if (blockedSince(tab, before)) return `Snapshot unavailable: ${DISCARDED}. Call snapshot again.`; // one that came and went
     if (tab.documentGeneration === generation && tab.page.url() === url) break;
     if (attempt) return `Snapshot unavailable: the page kept navigating while it was read (now ${tab.page.url()}). Call snapshot again.`;
   }
@@ -721,9 +750,10 @@ const PAGE_LINKS_FN = (el) => {
 
 async function pageLinks(tab, { ref, maxChars = SNAPSHOT_MAX_CHARS } = {}) {
   if (tab.dialog) return 'Links unavailable while a dialog is open. Resolve it with the dialog tool.';
-  refuseLocalPage(tab);
+  refuseBlockedPage(tab);
+  const before = tab.blockedPageAt;
   const { name, links } = ref ? await locator(tab, ref).evaluate(PAGE_LINKS_FN, null, { timeout: ACTION_TIMEOUT_MS }) : await tab.page.evaluate(PAGE_LINKS_FN, null);
-  refuseLocalPage(tab);
+  refuseBlockedPage(tab, before);
   return `Links of ${ref ? `${ref} (<${name}>)` : `<${name}>`} (${links.length}; text → URL, no refs; to click one, call snapshot for refs or navigate to its URL):\n` +
     capText(links.join('\n') || '(no links)', maxChars - 200, 'To read them, call snapshot with mode "links" and ref=<eN> of a section, or with a larger max_chars');
 }
@@ -757,7 +787,8 @@ async function framesText(tab) {
 
 async function pageText(tab, { ref, maxChars = SNAPSHOT_MAX_CHARS } = {}) {
   if (tab.dialog) return 'Text unavailable while a dialog is open. Resolve it with the dialog tool.';
-  refuseLocalPage(tab);
+  refuseBlockedPage(tab);
+  const before = tab.blockedPageAt;
   const read = () => (ref ? locator(tab, ref).evaluate(PAGE_TEXT_FN, null, { timeout: ACTION_TIMEOUT_MS }) : tab.page.evaluate(PAGE_TEXT_FN, null));
   let { name, text: raw, early } = await read();
   // A document that has only just started (a challenge page that reloads itself) is read once its body is parsed.
@@ -766,7 +797,7 @@ async function pageText(tab, { ref, maxChars = SNAPSHOT_MAX_CHARS } = {}) {
     ({ name, text: raw } = await read());
   }
   const frames = ref ? [] : await framesText(tab); // the whole page's text takes in its iframes'
-  refuseLocalPage(tab); // it went there while the text was read
+  refuseBlockedPage(tab, before); // it went there while the text was read
   const body = [collapseText(raw), ...frames].filter(Boolean).join('\n') || '(no text)';
   return `Text of ${ref ? `${ref} (<${name}>)` : `<${name}>`} (readable text only, no refs; to act on the page, call snapshot without mode for refs):\n` +
     capText(body, maxChars - 150, 'To read them, call snapshot with mode "text" and ref=<eN> of a section, or with a larger max_chars');
@@ -774,7 +805,7 @@ async function pageText(tab, { ref, maxChars = SNAPSHOT_MAX_CHARS } = {}) {
 
 function dialogLine(tab) {
   const d = tab.dialog;
-  if (!d || isLocalPage(tab.page.url())) return null;
+  if (!d || blockedTab(tab)) return null;
   const prompt = d.type() === 'prompt' ? ` (default value "${d.defaultValue()}")` : '';
   return `Dialog open: ${d.type()} "${d.message()}"${prompt}. The page is blocked until you resolve it with the dialog tool.`;
 }
@@ -803,14 +834,15 @@ async function report(tab, { lines = [], newTabs = [], snapshot = true, ref, cha
   if (snapshot) out.push(snap);
   const images = [];
   if (frames?.length) {
-    refuseLocalPage(tab); // it went there while they were taken
+    refuseBlockedPage(tab); // it went there while they were taken
     out.push(`${frames.length} frames from the action's first input to the page, at ${frames.map((f) => `+${f.at}`).join(', ')} ms (in that order${screenshot ? ', then the screenshot once it settled' : ''}).`);
     images.push(...frames.map((f) => f.image));
   }
-  if (screenshot && !tab.dialog && !isLocalPage(tab.page.url())) {
+  if (screenshot && !tab.dialog && !blockedTab(tab)) {
+    const before = tab.blockedPageAt;
     const image = await cursor.hideForCapture(tab, () => tab.page.screenshot({ type: 'jpeg', quality: 80, scale: 'css', timeout: ACTION_TIMEOUT_MS }))
       .catch((error) => { out.push(`(The screenshot failed: ${cleanError(error)})`); return null; });
-    refuseLocalPage(tab); // it went there while the screenshot was taken
+    refuseBlockedPage(tab, before); // it went there while the screenshot was taken
     if (image) images.push(image);
   }
   const result = text(out.join('\n'));
@@ -820,11 +852,13 @@ async function report(tab, { lines = [], newTabs = [], snapshot = true, ref, cha
 
 // Screenshots taken while something plays out (an action's animation or transition, a running animation): `count` of
 // them, `every` ms apart from now (or as fast as the browser captures), the cursor hidden throughout. A dialog (it
-// holds captures; none are taken after it, even once it is answered) or a local page ends them early.
+// holds captures; none are taken after it, even once it is answered) or a local page ends them early; when one showed
+// meanwhile (and maybe went again), none are kept.
 const FRAME_MS = 100;
 async function filmstrip(tab, count, every = FRAME_MS, shoot = () => tab.page.screenshot({ type: 'jpeg', quality: 70, scale: 'css', timeout: ACTION_TIMEOUT_MS })) {
   const frames = [];
   const started = Date.now();
+  const before = tab.blockedPageAt;
   let dialog = !!tab.dialog;
   const onDialog = () => { dialog = true; };
   tab.on('dialog', onDialog);
@@ -833,7 +867,7 @@ async function filmstrip(tab, count, every = FRAME_MS, shoot = () => tab.page.sc
       for (let i = 0; i < count; i++) {
         const wait = started + i * every - Date.now();
         if (wait > 0) await sleep(wait);
-        if (dialog || tab.page.isClosed() || isLocalPage(tab.page.url())) break;
+        if (dialog || tab.page.isClosed() || blockedTab(tab) || blockedSince(tab, before)) break;
         const at = Date.now() - started;
         frames.push({ at, image: await shoot() });
       }
@@ -841,6 +875,7 @@ async function filmstrip(tab, count, every = FRAME_MS, shoot = () => tab.page.sc
   } finally {
     tab.off('dialog', onDialog);
   }
+  if (blockedSince(tab, before)) throw new Error(`Tab ${tab.id}: ${DISCARDED}.`);
   return frames;
 }
 
@@ -985,7 +1020,7 @@ async function withGesture(tab, fn) {
 // claimed tab), and opens for them as usual. Reads hold choosers too: an evaluate right after an action still has its
 // user activation (a script click on a file input opens a chooser then), and media may click the player.
 async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenTabs = false, read = false, waited = false, input = true } = {}) {
-  if (tab.dialog) throw new Error(dialogLine(tab) ?? `A dialog is open, and ${localPage(tab.page.url())}.`);
+  if (tab.dialog) throw new Error(dialogLine(tab) ?? `A dialog is open, and ${blockedTab(tab)}.`);
   // A tab this action opens from the user's claimed tab is adopted (ours, in the background) instead of being the user's.
   // Only for actions that can open tabs (a shorter window means fewer chances to catch the user's own Cmd-click, and
   // such a tab is handed back to them, never closed). Older extensions don't know the command; that only loses
@@ -1074,14 +1109,14 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
     frames: tab.dialog ? null : frames, afterAction: true });
 }
 
-// onLocalPage: the call may run on a tab showing a local file (navigate with a url, which takes it away).
+// onBlockedPage: the call may run on a tab showing a blocked page (navigate with a url, which takes it away).
 // escape: it also runs on a page found stuck in a script (navigate: how the agent gets out, Tab.run).
-function withTab(manager, handler, { onLocalPage = () => false, escape = false } = {}) {
+function withTab(manager, handler, { onBlockedPage = () => false, escape = false } = {}) {
   return async (args) => {
     const tab = await resolveTab(manager, args.tab);
     const started = Date.now();
     return tab.run(async () => {
-      if (!onLocalPage(args)) refuseLocalPage(tab);
+      if (!onBlockedPage(args)) refuseBlockedPage(tab);
       await checkRefs(tab, args);
       return handler(tab, args);
     }, { escape }).catch((error) => {
@@ -1730,19 +1765,22 @@ export function registerTools(server, manager) {
     'Open a new tab in the named browser and control it. By default it is a work tab: in the background (never focused), muted, inside a tab group, ' +
     'closed when your session ends (in Claude Code at the end of your turn), so the user is not disturbed. When the tab is for the user (they asked you to open something for them to use, watch or read), ' +
     'pass for_user: true: it opens like their own tab (not in your work group, stays open after your turn, muted only while you control it), still in the background unless focus: true. ' +
-    'Tabs you give the user in one turn (for_user, tab_keep) share a tab group of their own once there are two or more, say one per prototype or result; a single one stays ungrouped. ' +
-    'Returns the tab id (e.g. "helium:1834") to pass to every other tool, plus the page snapshot.',
-    { browser: browserArg, url: z.string().optional().describe('URL to load (default about:blank).'),
+    'Tabs you give the user in one turn (for_user, tab_keep) share a tab group of their own once there are two or more; without a group, a single one stays ungrouped. ' +
+    'To show the user several pages (prototypes, variants, results), pass for_user with a group named for the project, e.g. "Nearby places prototypes": the tab joins that group at once, even alone, also in later turns. ' +
+    'On a redo, open the same URLs with the same group: the earlier tabs showing them reload in place (same tab ids) instead of new tabs piling up; the result lists the group\'s other tabs, and earlier ones the new set replaces can be closed with tab_close (confirm_close_users_tab: true). ' +
+    `${LOCAL_FILES}Returns the tab id (e.g. "helium:1834") to pass to every other tool, plus the page snapshot.`,
+    { browser: browserArg, url: z.string().optional().describe('URL to load (default about:blank): a web page, or a local file as a file:/// URL.'),
       for_user: z.boolean().optional().describe('Open the tab for the user: kept after your turn ends, out of your work group (several for the user share a group of their own, see group). You control it until then; it stays muted till then so nothing plays aloud before the user looks (tab_mute false if they asked to hear it now).'),
       focus: z.boolean().optional().describe('Bring the tab to the front once loaded. Only when the user asked to see it now.'),
-      group: z.string().optional().describe('Tab group title (default: this session\'s label). With for_user, the title of the group the tabs you open for the user this turn share once there are two or more: name what they are, e.g. "Ad prototypes".'),
+      group: z.string().optional().describe('Tab group title (default: this session\'s label). With for_user, the group the tab joins at once (one FowlBrowser made for the user with that title in the window, else a new one): name it for the project, e.g. "Nearby places prototypes". On a redo pass the same group and URLs: an earlier tab of it showing the URL reloads in place; close earlier tabs the new set replaces with tab_close (confirm_close_users_tab: true).'),
       muted: z.boolean().optional().describe('Mute the tab\'s audio (default true; ignored with for_user).'),
       snapshot: snapshotArg, screenshot: screenshotArg, timeout_ms: timeoutArg },
     async ({ browser: key, url, for_user, focus, group, muted, snapshot, screenshot, timeout_ms }) => {
       refuseNonWeb(url);
       const browser = await manager.get(key);
       await browser.playwright();
-      const created = await browser.host.request('tabs.open', { group, muted, forUser: for_user === true });
+      // matchUrl: with a named group, an earlier tab of it showing that URL may come back instead of a new one (reused).
+      const created = await browser.host.request('tabs.open', { group, muted, forUser: for_user === true, ...(for_user && group && url && { matchUrl: url }) });
       record.tabEvent('open', `${key}:${created.id}`, url ?? 'about:blank', { forUser: for_user === true });
       try {
         // Like a navigation, it may take a while when the browser is busy (its debugger attach alone can take seconds).
@@ -1750,10 +1788,18 @@ export function registerTools(server, manager) {
         return await tab.run(async () => {
           // A dialog the page opens while it loads holds the load up: it is reported at once, as act() does for navigate,
           // and the load goes on once it is resolved (later calls on the tab wait for that).
-          let onDialog;
+          let onDialog, reloaded = false;
           const dialogOpened = new Promise((resolve) => { onDialog = resolve; tab.once('dialog', onDialog); });
           const opening = (async () => {
-            if (url) await tab.page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeout_ms ?? NAVIGATION_TIMEOUT_MS });
+            const options = { waitUntil: 'domcontentloaded', timeout: timeout_ms ?? NAVIGATION_TIMEOUT_MS };
+            // A reused tab reloads: it shows the URL already (the extension matched it, fragment aside). Another fragment
+            // alone would be a same-document navigation keeping the old page, so it is applied after the reload.
+            const bare = (u) => u.split('#')[0];
+            if (created.reused && bare(tab.page.url()) === bare(new URL(url).href)) {
+              reloaded = true;
+              await tab.page.reload(options);
+              if (tab.page.url() !== new URL(url).href) await tab.page.goto(url, options);
+            } else if (url) await tab.page.goto(url, options);
             await loaded(tab.page);
             if (url && snapshot !== false) await contentReady(tab);
             if (focus) await browser.host.request('tabs.focus', { tabId: tab.tabId });
@@ -1761,8 +1807,17 @@ export function registerTools(server, manager) {
           opening.catch(() => {}); // a dialog may win the race
           await Promise.race([opening, dialogOpened]).finally(() => tab.off('dialog', onDialog));
           if (tab.dialog) tab.keepBusy(opening.catch(() => {}));
-          const lines = [`Opened ${tab.id} in ${browser.name}${focus && !tab.dialog ? ' and brought it to the front' : ''}.`];
-          if (for_user) lines.push(`It is the user's tab${created.groupId >= 0 ? ', in one tab group with the other tabs you opened for them this turn,' : ''} and stays open after your turn; you control it until then, and it stays muted till then so nothing plays aloud before they look (tab_mute false if they asked to hear it now).`);
+          const front = focus && !tab.dialog ? ' and brought it to the front' : '';
+          const lines = [created.reused
+            ? `${reloaded ? 'Reloaded' : 'Loaded the URL in'} your earlier tab ${tab.id} in group "${group}"${reloaded ? ' (same URL)' : ''} instead of opening another.${front && ' Brought it to the front.'}`
+            : `Opened ${tab.id} in ${browser.name}${front}.`];
+          const grouped = created.groupId < 0 ? '' : group ? `, in the tab group "${group}",` : ', in one tab group with the other tabs you opened for them this turn,';
+          if (for_user) lines.push(`It is the user's tab${grouped} and stays open after your turn; you control it until then, and it stays muted till then so nothing plays aloud before they look (tab_mute false if they asked to hear it now).`);
+          if (created.groupTabs?.length) {
+            const listed = created.groupTabs.slice(0, 10).map((t) => `${key}:${t.id} · ${t.title || '(no title)'} · ${t.url}`);
+            const more = created.groupTabs.length - listed.length;
+            lines.push(`Also in group "${group}": ${listed.join(', ')}${more > 0 ? `, and ${more} more` : ''}.`);
+          }
           return report(tab, { lines, snapshot: snapshot !== false && !tab.dialog, screenshot: screenshot === true });
         });
       } catch (error) {
@@ -1907,8 +1962,10 @@ export function registerTools(server, manager) {
     { tab: tabArg, reason: z.string().min(1).describe('What the user should do there, as words for them, e.g. "log in to your bank" or "enter the card details".') },
     async ({ tab: value, reason }) => {
       const tab = await resolveTab(manager, value);
-      refuseLocalPage(tab);
-      const title = (await tab.currentTitle()) || tab.page.url();
+      refuseBlockedPage(tab);
+      const before = tab.blockedPageAt;
+      const read = await tab.currentTitle(); // dropped as header() drops it
+      const title = (!blockedTab(tab) && !blockedSince(tab, before) && read) || tab.page.url();
       await tab.run(() => takeover.handOff(tab, reason), { escape: true });
       return text(`Browser: ${tab.browser.name} · Tab: ${tab.id}\nHanded ${tab.id} to the user. Tell them: Your turn in ${tab.browser.name} tab "${title}": ${reason}, then tell me.\n` +
         'Once they say they are done, call tab_claim on it with resume: true to carry on (you get a fresh snapshot). If you no longer need it, tab_release gives it to them for good.');
@@ -1922,7 +1979,7 @@ export function registerTools(server, manager) {
     { tab: tabArg }, simpleTabCall('tabs.focus', byId, 'Focused.'));
 
   tool('navigate',
-    'Load a URL in a tab, or go back, forward or reload. Returns the new snapshot.',
+    `Load a URL in a tab, or go back, forward or reload. ${LOCAL_FILES}Returns the new snapshot.`,
     { tab: tabArg, url: z.string().optional(), action: z.enum(['back', 'forward', 'reload']).optional(), snapshot: snapshotArg, screenshot: screenshotArg, timeout_ms: timeoutArg },
     withTab(manager, (tab, args) => act(tab, args, () => cued(tab, 'navigate', async () => {
       const options = { waitUntil: 'domcontentloaded', timeout: args.timeout_ms ?? NAVIGATION_TIMEOUT_MS };
@@ -1944,7 +2001,7 @@ export function registerTools(server, manager) {
       if (args.snapshot !== false) await contentReady(tab);
       if (response === null && args.action && args.action !== 'reload') return `No ${args.action} history entry.`;
       return response && !response.ok() ? `HTTP ${response.status()} ${response.statusText()}` : null;
-    }, { after: true }), { waited: true }), { onLocalPage: (args) => !!args.url, escape: true }));
+    }, { after: true }), { waited: true }), { onBlockedPage: (args) => !!args.url, escape: true }));
 
   tool('snapshot',
     'Read the page as an accessibility snapshot (YAML). Elements carry refs like [ref=e12] that click, type and other tools take. ' +
@@ -2249,7 +2306,7 @@ export function registerTools(server, manager) {
     // Not queued: the action that opened the dialog may still hold this tab's queue until the dialog is resolved.
     async (args) => {
       const tab = await resolveTab(manager, args.tab);
-      refuseLocalPage(tab);
+      refuseBlockedPage(tab);
       const started = Date.now();
       const dialog = tab.dialog;
       if (!dialog) throw new Error('No dialog is open on this tab.');
@@ -2353,13 +2410,14 @@ export function registerTools(server, manager) {
         const clip = at && { x: at.x - at.w / 2, y: at.y - at.h / 2, width: Math.max(1, at.w), height: Math.max(1, at.h) };
         const frames = await cued(tab, 'observe', () => filmstrip(tab, args.frames, args.frame_ms,
           () => tab.page.screenshot({ ...options, quality: 70, ...(clip && { clip }) })), { after: true });
-        refuseLocalPage(tab); // it went there while they were taken
+        refuseBlockedPage(tab); // it went there while they were taken
         return { content: [
           { type: 'text', text: `${await header(tab)}\n${frames.length} screenshots of the ${args.ref ? `area of element ${args.ref}` : 'viewport'} at ` +
             `${frames.map((f) => `+${f.at}`).join(', ')} ms (in that order), JPEG, 1 image px = 1 CSS px.` },
           ...frames.map((f) => ({ type: 'image', data: f.image.toString('base64'), mimeType: 'image/jpeg' })),
         ] };
       }
+      const before = tab.blockedPageAt;
       // Within the call's own timeout too: a page too busy to scroll is captured as it is.
       if (args.full_page && !args.ref) {
         const waitMs = Math.min(6000, options.timeout);
@@ -2376,7 +2434,7 @@ export function registerTools(server, manager) {
       const image = await cued(tab, 'observe', () => cursor.hideForCapture(tab, () => (args.ref && !options.clip
         ? locator(tab, args.ref).screenshot(options)
         : tab.page.screenshot({ ...options, fullPage: !!(args.full_page || options.clip) }))), { after: true });
-      refuseLocalPage(tab); // it went there while the screenshot was taken
+      refuseBlockedPage(tab, before); // it went there while the screenshot was taken
       const cut = options.clip ? `, cut to its first ${options.clip.width.toLocaleString('en-US')}x${options.clip.height.toLocaleString('en-US')} px of ` +
         `${box.w.toLocaleString('en-US')}x${box.h.toLocaleString('en-US')} (the browser captures at most ${FULL_PAGE_MAX_PX.toLocaleString('en-US')} px a side; ` +
         'for the rest, scroll and take viewport screenshots)' : '';
@@ -2445,7 +2503,7 @@ export function registerTools(server, manager) {
       if (!code) throw new Error('Pass function, e.g. "() => document.title".');
       const source = functionSource(code, { withElement: !!args.ref });
       const urlBefore = tab.page.url();
-      const started = Date.now();
+      const before = tab.blockedPageAt;
       // A page function that never settles must not hold this tab's queue for the rest of the session.
       const timeout = args.timeout_ms ?? ACTION_TIMEOUT_MS;
       let result;
@@ -2468,8 +2526,8 @@ export function registerTools(server, manager) {
       } finally {
         if (record.recording) record.scriptClicks(tab, await cursor.drainClicks(tab).catch(() => []));
       }
-      // The page went to a local file while the function ran (and maybe back): its result may be read from that file.
-      if (tab.localPageAt >= started) throw new Error(`Tab ${tab.id}: it showed a local file while this ran, which FowlBrowser doesn't read, so the result was discarded.`);
+      // The page went to, framed or loaded a refused local file while the function ran (and maybe back): its result may be read from that file.
+      if (blockedSince(tab, before)) throw new Error(`Tab ${tab.id}: it showed or loaded a local file agents can't open while this ran, which FowlBrowser doesn't read, so the result was discarded.`);
       const json = result === undefined ? 'undefined' : JSON.stringify(result, null, 2);
       // With its snapshot (cut at its own max) the whole result still fits what Claude Code takes.
       return `Result:\n${capText(json, args.snapshot ? MAX_CHARS - SNAPSHOT_MAX_CHARS : MAX_CHARS, 'Return less data.')}`;
@@ -2564,5 +2622,5 @@ export function registerTools(server, manager) {
     withTab(manager, async (tab, args) => text(`${await header(tab)}\n${await cued(tab, 'observe', () => exportTab(tab, args))}`)));
 
   registerBrowserData(tool, manager, { click: (args) => handlers.click(args), parseTabId });
-  registerPerf(tool, manager, { withTab: (handler) => withTab(manager, handler), header, text, tabArg });
+  registerPerf(tool, manager, { withTab: (handler) => withTab(manager, handler), header, text, tabArg, refuseBlockedPage, blockedSince });
 }

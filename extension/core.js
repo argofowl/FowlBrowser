@@ -53,6 +53,7 @@ const DOWNLOAD_PAIR_MS = 2000;         // a download and its tab's signal arrive
 const DOWNLOAD_EXPECT_MAX_MS = 300_000;
 const BROWSING_DATA_MAX = 200;
 const POPUP_ARM_MS = 1500;             // after a Page.windowOpen, how long a new active tab in that window is switched back
+const GIVEN_NAMED = 'given:named'; // the lock of named groups made for the user (groupForUser, reuseGiven), every client's
 const GROUP_COLORS = ['grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange'];
 
 export function colorFor(label) {
@@ -65,21 +66,42 @@ export function isNewTabPage(url) {
   return /^(chrome|edge):\/\/(newtab|new-tab-page)\b/.test(url) || url.startsWith('chrome-search://');
 }
 
-// Where an agent tab may go: web pages, a blank page and data: URLs, never this extension's own pages (Chrome lets an
-// extension debug those, with all of its powers), browser, DevTools or local pages. Parsed as Chrome does, so
-// "fi\tle:" is a local file too. new URL, not URL.parse: Chrome 125 lacks that.
+// Where an agent tab may go: web pages, a blank page, data: URLs and allowed local files (isLocalFile), never this
+// extension's own pages (Chrome lets an extension debug those, with all of its powers), browser or DevTools pages.
+// Parsed as Chrome does, so "fi\tle:" is a local file too. new URL, not URL.parse: Chrome 125 lacks that.
 function parsed(url) {
   try { return new URL(String(url ?? '')); } catch { return null; }
 }
+// A local file agents may open: the MCP server's rule (hidden files and folders, ~/Library but iCloud Drive and the cloud
+// drives, system folders and folder listings refused), applied to the URL's path alone, as defense in depth: this
+// extension can't resolve symlinks, so the server, which can, is the real guard. Compared in lower case like the Mac's disk.
+const SYSTEM_DIRS = ['/etc/', '/private/etc/', '/system/', '/private/var/db/', '/library/keychains/', '/private/var/log/'];
+export function isLocalFile(url) {
+  const u = parsed(url);
+  if (u?.protocol !== 'file:' || u.host) return false;
+  let path;
+  try { path = decodeURIComponent(u.pathname).toLowerCase(); } catch { return false; }
+  const library = /^\/users\/[^/]+\/library\/(.*)$/.exec(path);
+  return !path.endsWith('/') && !path.split('/').some((part) => part.startsWith('.'))
+    && !(library && !/^(mobile documents|cloudstorage)\//.test(library[1])) && !SYSTEM_DIRS.some((d) => path.startsWith(d));
+}
+const isFileUrl = (url) => parsed(url)?.protocol === 'file:';
+const isRefusedFile = (url) => isFileUrl(url) && !isLocalFile(url);
 function isWebUrl(url) {
   const { protocol, pathname } = parsed(url) ?? {};
-  return ['http:', 'https:', 'data:'].includes(protocol) || (protocol === 'about:' && pathname === 'blank');
+  return ['http:', 'https:', 'data:'].includes(protocol) || (protocol === 'about:' && pathname === 'blank') || isLocalFile(url);
 }
 const isHttpUrl = (url) => ['http:', 'https:'].includes(parsed(url)?.protocol);
-const webOnly = (url) => `${url} can't be opened: agents only open web pages (http and https)`;
+// A URL as Chrome shows it, query included, without its fragment (a redo's match: reuseGiven).
+const redoUrl = (url) => {
+  const page = parsed(url);
+  if (page) page.hash = '';
+  return page?.href ?? null;
+};
+const webOnly = (url) => `${url} can't be opened: agents only open web pages (http and https) and local files outside hidden folders, ~/Library and system folders`;
 
 export function isRestricted(url) {
-  if (url === 'about:blank') return false;
+  if (url === 'about:blank' || isLocalFile(url)) return false;
   return /^(chrome|chrome-extension|devtools|edge|about|file|view-source):/.test(url)
     || url.startsWith('https://chromewebstore.google.com')
     || url.startsWith('https://chrome.google.com/webstore');
@@ -147,6 +169,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
   const owners = new Map();
   const labels = new Map();         // client -> label from client.hello
   const groups = new Map();         // `${client}|${label}|${windowId}` -> promise of the tab group id
+  const givenGroups = new Map();    // tab group id -> title: groups made for the user (groupForUser), until removed or renamed
+  // tabId -> the group made for the user that this extension put it in (groupForUser, reuseGiven): only these come back on
+  // a redo, never a tab the user moved into the group themselves
+  const givenTabs = new Map();
   const activeByWindow = new Map(); // windowId -> { current, previous } active tab ids
   const chunks = new Map();         // chunk id -> text received so far
   const liveClients = new Set();    // clients the current host announced and hasn't disconnected
@@ -187,9 +213,11 @@ export function createCore({ chrome, send, timers = globalThis }) {
   const ready = restore();
 
   async function restore() {
-    const stored = await chrome.storage.session.get(['owners', 'labels']);
+    const stored = await chrome.storage.session.get(['owners', 'labels', 'givenGroups', 'givenTabs']);
     for (const [tabId, owner] of Object.entries(stored.owners ?? {})) owners.set(Number(tabId), owner);
     for (const [client, label] of Object.entries(stored.labels ?? {})) labels.set(Number(client), label);
+    for (const [groupId, title] of Object.entries(stored.givenGroups ?? {})) givenGroups.set(Number(groupId), title);
+    for (const [tabId, groupId] of Object.entries(stored.givenTabs ?? {})) givenTabs.set(Number(tabId), groupId);
     // A worker restart closes the native port, and with it the host and every client it served,
     // so whatever the previous worker owned is cleaned up like a disconnect.
     await disconnectAll();
@@ -202,6 +230,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     return chrome.storage.session.set({
       owners: Object.fromEntries(owners),
       labels: Object.fromEntries(labels),
+      givenGroups: Object.fromEntries(givenGroups),
+      givenTabs: Object.fromEntries(givenTabs),
     });
   }
 
@@ -295,6 +325,13 @@ export function createCore({ chrome, send, timers = globalThis }) {
     }
   }
 
+  // Chrome lets an extension open and debug file: pages only with "Allow access to file URLs" on for it.
+  async function requireFileAccess(url) {
+    if (isFileUrl(url) && !(await chrome.extension.isAllowedFileSchemeAccess())) {
+      throw new Error(`${url} can't be opened: FowlBrowser has no access to local files. Ask the user to turn on "Allow access to file URLs" in FowlBrowser's Details on the extensions page`);
+    }
+  }
+
   // Counts tab creations and claims under way, so extension.reloadIfIdle can see them.
   async function tracked(fn) {
     inFlight++;
@@ -305,11 +342,17 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // A tab `forUser` is the user's from the start (handed over: out of the client's group, discardable, kept), though the
   // client still drives it until it disconnects. It stays muted while driven (focus emulation lets background pages
   // autoplay) and is unmuted when control ends, unless the agent set its mute itself or the user changed it meanwhile.
-  // Several given to the user at once share a group of their own (groupForUser).
-  async function openTab({ client, live }, { url = 'about:blank', group, muted = true, forUser = false } = {}) {
+  // Several given to the user at once share a group of their own (groupForUser); a named one (`group`) gets that group at
+  // once, and with `matchUrl` may be an earlier tab of it reloaded instead (reuseGiven).
+  async function openTab({ client, live }, { url = 'about:blank', group, muted = true, forUser = false, matchUrl } = {}) {
     if (!isWebUrl(url)) throw new Error(webOnly(url));
+    await requireFileAccess(url);
     const label = group || labelFor(client);
     const windowId = await pickWindow();
+    if (forUser && group && matchUrl !== undefined && windowId !== undefined) {
+      const reused = await reuseGiven({ client, live }, label, matchUrl, windowId);
+      if (reused) return reused;
+    }
     const tab = windowId === undefined
       ? (await chrome.windows.create({ focused: false, url })).tabs[0]
       : await chrome.tabs.create({ windowId, url, active: false });
@@ -317,7 +360,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
       await chrome.tabs.remove(tab.id).catch(() => {});
       throw new Error('Client disconnected');
     }
-    const owner = { client, origin: 'agent', group: label, kept: !!forUser, handedOver: !!forUser, agentMuted: !!forUser };
+    const owner = { client, origin: 'agent', group: label, kept: !!forUser, handedOver: !!forUser, agentMuted: !!forUser, ...(forUser && group && { named: true }) };
     owners.set(tab.id, owner);
     if (parsed(url)?.protocol === 'about:') blankedByUs.add(tab.id);
     try {
@@ -413,40 +456,94 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // tabs. Titled like the client's group (the tab_open group, else its label). The group is the user's: it stays when
   // the client lets the tabs go. Only tabs in the same window join, never one the user moved out of the group or into
   // another. One client at a time, so tabs opened at once make one group. Best effort: the tab is the user's either way.
+  // A tab with a named group (tabs.open forUser with `group`) is grouped at once, even alone, into the newest group made
+  // for the user with that title in its window (any client's, so a later turn or session adds to it), else a new one.
   async function groupForUser(client, tabId) {
-    await serialize(`given:${client}`, async () => {
+    const named = !!owners.get(tabId)?.named;
+    await serialize(named ? GIVEN_NAMED : `given:${client}`, async () => {
       const owner = owners.get(tabId);
       // Still this client's tab given to the user, under the same title: asked again right before grouping, since a
       // release, claim, park or disconnect can come while tabs are looked up.
       const given = (id, record) => owners.get(id) === record && record.client === client && record.origin === 'agent'
-        && record.handedOver && !record.parked && !record.releasing && record.group === owner.group;
+        && record.handedOver && !record.parked && !record.releasing && record.group === owner.group && !record.named === !named;
       // chrome.tabs.group takes a tab's Split View partner along (the user's own tab, maybe) and unpins a pinned tab, so
       // a split or pinned tab never joins.
       const split = (t) => (t.splitViewId ?? -1) !== -1 || !!t.pinned;
       if (!owner || !given(tabId, owner) || owner.givenGroup !== undefined) return; // grouped once already: the user's call since
       const { windowId } = await chrome.tabs.get(tabId);
+      const titled = named ? await givenGroupsTitled(owner.group) : [];
       // One read of the window, then nothing awaited until the group call: the user may group, split or move tabs meanwhile.
       const inWindow = new Map((await chrome.tabs.query({ windowId })).map((t) => [t.id, t]));
       const tab = inWindow.get(tabId);
       if (!tab || tab.groupId !== -1 || split(tab) || !given(tabId, owner)) return;
-      const peers = [...owners].filter(([id, other]) => id !== tabId && inWindow.has(id) && given(id, other)).map(([id, other]) => {
+      const peers = named ? [] : [...owners].filter(([id, other]) => id !== tabId && inWindow.has(id) && given(id, other)).map(([id, other]) => {
         const t = inWindow.get(id);
         return (other.givenGroup === undefined ? t.groupId === -1 && !split(t) : t.groupId === other.givenGroup) ? t : null;
       }).filter(Boolean);
-      if (!peers.length) return;
-      const existing = peers.find((t) => t.groupId !== -1)?.groupId;
+      if (!named && !peers.length) return;
+      const existing = named ? titled.find((id) => [...inWindow.values()].some((t) => t.groupId === id))
+        : peers.find((t) => t.groupId !== -1)?.groupId;
       const tabIds = [tabId, ...peers.filter((t) => t.groupId === -1).map((t) => t.id)];
       const members = tabIds.map((id) => owners.get(id));
       const groupId = existing === undefined
         ? await chrome.tabs.group({ tabIds, createProperties: { windowId } })
         : await chrome.tabs.group({ groupId: existing, tabIds });
       for (const member of members) member.givenGroup = groupId;
+      for (const id of tabIds) givenTabs.set(id, groupId);
+      if (existing === undefined) givenGroups.set(groupId, owner.group);
       await persist();
       if (existing === undefined) {
         await chrome.tabGroups.update(groupId, { title: owner.group, color: colorFor(owner.group), collapsed: false })
           .catch((e) => log('group for user: title failed', groupId, e.message));
       }
     }).catch((e) => log('group for user failed', tabId, e.message));
+  }
+
+  // Groups made for the user still titled `title` (a rename since makes one the user's: onTabGroupUpdated), newest first.
+  async function givenGroupsTitled(title) {
+    const ids = [...givenGroups].filter(([, t]) => t === title).map(([id]) => id).reverse();
+    const live = await Promise.all(ids.map((id) => chrome.tabGroups.get(id).catch(() => null)));
+    return ids.filter((id, i) => live[i]?.title === title);
+  }
+
+  // A redo (tabs.open forUser with a named group and matchUrl): a tab in the newest group made for the user with that
+  // title in the window, showing that URL (hash aside), is taken instead of a new one, unless another client has it. It
+  // becomes this client's like a new forUser tab (kept, handed over, muted while driven unless muted already), stays
+  // where it is (never activated or moved), and the client reloads it. Decided under the named groups' lock with nothing
+  // awaited between the window read and taking it, so of clients racing for one tab, one gets it and the others open a
+  // new tab. Null when there is none.
+  async function reuseGiven({ client, live }, title, matchUrl, windowId) {
+    const want = redoUrl(matchUrl);
+    if (!want || !isWebUrl(matchUrl)) return null;
+    const found = await serialize(GIVEN_NAMED, async () => {
+      const titled = await givenGroupsTitled(title);
+      const inWindow = await chrome.tabs.query({ windowId });
+      const groupId = titled.find((id) => inWindow.some((t) => t.groupId === id));
+      if (groupId === undefined) return null;
+      const yours = (record) => record.client === client && record.origin === 'agent' && record.handedOver && !record.parked && !record.releasing;
+      const tab = inWindow.find((t) => t.groupId === groupId && !t.incognito && !closing.has(t.id)
+        && redoUrl(t.pendingUrl || t.url) === want && (owners.has(t.id) ? yours(owners.get(t.id)) : givenTabs.get(t.id) === groupId));
+      if (!tab || !live()) return null;
+      if (owners.has(tab.id)) return { tab, yours: true }; // this client's already (this turn, a subagent)
+      const muted = !!tab.mutedInfo?.muted; // the user's own mute: theirs, never ended by us
+      const owner = { client, origin: 'agent', group: title, named: true, kept: true, handedOver: true, givenGroup: groupId, ...(!muted && { agentMuted: true }) };
+      owners.set(tab.id, owner);
+      return { tab, owner, muted };
+    });
+    if (!found) return null;
+    const { tab, owner } = found;
+    if (found.yours) return { ...(await chrome.tabs.get(tab.id)), reused: true, yours: true };
+    try {
+      return await serialize(tab.id, async () => {
+        await persist();
+        if (!found.muted) await chrome.tabs.update(tab.id, { muted: true });
+        return { ...(await chrome.tabs.get(tab.id)), reused: true };
+      });
+    } catch (error) {
+      owner.releasing = true;
+      await serialize(tab.id, () => cleanUp(tab.id, owner));
+      throw error;
+    }
   }
 
   // An agent tab the user gets to keep (kept or released) leaves its group and behaves like their own tabs again.
@@ -629,8 +726,13 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
     async 'tabs.open'(params, ctx) {
       const tab = await tracked(() => openTab(ctx, params));
-      ctx.emit('chrome.tabs.onCreated', [tab]);
-      return tab;
+      if (!tab.yours) ctx.emit('chrome.tabs.onCreated', [tab]);
+      // In a named group made for the user: its other tabs this client doesn't control (a redo's leftovers to tidy up).
+      if (!params.forUser || !params.group || !givenGroups.has(tab.groupId)) return tab;
+      const groupTabs = (await chrome.tabs.query({ groupId: tab.groupId }))
+        .filter((t) => t.id !== tab.id && owners.get(t.id)?.client !== ctx.client)
+        .map((t) => ({ id: t.id, title: t.title, url: t.pendingUrl || t.url }));
+      return { ...tab, groupTabs };
     },
 
     async 'chrome.tabs.create'([createProperties = {}], ctx) {
@@ -672,6 +774,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         const url = tab.pendingUrl || tab.url || '';
         if (isNewTabPage(url)) tab = await navigateBlank(tabId);
         else if (isRestricted(url)) throw new Error(`Tab ${tabId} shows ${url}, which can't be controlled`);
+        await requireFileAccess(url);
         if (owners.has(tabId)) throw ownedByOther(tabId);
         if (!live()) throw new Error('Client disconnected');
         owners.set(tabId, { client, origin: 'user', group: null, kept: false });
@@ -936,12 +1039,14 @@ export function createCore({ chrome, send, timers = globalThis }) {
       }
       if (offWeb.has(target.tabId) || offWebSessions.get(target.tabId)?.has(target.sessionId)) throw notOnTheWeb(target.tabId);
       if (method === 'Page.navigate' && !isWebUrl(params?.url)) throw new Error(`${method} is blocked: ${webOnly(params?.url)}`);
+      if (method === 'Page.navigate') await requireFileAccess(params.url);
       if (method === 'Network.loadNetworkResource' && !isHttpUrl(params?.url)) throw new Error(`${method} is blocked: only http and https URLs load`);
       if (method === 'Page.navigateToHistoryEntry') {
         // By id, so the entry looked up is the one Chrome goes to.
         const { entries = [] } = await chrome.debugger.sendCommand(target, 'Page.getNavigationHistory') ?? {};
         const entry = entries.find((e) => e.id === params?.entryId);
         if (entry && !isWebUrl(entry.url)) throw new Error(`${method} is blocked: ${webOnly(entry.url)}`);
+        if (entry) await requireFileAccess(entry.url);
       }
       if (String(method).startsWith('Input.')) agentInputAt.set(target.tabId, Date.now()); // the agent's input (usersTurn)
       if (waitsOnPage(method, params)) return chrome.debugger.sendCommand(target, method, params);
@@ -1146,7 +1251,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
     // its target id and which has a parentId), navigating: see leftTheWeb.
     if (method === 'Page.frameNavigated' && params?.frame) {
       const { id, parentId, url } = params.frame;
-      if (!source.sessionId && !parentId && offTheWeb(url)) return leftTheWeb(source.tabId);
+      if (!source.sessionId && !parentId && offTheWeb(url)) return leftTheWeb(source.tabId, false, url);
+      // A frame of the page's own process (a file page's frames are) showing a local file agents may not open: an
+      // allowed file can frame any other, and snapshots read frames.
+      if (!source.sessionId && parentId && isRefusedFile(url)) return leftTheWeb(source.tabId, false, url);
       if (source.sessionId && (!parentId || childTargets.get(source.tabId)?.has(id))) offWebSession(source.tabId, source.sessionId, offTheWeb(url));
     }
     // The page asks to go to this extension's own page, in any frame of the tab (Page.frameRequestedNavigation: a script's
@@ -1188,8 +1296,9 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // claimed tab's history), seen at its commit (Page.frameNavigated, webNavigation.onCommitted, whichever comes first):
   // the debugger lets go at once (Chrome lets this extension debug its own pages, with all its powers), and attach and
   // commands are refused until the tab commits a web page. The client hears a detach as for a browser page Chrome lets go of.
-  // `pending`: the URL of a navigation that has not committed yet (onBeforeNavigate).
-  async function leftTheWeb(tabId, pending = false) {
+  // `pending`: the URL of a navigation that has not committed yet (onBeforeNavigate). `url`: the page (or frame) that
+  // made the tab leave, told to the client with the detach, so a local file it may not open is named as such.
+  async function leftTheWeb(tabId, pending = false, url = pending || null) {
     if (offWeb.has(tabId)) {
       if (!pending) offWeb.set(tabId, false);
       return;
@@ -1204,7 +1313,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     if (owner.detached || owners.get(tabId) !== owner) return;
     owner.detached = true;
     await persist();
-    emitToOwner(owner, 'chrome.debugger.onDetach', [{ tabId }, 'target_closed']);
+    emitToOwner(owner, 'chrome.debugger.onDetach', [{ tabId }, 'target_closed', { url }]);
   }
 
   // A navigation about to start, before the page it goes to has a document (webNavigation fires onBeforeNavigate as the
@@ -1360,11 +1469,13 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
   // A tabs.openChild child's first page other than about:blank: its downloads are its own from now on (openedFor). A main
   // frame's commit also decides whether agents may drive the tab (leftTheWeb); only a commit ends that.
+  // A child frame's commit of a local file agents may not open makes the tab leave as the main frame's would (an allowed
+  // file can frame any other); only the main frame's commit of a web page ends that.
   async function onNavigationCommitted({ tabId, frameId, url }) {
     await ready;
-    if (frameId !== 0) return;
+    if (frameId !== 0) return isRefusedFile(url) && owners.has(tabId) ? leftTheWeb(tabId, false, url) : undefined;
     if (url !== 'about:blank') openedFor.delete(tabId);
-    if (offTheWeb(url)) return leftTheWeb(tabId);
+    if (offTheWeb(url)) return leftTheWeb(tabId, false, url);
     offWeb.delete(tabId);
   }
 
@@ -1381,8 +1492,12 @@ export function createCore({ chrome, send, timers = globalThis }) {
     const [userAt, agentAt] = [userInputAt.get(tabId), agentInputAt.get(tabId)];
     forgetInput(tabId);
     adoptedFrom.delete(tabId);
+    const given = givenTabs.delete(tabId);
     const owner = owners.get(tabId);
-    if (!owner) return;
+    if (!owner) {
+      if (given) await persist();
+      return;
+    }
     owners.delete(tabId);
     lastOwned.set(tabId, { owner, windowId: removeInfo?.windowId, at: Date.now(), gen: generation, userAt, agentAt });
     await persist();
@@ -1403,8 +1518,17 @@ export function createCore({ chrome, send, timers = globalThis }) {
       adoptedFrom.delete(removedTabId);
       timers.setTimeout(() => adoptedFrom.delete(addedTabId), EXPECT_CHILD_MAX_MS);
     }
+    // Moved with the owner before anything is awaited: a disconnect meanwhile must find the owner under its new id.
+    const given = givenTabs.get(removedTabId);
+    if (given !== undefined) {
+      givenTabs.set(addedTabId, given);
+      givenTabs.delete(removedTabId);
+    }
     const owner = owners.get(removedTabId);
-    if (!owner) return;
+    if (!owner) {
+      if (given !== undefined) await persist();
+      return;
+    }
     owners.delete(removedTabId);
     owners.set(addedTabId, owner);
     await persist();
@@ -1630,6 +1754,23 @@ export function createCore({ chrome, send, timers = globalThis }) {
     armedWindows.delete(windowId);
   }
 
+  // A group made for the user is forgotten once Chrome removes it, or once the user renames it (it is theirs then: never
+  // reused). A title-less update is no rename: Chrome reports the group as made, untitled, before its title is set.
+  async function onTabGroupRemoved(group) {
+    await ready;
+    const forgot = givenGroups.delete(group.id);
+    for (const [tabId, groupId] of givenTabs) if (groupId === group.id) givenTabs.delete(tabId);
+    if (forgot) await persist();
+  }
+
+  async function onTabGroupUpdated(group) {
+    await ready;
+    if (group.title && givenGroups.has(group.id) && givenGroups.get(group.id) !== group.title) {
+      givenGroups.delete(group.id);
+      await persist();
+    }
+  }
+
   // The host and every client it served are gone; whatever is still in flight belongs to the old port.
   async function portClosed() {
     generation++;
@@ -1663,6 +1804,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     onWindowCreated,
     onWindowFocusChanged,
     onWindowRemoved,
+    onTabGroupRemoved,
+    onTabGroupUpdated,
     onDownloadCreated,
     onDownloadChanged,
     // for tests

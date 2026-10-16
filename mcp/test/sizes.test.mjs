@@ -13,7 +13,7 @@ const PAGE = Array.from({ length: 4000 }, (_, i) => `${'  '.repeat(1 + (i % 9))}
 
 function setup() {
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://www.youtube.com/watch?v=ND_kRgU_WlY', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://www.youtube.com/watch?v=ND_kRgU_WlY', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     ariaSnapshot: async () => PAGE,
     // A page function that returns a lot of data.
     evaluate: async () => Array.from({ length: 5000 }, (_, i) => ({ title: `Comment ${i}`, likes: i, url: `https://www.youtube.com/watch?v=ND_kRgU_WlY&lc=${i}` })),

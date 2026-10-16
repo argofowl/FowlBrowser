@@ -15,8 +15,8 @@ if [ "${FOWLBROWSER_SKIP_CLAUDE:-}" != 1 ]; then
     env -u CLAUDE_CONFIG_DIR claude mcp remove --scope user fowlbrowser >/dev/null 2>&1 &&
       echo "Claude Code: removed MCP server fowlbrowser (user scope)" || true
   fi
-  # Only hook entries running FowlBrowser's turn-ended.mjs go; everything else in the settings stays as it is.
-  node "$SRC/tools/claude-hooks.mjs" remove "${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}" "$APP/mcp/bin/turn-ended.mjs"
+  # Only hook entries running FowlBrowser's turn-ended.mjs or shell-guard.mjs go; everything else in the settings stays.
+  node "$SRC/tools/claude-hooks.mjs" remove "${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}" "$APP/mcp/bin/turn-ended.mjs" "$APP/mcp/bin/shell-guard.mjs"
 fi
 
 rm -rf "$APP"

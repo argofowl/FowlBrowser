@@ -138,7 +138,7 @@ test('privateDir: made 0700; a symlink or a folder others can write to is refuse
 
 test('memory with a page dialog open says so at once (the page answers no reads until it is resolved)', async () => {
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
   });
   const sent = [];
   const host = {

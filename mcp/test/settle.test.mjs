@@ -16,10 +16,10 @@ const matches = (text, texts) => {
   const found = texts[text] ?? [];
   return { count: async () => found.length, filter: ({ visible }) => ({ count: async () => found.filter((shown) => shown === visible).length }) };
 };
-const payment = { getByText: (text) => matches(text, { 'Pay now': [true] }) };
+const payment = { url: () => 'https://pay.example/', getByText: (text) => matches(text, { 'Pay now': [true] }) };
 // An ad iframe whose script never yields: it answers no read.
 const never = () => new Promise(() => {});
-const stuckAd = { getByText: () => ({ count: never, filter: () => ({ count: never }) }) };
+const stuckAd = { url: () => 'https://ads.example/', getByText: () => ({ count: never, filter: () => ({ count: never }) }) };
 
 function setup({ stuck = false } = {}) {
   let url = 'https://news.example/story';

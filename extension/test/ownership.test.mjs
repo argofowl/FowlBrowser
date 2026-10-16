@@ -24,6 +24,13 @@ function fakeChrome({ session = {}, local = {} } = {}) {
     tabs.set(tab.id, tab);
     return tab;
   };
+  // Like Chrome: a group whose last tab left or closed is gone (tabGroups.onRemoved).
+  const emptied = async (groupId) => {
+    if (groupId === -1 || !groupsById.has(groupId) || [...tabs.values()].some((t) => t.groupId === groupId)) return;
+    const group = groupsById.get(groupId);
+    groupsById.delete(groupId);
+    await hooks.onGroupRemoved?.(structuredClone(group));
+  };
   const getTab = (id) => {
     const tab = tabs.get(id);
     if (!tab) throw new Error(`No tab with id: ${id}`);
@@ -33,6 +40,7 @@ function fakeChrome({ session = {}, local = {} } = {}) {
     calls, tabsById: tabs, groupsById, hooks, gates, addTab, session, local,
     storage: { session: store(session), local: store(local) },
     runtime: { id: 'fowlbrowser-ext', getManifest: () => ({ version: '0.1.0' }), reload: () => calls.push(['reload']) },
+    extension: { isAllowedFileSchemeAccess: async () => !hooks.noFileAccess },
     windows: {
       async getLastFocused() { return { id: 1, type: 'normal', incognito: false }; },
       // Window 1, those of the tabs, and another window of the user's (holding a tab of theirs) unless the test says the
@@ -79,6 +87,7 @@ function fakeChrome({ session = {}, local = {} } = {}) {
           tabs.delete(id);
           calls.push(['tabs.remove', id]);
           await hooks.onRemoved?.(id, { windowId: tab.windowId, isWindowClosing: false });
+          await emptied(tab.groupId);
         }
       },
       async group({ groupId, tabIds }) {
@@ -99,7 +108,7 @@ function fakeChrome({ session = {}, local = {} } = {}) {
         for (const id of [ids].flat()) {
           const { groupId } = getTab(id);
           getTab(id).groupId = -1;
-          if (![...tabs.values()].some((t) => t.groupId === groupId)) groupsById.delete(groupId);
+          await emptied(groupId);
         }
         calls.push(['tabs.ungroup', ids]);
       },
@@ -109,6 +118,7 @@ function fakeChrome({ session = {}, local = {} } = {}) {
         calls.push(['tabGroups.update', id, props]);
         if (hooks.groupUpdateError) throw new Error(hooks.groupUpdateError);
         Object.assign(groupsById.get(id) ?? {}, props);
+        if (groupsById.has(id)) await hooks.onGroupUpdated?.(structuredClone(groupsById.get(id)));
       },
       async get(id) { return structuredClone(groupsById.get(id)); },
       async query() { return structuredClone([...groupsById.values()]); },
@@ -152,6 +162,8 @@ function setup(options = {}) {
   const sent = [];
   const core = createCore({ chrome, timers: options.timers, send: (msg) => msg.method !== 'extension.log' && sent.push(msg) });
   chrome.hooks.onRemoved = core.onTabRemoved;
+  chrome.hooks.onGroupRemoved = core.onTabGroupRemoved;
+  chrome.hooks.onGroupUpdated = core.onTabGroupUpdated;
   const connected = new Set();
   const connect = (client) => {
     connected.add(client);
@@ -485,7 +497,7 @@ test('claim refuses browser pages and turns a new tab page into about:blank', as
   assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && c[2].active));
 });
 
-test('local files and view-source: pages are never opened or claimed, however the URL is written', async () => {
+test('refused local files and view-source: pages are never opened or claimed, however the URL is written', async () => {
   const { call, chrome } = setup();
   const { result: tab } = await call(1, 'tabs.open', {});
   for (const url of ['file:///Users/me/.ssh/id_ed25519', 'fi\tle:///etc/passwd', ' FILE:///etc/passwd', '\u0001file:///etc/passwd',
@@ -494,7 +506,7 @@ test('local files and view-source: pages are never opened or claimed, however th
   }
   assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url: 'https://example.com/file:///x' }])).error);
   assert.equal(chrome.calls.filter((c) => c[0] === 'debugger.sendCommand' && c[2] === 'Page.navigate').length, 1, 'only the https one reached the tab');
-  for (const url of ['file:///Users/me/notes.txt', 'view-source:https://example.com/']) {
+  for (const url of ['file:///Users/me/.notes/notes.txt', 'view-source:https://example.com/']) {
     const local = chrome.addTab({ url });
     assert.match((await call(1, 'tabs.claim', { tabId: local.id })).error.message, /can't be controlled/, url);
   }
@@ -505,6 +517,60 @@ test('local files and view-source: pages are never opened or claimed, however th
   }
   assert.equal(chrome.calls.filter((c) => c[0] === 'tabs.create' || c[0] === 'windows.create').length, 1, 'only the first about:blank tab was created');
   assert.ok(!(await call(1, 'tabs.open', { url: 'https://example.com/file:///x' })).error);
+});
+
+// The MCP server resolves symlinks and is the real guard; this is the same rule on the URL's path alone.
+test('allowed local files open, navigate and claim like web pages; refused ones, a child frame showing one and file access off are refused', async () => {
+  const { call, chrome, core, sent } = setup();
+  const PROTO = 'file:///Users/me/Downloads/x/proto.html?variant=A';
+  const allowed = [PROTO, 'file:///Users/me/Library/Mobile%20Documents/com~apple~CloudDocs/a.html', 'file:///Users/me/Library/CloudStorage/Dropbox/a.html',
+    'file:///Users/me/proto%20one.html#top', 'file:///tmp/a.html'];
+  const refused = ['file:///Users/me/.ssh/id.html', 'file:///Users/me/%2Essh/id.html', 'file:///Users/me/Library/Keychains/x', 'file:///users/me/library/Cookies/x',
+    'file:///Users/me/Downloads/', 'file:///private/var/log/system.log', 'file:///System/Library/x.plist', 'file:///etc/hosts', 'file://server/share/a.html',
+    'file:///Users/me/a%E0.html'];
+  const { result: tab } = await call(1, 'tabs.open', { url: PROTO });
+  assert.equal(tab.url, PROTO);
+  for (const url of allowed) {
+    assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url }])).error, url);
+  }
+  for (const url of refused) {
+    assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Page.navigate', { url }])).error?.message ?? '', /is blocked: .*agents only open web pages .* and local files outside hidden folders/, url);
+    assert.match((await call(1, 'tabs.open', { url })).error?.message ?? '', /only open web pages/, url);
+    assert.match((await call(1, 'tabs.claim', { tabId: chrome.addTab({ url }).id })).error?.message ?? '', /can't be controlled/, url);
+  }
+  const users = chrome.addTab({ url: PROTO });
+  assert.ok(!(await call(1, 'tabs.claim', { tabId: users.id })).error);
+
+  // A child frame committing a refused file makes the tab leave, like its main frame would; an allowed one doesn't.
+  const detaches = () => chrome.calls.filter((c) => c[0] === 'debugger.detach' && c[1] === tab.id).length;
+  const evaluate = () => call(1, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Runtime.evaluate', { expression: '1' }]);
+  await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3']);
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 3, url: allowed[1] });
+  await core.onDebuggerEvent({ tabId: tab.id }, 'Page.frameNavigated', { frame: { id: 'f4', parentId: 'main', url: allowed[3] } });
+  assert.equal(detaches(), 0);
+  assert.ok(!(await evaluate()).error);
+  sent.length = 0;
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 3, url: 'file:///Users/me/.ssh/id.html' });
+  assert.equal(detaches(), 1);
+  assert.deepEqual(sent.map((m) => [m.method, m.params]), [['chrome.debugger.onDetach', [{ tabId: tab.id }, 'target_closed', { url: 'file:///Users/me/.ssh/id.html' }]]],
+    'the detach names the refused file');
+  assert.match((await evaluate()).error?.message ?? '', /agents can't control/);
+  // Back once the main frame commits a page again; a frame of the page's own process seen by the debugger first.
+  await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: PROTO });
+  await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3']);
+  assert.ok(!(await evaluate()).error);
+  await core.onDebuggerEvent({ tabId: tab.id }, 'Page.frameNavigated', { frame: { id: 'f5', parentId: 'main', url: 'file:///Users/me/Library/Keychains/k' } });
+  assert.equal(detaches(), 2);
+  assert.match((await evaluate()).error?.message ?? '', /agents can't control/);
+
+  // "Allow access to file URLs" off: Chrome wouldn't let the extension near file pages, so the agent is told what to ask for.
+  chrome.hooks.noFileAccess = true;
+  const { result: web } = await call(1, 'tabs.open', { url: 'https://example.com/' });
+  for (const reply of [await call(1, 'tabs.open', { url: PROTO }), await call(1, 'chrome.debugger.sendCommand', [{ tabId: web.id }, 'Page.navigate', { url: PROTO }]),
+    await call(1, 'tabs.claim', { tabId: chrome.addTab({ url: PROTO }).id })]) {
+    assert.match(reply.error?.message ?? '', /turn on "Allow access to file URLs" in FowlBrowser's Details on the extensions page/);
+  }
+  assert.ok(!(await call(1, 'chrome.debugger.sendCommand', [{ tabId: web.id }, 'Page.navigate', { url: 'https://example.org/' }])).error);
 });
 
 test('navigation checks work on Chrome 125, which has no URL.parse', async (t) => {
@@ -580,8 +646,8 @@ test('a tab whose page reaches a non-web page anyway is let go at once, and refu
   await core.onNavigationCommitted({ tabId: tab.id, frameId: 0, url: OWN_PAGE });
   assert.equal(detaches(), 1, 'detached once');
   assert.ok(core.owners.get(tab.id).detached);
-  assert.deepEqual(sent.map((m) => [m.method, m.params]), [['chrome.debugger.onDetach', [{ tabId: tab.id }, 'target_closed']]],
-    'the client hears a detach, and nothing of the page');
+  assert.deepEqual(sent.map((m) => [m.method, m.params]), [['chrome.debugger.onDetach', [{ tabId: tab.id }, 'target_closed', { url: OWN_PAGE }]]],
+    'the client hears a detach naming the page, and nothing of the page');
   await core.onDebuggerEvent({ tabId: tab.id }, 'Runtime.consoleAPICalled', { type: 'log', args: [] });
   assert.equal(sent.length, 1, 'events still on their way are dropped');
   assert.match((await evaluate()).error?.message ?? '', /agents can't control/);
@@ -718,7 +784,7 @@ test('a navigation toward a non-web page detaches the tab as it starts, before a
   sent.length = 0;
   await core.onBeforeNavigate({ tabId: tab.id, frameId: 0, url: OWN_PAGE });
   assert.equal(detaches(tab.id), 1);
-  assert.deepEqual(sent.map((m) => [m.method, m.params]), [['chrome.debugger.onDetach', [{ tabId: tab.id }, 'target_closed']]]);
+  assert.deepEqual(sent.map((m) => [m.method, m.params]), [['chrome.debugger.onDetach', [{ tabId: tab.id }, 'target_closed', { url: OWN_PAGE }]]]);
   assert.match((await evaluate(tab.id)).error?.message ?? '', /agents can't control/);
   assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error?.message ?? '', /agents can't control/);
   assert.equal(detaches(other.id), 0, 'other tabs are untouched');
@@ -1287,7 +1353,8 @@ test('tabs given to the user at the same moment make one group; each client and 
   assert.ok(!groups.has(-1));
   assert.equal(chrome.tabsById.get(other.reply().result.id).groupId, -1, "another client's lone tab is not theirs to group");
   const { result: named } = await call(1, 'tabs.open', { url: 'https://example.com/named', forUser: true, group: 'Results' });
-  assert.equal(chrome.tabsById.get(named.id).groupId, -1, 'another title starts its own batch');
+  const namedGroup = chrome.tabsById.get(named.id).groupId;
+  assert.ok(namedGroup !== -1 && !groups.has(namedGroup), 'a named title gets a group of its own at once');
 });
 
 test('a tab the user moved out of the given group, or into one of theirs, is left there', async () => {
@@ -1303,6 +1370,181 @@ test('a tab the user moved out of the given group, or into one of theirs, is lef
   const theirs = await chrome.tabs.group({ tabIds: [d.id] }); // the user puts it in a group of their own
   const { result: e } = await call(2, 'tabs.open', { url: 'https://example.com/e', forUser: true });
   assert.deepEqual([d, e].map((t) => chrome.tabsById.get(t.id).groupId), [theirs, -1]);
+});
+
+// A redo: tab_open for_user with the same group and URLs in a later turn reloads the earlier tabs in place.
+const REDO = 'Nearby places prototypes';
+const redo = (call, client, url) => call(client, 'tabs.open', { forUser: true, group: REDO, matchUrl: url });
+// The MCP server navigates a tab after tabs.open; the fake browser only needs the URL it ends up on.
+const shows = (chrome, tab, url) => { chrome.tabsById.get(tab.id).url = url; };
+
+test('a named group for the user: a lone tab gets it at once; a redo reloads the tab with the same URL, a new URL joins', async () => {
+  const { core, chrome, call, sent } = setup();
+  const groupOf = (tab) => chrome.tabsById.get(tab.id).groupId;
+  const { result: a } = await redo(call, 1, 'http://localhost:5263/?variant=A');
+  const given = groupOf(a);
+  assert.notEqual(given, -1, 'grouped although alone');
+  assert.deepEqual(chrome.groupsById.get(given), { id: given, title: REDO, color: colorFor(REDO), collapsed: false });
+  assert.equal(a.reused, undefined);
+  shows(chrome, a, 'http://localhost:5263/?variant=A#map'); // a fragment doesn't count
+  const { result: b } = await redo(call, 1, 'http://localhost:5263/?variant=B');
+  shows(chrome, b, 'http://localhost:5263/?variant=B');
+  assert.equal(groupOf(b), given);
+  assert.deepEqual(b.groupTabs, [], 'tabs this client controls are not listed');
+  for (const tab of [a, b]) assert.ok(!(await call(1, 'tabs.release', { tabId: tab.id })).error); // the turn ends
+
+  sent.length = 0;
+  chrome.calls.length = 0;
+  const count = chrome.tabsById.size;
+  const { result: again } = await redo(call, 1, 'http://localhost:5263/?variant=A');
+  assert.equal(again.id, a.id, 'the same tab');
+  assert.equal(again.reused, true);
+  assert.equal(chrome.tabsById.size, count, 'no new tab');
+  assert.deepEqual(core.owners.get(a.id), { client: 1, origin: 'agent', group: REDO, named: true, kept: true, handedOver: true, givenGroup: given, agentMuted: true },
+    'taken like a new tab for the user');
+  assert.equal(chrome.session.owners[a.id].givenGroup, given, 'persisted');
+  assert.deepEqual([chrome.tabsById.get(a.id).mutedInfo.muted, chrome.tabsById.get(a.id).active, groupOf(a)], [true, false, given]);
+  assert.ok(sent.some((m) => m.method === 'chrome.tabs.onCreated' && m.client === 1 && m.params[0].id === a.id), 'announced for attaching');
+  assert.deepEqual(again.groupTabs, [{ id: b.id, title: '', url: 'http://localhost:5263/?variant=B' }], 'the group\'s other tabs');
+  assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.create' || c[0] === 'tabs.group' || (c[0] === 'tabs.update' && 'active' in c[2])),
+    'never created, moved or activated');
+
+  const { result: c } = await redo(call, 1, 'http://localhost:5263/?variant=C');
+  assert.ok(c.id !== a.id && c.id !== b.id);
+  assert.equal(groupOf(c), given, 'a new URL joins the same group');
+  assert.deepEqual(c.groupTabs.map((t) => t.id), [b.id]);
+  assert.equal(chrome.groupsById.size, 1, 'one group');
+
+  // The next turn end lets it go like any tab given to the user: open, unmuted, still in the group.
+  assert.ok(!(await call(1, 'tabs.release', { tabId: a.id })).error);
+  assert.deepEqual([chrome.tabsById.has(a.id), chrome.tabsById.get(a.id).mutedInfo.muted, groupOf(a)], [true, false, given]);
+});
+
+test('a redo reloads the user\'s muted tab without ending their mute, and a tab still this client\'s without announcing it again', async () => {
+  const { core, chrome, call, sent } = setup();
+  const { result: a } = await redo(call, 1, 'https://example.com/a');
+  shows(chrome, a, 'https://example.com/a');
+  const { result: same } = await redo(call, 1, 'https://example.com/a'); // the same turn, say a subagent
+  assert.deepEqual([same.id, same.reused, same.yours], [a.id, true, true]);
+  assert.equal(sent.filter((m) => m.method === 'chrome.tabs.onCreated' && m.params[0].id === a.id).length, 1, 'attached once');
+  await call(1, 'tabs.release', { tabId: a.id });
+  await chrome.tabs.update(a.id, { muted: true }); // the user mutes it
+  const { result: again } = await redo(call, 1, 'https://example.com/a');
+  assert.equal(again.id, a.id);
+  assert.equal(core.owners.get(a.id).agentMuted, undefined);
+  await call(1, 'tabs.release', { tabId: a.id });
+  assert.equal(chrome.tabsById.get(a.id).mutedInfo.muted, true, 'their mute stays');
+});
+
+test('only groups made for the user are reused: never the user\'s own group with that title, nor one renamed or removed since', async () => {
+  const { chrome, call } = setup();
+  const groupOf = (tab) => chrome.tabsById.get(tab.id).groupId;
+  const url = 'https://example.com/a';
+  const theirs = chrome.addTab({ url });
+  const theirGroup = await chrome.tabs.group({ tabIds: [theirs.id] });
+  await chrome.tabGroups.update(theirGroup, { title: REDO });
+  const { result: first } = await redo(call, 1, url);
+  assert.notEqual(first.id, theirs.id);
+  assert.ok(![-1, theirGroup].includes(groupOf(first)), 'a group of its own');
+  assert.deepEqual(first.groupTabs, [], 'nothing of the user\'s group listed');
+  shows(chrome, first, url);
+  await call(1, 'tabs.release', { tabId: first.id });
+
+  const renamed = groupOf(first);
+  await chrome.tabGroups.update(renamed, { title: 'My picks' }); // the user renames it: theirs now
+  assert.equal(chrome.session.givenGroups[renamed], undefined, 'forgotten');
+  await chrome.tabGroups.update(renamed, { title: REDO }); // and back: still theirs
+  const { result: second } = await redo(call, 1, url);
+  assert.ok(![first.id, theirs.id].includes(second.id));
+  assert.ok(![-1, theirGroup, renamed].includes(groupOf(second)));
+  shows(chrome, second, url);
+  await call(1, 'tabs.release', { tabId: second.id });
+
+  const removed = groupOf(second);
+  assert.equal(chrome.session.givenGroups[removed], REDO);
+  await chrome.tabs.remove(second.id); // the user closes its last tab: Chrome removes the group
+  assert.equal(chrome.session.givenGroups[removed], undefined, 'forgotten');
+});
+
+test('a redo never takes a tab another client controls or one the user moved out of the group; racing clients get one each', async () => {
+  const { chrome, call, start } = setup();
+  const groupOf = (tab) => chrome.tabsById.get(tab.id).groupId;
+  const url = 'https://example.com/a';
+  const { result: a } = await redo(call, 1, url);
+  shows(chrome, a, url);
+  await call(1, 'tabs.release', { tabId: a.id });
+  const given = groupOf(a);
+
+  assert.ok(!(await call(2, 'tabs.claim', { tabId: a.id })).error);
+  const { result: beside } = await redo(call, 1, url);
+  assert.notEqual(beside.id, a.id, 'another client has it');
+  assert.equal(groupOf(beside), given);
+  shows(chrome, beside, 'https://example.com/other');
+  await call(1, 'tabs.release', { tabId: beside.id });
+  await call(2, 'tabs.release', { tabId: a.id });
+
+  const one = start(1, 'tabs.open', { forUser: true, group: REDO, matchUrl: url });
+  const other = start(3, 'tabs.open', { forUser: true, group: REDO, matchUrl: url });
+  await Promise.all([one.done, other.done]);
+  const ids = [one.reply().result, other.reply().result];
+  assert.deepEqual(ids.map((t) => t.reused === true).sort(), [false, true], 'one reuses it, the other opens a tab');
+  assert.ok(ids.some((t) => t.id === a.id));
+  assert.deepEqual(ids.map(groupOf), [given, given]);
+  for (const [client, t] of [[1, ids[0]], [3, ids[1]]]) await call(client, 'tabs.release', { tabId: t.id });
+
+  await chrome.tabs.ungroup(a.id); // the user drags it out of the group
+  const { result: after } = await redo(call, 1, url);
+  assert.notEqual(after.id, a.id, 'out of the group, out of reach');
+  assert.equal(groupOf(a), -1);
+});
+
+test('a redo matches the URL as Chrome shows it: a bare host is its root page', async () => {
+  const { chrome, call } = setup();
+  const { result: a } = await redo(call, 1, 'https://Example.com');
+  shows(chrome, a, 'https://example.com/'); // what Chrome shows for it
+  await call(1, 'tabs.release', { tabId: a.id });
+  const { result: again } = await redo(call, 2, 'https://Example.com');
+  assert.deepEqual([again.id, again.reused], [a.id, true]);
+});
+
+test('a redo never takes a tab the user moved into the group themselves, also after a worker restart', async () => {
+  const { chrome, call } = setup();
+  const groupOf = (tab) => chrome.tabsById.get(tab.id).groupId;
+  const { result: a } = await redo(call, 1, 'https://example.com/a');
+  shows(chrome, a, 'https://example.com/b'); // the agent's tab went on to another page
+  await call(1, 'tabs.release', { tabId: a.id });
+  const given = groupOf(a);
+  const theirs = chrome.addTab({ url: 'https://example.com/a' }); // the user's own tab, dragged into the group
+  await chrome.tabs.group({ groupId: given, tabIds: [theirs.id] });
+  const { result: again } = await redo(call, 2, 'https://example.com/a');
+  assert.notEqual(again.id, theirs.id, 'the user\'s tab is left alone');
+  assert.equal(again.reused, undefined);
+  assert.equal(groupOf(again), given, 'the new tab joins the group');
+  shows(chrome, again, 'https://example.com/a');
+  await call(2, 'tabs.release', { tabId: again.id });
+
+  const sent = [];
+  const core = createCore({ chrome, send: (msg) => sent.push(msg) }); // the restarted worker remembers which tabs were given
+  await core.ready;
+  await core.handleMessage({ method: 'host.clientConnected', params: { client: 3 } });
+  await core.handleMessage({ id: 1, method: 'tabs.open', params: { forUser: true, group: REDO, matchUrl: 'https://example.com/a' }, client: 3 });
+  assert.deepEqual([sent.find((m) => m.id === 1).result.id, sent.find((m) => m.id === 1).result.reused], [again.id, true]);
+});
+
+test('the groups made for the user survive a worker restart', async () => {
+  const { chrome, call } = setup();
+  const url = 'https://example.com/a';
+  const { result: a } = await redo(call, 1, url);
+  shows(chrome, a, url);
+  await call(1, 'tabs.release', { tabId: a.id });
+
+  const sent = [];
+  const core = createCore({ chrome, send: (msg) => sent.push(msg) }); // the restarted worker
+  await core.ready;
+  await core.handleMessage({ method: 'host.clientConnected', params: { client: 1 } });
+  await core.handleMessage({ id: 1, method: 'tabs.open', params: { forUser: true, group: REDO, matchUrl: url }, client: 1 });
+  const reply = sent.find((m) => m.id === 1);
+  assert.deepEqual([reply.result.id, reply.result.reused], [a.id, true]);
 });
 
 test('a tab the user took out of the given group while its own open was still under way stays out', { timeout: 5000 }, async () => {

@@ -14,7 +14,7 @@ const CLOSED = 'Target page, context or browser has been closed';
 function setup({ itself = true, during = true, answerFails = false } = {}) {
   let closed = false;
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://idp.example/consent', mainFrame: () => page,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://idp.example/consent', mainFrame: () => page, frames: () => [page],
     isClosed: () => closed,
     keyboard: {
       async press() {

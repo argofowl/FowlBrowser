@@ -12,7 +12,7 @@ import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
 import { uninstallPopups } from './popups.mjs';
 import { tabEvent } from './record.mjs';
-import { sleep, tabInfo } from './util.mjs';
+import { localFileBlock, sleep, tabInfo } from './util.mjs';
 import { clearViewport } from './viewport.mjs';
 
 const BEFORE_MS = 50; // an agent window starts this much before its command was sent (clock skew)
@@ -118,6 +118,10 @@ export function notice(key) {
   if (record.kind === 'handoff') {
     return `You handed ${key} to the user at ${clock(record.at)} (${record.reason}); wait until they say they are done, then tab_claim it with resume: true.`;
   }
+  if (record.localFile) {
+    return `FowlBrowser let go of ${key} at ${clock(record.at)} (${record.how}): it is the user's tab now and nothing of it is read. ` +
+      'Don\'t open that file another way; tell the user, and go on in another tab.';
+  }
   return `The user took over ${key} at ${clock(record.at)} (${record.how}). Stop working in that tab, tell the user where you got to, and ask before going on.` +
     (record.gone ? '' : ' If they say to carry on there, call tab_claim on it with resume: true.');
 }
@@ -204,10 +208,10 @@ export function markEnding(key) {
 // The user took the tab over (its debugger went, or it closed): noted at once (so every later signal and call sees it),
 // parked, journaled. Nothing is cleaned up in the page: without the debugger nothing reaches it (the cursor overlay
 // fades on its own idle timer, the popup scripts switch themselves off).
-export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tabId), gone = false } = {}) {
+export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tabId), gone = false, localFile = false } = {}) {
   const key = keyOf(browser, tabId);
   if (records.has(key) || browser.host.closed) return;
-  records.set(key, { kind: 'takeover', at: Date.now(), tabId, how, gone });
+  records.set(key, { kind: 'takeover', at: Date.now(), tabId, how, gone, localFile });
   unseen.add(key);
   debug('takeover', key, how);
   const url = tab?.page.url();
@@ -292,7 +296,7 @@ export function watchTakeovers(browser) {
   };
   browser.host.on('event', (method, params) => {
     if (browser.host.closed) return; // drained after the connection ended: its tabs are no longer this session's
-    if (method === 'chrome.debugger.onDetach') onDetach(browser, params?.[0]?.tabId, params?.[1]).catch((e) => debug('takeover: detach', e.message));
+    if (method === 'chrome.debugger.onDetach') onDetach(browser, params?.[0]?.tabId, params?.[1], params?.[2]?.url).catch((e) => debug('takeover: detach', e.message));
     else if (method === 'chrome.tabs.onRemoved') onRemoved(browser, params?.[0], params?.[1]).catch((e) => debug('takeover: removed', e.message));
     else if (method === 'chrome.debugger.onEvent') {
       const [source, cdpMethod, cdpParams] = params ?? [];
@@ -317,7 +321,8 @@ const BROWSER_PAGE = /^(chrome|chrome-extension|chrome-search|chrome-untrusted|d
 const appLink = (url) => /^[a-z][a-z0-9+.-]*:/i.test(url ?? '') && !BROWSER_PAGE.test(url)
   && !/^(https?|data|blob|javascript|file|filesystem|view-source|wss?):/i.test(url);
 
-async function onDetach(browser, tabId, reason) {
+// left: the page or frame the extension let the tab go for (a page agents may not drive), when it says.
+async function onDetach(browser, tabId, reason, left) {
   const key = keyOf(browser, tabId);
   if (reason === 'parked' || records.has(key)) return;
   const detachedAt = Date.now();
@@ -346,8 +351,12 @@ async function onDetach(browser, tabId, reason) {
       // The user's input near the detach, however long the checks above took.
       if (!judging.get(tab)?.size && !((usersInput.get(key) ?? -Infinity) >= detachedAt - KEEP_MS) && await reattach(browser, tabId, link, url, tab)) return;
     }
-    const how = BROWSER_PAGE.test(info.url) && info.url !== 'about:blank' ? `opened a browser page (${info.url.slice(0, 60)})` : 'took the tab out of the agent\'s control';
-    await takeOver(browser, tabId, how, { tab });
+    // A local file agents may not open, in the page or a frame (an allowed file can frame any other): no one took over,
+    // FowlBrowser let the tab go. Named for what it is, so the agent neither blames the user nor tries the file again.
+    const refused = /^file:/i.test(left ?? '') ? localFileBlock(left) : null;
+    const how = refused ? `it showed a local file agents can't open: ${refused}`
+      : BROWSER_PAGE.test(info.url) && info.url !== 'about:blank' ? `opened a browser page (${info.url.slice(0, 60)})` : 'took the tab out of the agent\'s control';
+    await takeOver(browser, tabId, how, { tab, localFile: !!refused });
   })();
   if (link) {
     recovering.set(key, judged);

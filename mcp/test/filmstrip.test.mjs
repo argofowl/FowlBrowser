@@ -10,7 +10,7 @@ function setup({ dialogAfter = Infinity } = {}) {
   const shots = []; // { at, options } per capture
   let tab;
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://app.example/', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     keyboard: { press: async () => { page.pressedAt = Date.now(); } },
     ariaSnapshot: async () => '- button "Open" [ref=e1]',
     async screenshot(options) {

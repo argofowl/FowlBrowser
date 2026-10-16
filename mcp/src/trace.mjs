@@ -424,7 +424,7 @@ async function stopRecording(tab) {
   }
 }
 
-async function stop(tab, header, text) {
+async function stop(tab, { header, text, blockedSince }) {
   if (!tab.trace?.startedAt) throw new Error('No trace is recording in this tab. Call trace_start first.');
   // A tab closing from here on ends the recording through this stop (endRecording releases): never mid-parse.
   tab.page.off('close', tab.trace.release);
@@ -442,10 +442,13 @@ async function stop(tab, header, text) {
     tab.page.on('close', tab.trace.release);
     throw new Error(`Chrome did not stop the recording: ${error.message.replace(/\.$/, '')}. Call trace_stop again.`);
   }
-  // The tab showed a local file while it recorded: its screenshots and sources may hold the file, so nothing is kept.
-  if (tab.localPageAt >= tab.trace.startedAt) {
+  // The tab showed, framed or loaded (an <img>, a <script>: browsers.mjs Tab.loaded) a refused local file while it
+  // recorded, or while the recording was set up (trace.before, read as trace_start began): its screenshots and sources
+  // may hold the file, so nothing is kept.
+  if (blockedSince(tab, tab.trace.before)) {
     endRecording(tab);
-    throw new Error('The tab showed a local file during the recording, which FowlBrowser doesn\'t record, so the trace was discarded. Start a new one on a web page.');
+    throw new Error('The tab showed or loaded a local file agents can\'t open during the recording, which FowlBrowser doesn\'t record, so the trace was discarded. ' +
+      'Start a new one on a web page or an allowed local file.');
   }
   try {
     const { gz, dataLoss } = recording;
@@ -468,7 +471,8 @@ function endRecording(tab) {
   tab.trace.release = null;
 }
 
-export function registerTrace(tool, manager, { withTab, header, text, tabArg }) {
+export function registerTrace(tool, manager, helpers) {
+  const { withTab, header, text, tabArg, refuseBlockedPage } = helpers;
   tool('trace_start',
     'Record a performance trace of a tab, as DevTools\' Performance panel does (timeline, JS samples, screenshots), and analyze it with DevTools\' own insights: ' +
     'LCP with its subparts, INP, CLS, long tasks, and what fails (render-blocking requests, image delivery, caching, DOM size, third parties, layout shift culprits...). ' +
@@ -482,6 +486,7 @@ export function registerTrace(tool, manager, { withTab, header, text, tabArg }) 
     },
     withTab(async (tab, { reload = true, auto_stop: autoStop = true, seconds = 5 }) => {
       if (tab.trace?.startedAt) throw new Error('A trace is already recording in this tab. Call trace_stop to end it.');
+      const before = tab.blockedPageAt; // before any wait: a refused file the page loads during the set-up is seen too
       const url = tab.page.url();
       if (reload && await isUsersTab(tab)) {
         throw new Error('This is the user\'s own tab, so it was not reloaded. Open the URL in your own tab (tab_open) and trace there, or pass reload false to record the page as it is.');
@@ -515,12 +520,13 @@ export function registerTrace(tool, manager, { withTab, header, text, tabArg }) 
         }
         throw error;
       }
-      tab.trace = { ...tab.trace, startedAt: Date.now(), url, release, waitedMs };
+      tab.trace = { ...tab.trace, startedAt: Date.now(), before, url, release, waitedMs }; // before, not startedAt, decides the stop's discard
       tab.page.on('close', release); // a closed tab ends Chrome's recording too; endRecording removes it
       if (tab.page.isClosed?.()) { endRecording(tab); throw new Error('The tab closed while the trace started.'); } // closed before the listener
       try {
         takenOver(); // during the start: the recording ends, the user's page is left alone
         if (reload) await tab.page.goto(url, { waitUntil: 'load' });
+        refuseBlockedPage(tab, before); // it loaded a refused file while the recording was set up: it is ended unkept
       } catch (error) {
         // A recording still live because its end was refused stays tracked, with the slot: trace_stop ends it (or
         // its tab's close). One Chrome did stop (the trace itself was lost) or whose tab is gone is let go of.
@@ -537,14 +543,14 @@ export function registerTrace(tool, manager, { withTab, header, text, tabArg }) 
         return text(`${await header(tab)}\nTrace recording${reload ? ' (page reloaded)' : ''}. Do what you want to measure, then call trace_stop.`);
       }
       await sleep(seconds * 1000);
-      return stop(tab, header, text);
+      return stop(tab, helpers);
     }));
 
   tool('trace_stop',
     'Stop the trace recording in a tab (started by trace_start with auto_stop false), save it and return the analysis: LCP with subparts, INP, CLS, long tasks, ' +
     'failing insights with estimated savings, and the path of the trace file. Then trace_insight gives the details of one insight.',
     { tab: tabArg },
-    withTab((tab) => stop(tab, header, text)));
+    withTab((tab) => stop(tab, helpers)));
 
   tool('trace_insight',
     'Details of one insight from the tab\'s last trace (trace_start or trace_stop): what it checks, its state, estimated savings, and its data, ' +

@@ -12,7 +12,7 @@ function setup({ closes = false } = {}) {
   let closed = false;
   let tab;
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://shop.example/cart', mainFrame: () => page, isClosed: () => closed,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://shop.example/cart', mainFrame: () => page, frames: () => [page], isClosed: () => closed,
     keyboard: {
       // Enter places the order; the page then runs a long script (or closes its own tab, as payment popups do).
       press: async (key) => {
@@ -62,7 +62,7 @@ test('a page that closed its own tab after the action still says so', async () =
 test('a dialog answered on a page too busy to read afterwards is reported answered, not failed', async () => {
   const answered = [];
   const page = Object.assign(new EventEmitter(), {
-    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://shop.example/orders', mainFrame: () => page, isClosed: () => false,
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://shop.example/orders', mainFrame: () => page, frames: () => [page], isClosed: () => false,
     ariaSnapshot: async () => { throw new Error('page.ariaSnapshot: Timeout 10000ms exceeded.'); },
     on: EventEmitter.prototype.on, off: EventEmitter.prototype.off,
   });
