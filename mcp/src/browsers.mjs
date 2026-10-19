@@ -11,7 +11,7 @@ import { debug } from './debug.mjs';
 import { HostClient, listSockets, SOCKET_DIR } from './hostClient.mjs';
 import { installPopups } from './popups.mjs';
 import { downloadDone, record } from './record.mjs';
-import { currentCall, heldBack, notice, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
+import { currentCall, heldBack, notice, onTakeover, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
 import { isBlockedUrl, localFileBlock, sleep, tabInfo, within } from './util.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
 import { keepViewportSize } from './viewport.mjs';
@@ -446,29 +446,37 @@ export class Browser {
     }
   }
 
-  // Resolves the Tab once Playwright has a page for this chrome tab.
+  // Resolves the Tab once Playwright has a page for this chrome tab. One let go (the user took over, or it showed a local
+  // file agents can't open, also before it was ever attached) fails with its notice at once, or as that is noted while
+  // this waits, not at the timeout; a call that works on parked tabs (tab_claim resuming one) waits for the tab itself.
   async waitForTab(tabId, timeout = ACTION_TIMEOUT_MS) {
     await this.playwright();
     if (this.tabs.has(tabId)) return this.tabs.get(tabId);
-    let resolve;
-    const mapped = new Promise((r) => { resolve = r; });
+    const key = `${this.key}:${tabId}`;
+    const parked = !currentCall()?.onParked && notice(key);
+    if (parked) throw new Error(parked);
+    let resolve, takenOver;
+    const mapped = new Promise((r, reject) => { resolve = r; takenOver = (text) => reject(new Error(text)); });
     if (!this._waiters.has(tabId)) this._waiters.set(tabId, new Set());
     this._waiters.get(tabId).add(resolve);
+    const stopListening = onTakeover(key, takenOver);
     let timer;
     const timedOut = new Promise((_, reject) => {
       timer = setTimeout(() => {
-        this._waiters.get(tabId)?.delete(resolve);
-        if (!this._waiters.get(tabId)?.size) this._waiters.delete(tabId);
-        // Let go meanwhile (the user took over, or it showed a local file agents can't open before it was ever attached): say so.
-        const parkedNotice = notice(`${this.key}:${tabId}`);
+        const parkedNotice = notice(key);
         if (parkedNotice) return reject(new Error(parkedNotice));
         const detached = this.relay.model.hasTab(tabId) && !this.relay.model.isAttached(tabId);
-        reject(new Error(`Tab ${this.key}:${tabId} did not become controllable within ${timeout / 1000} s.` + (detached
+        reject(new Error(`Tab ${key} did not become controllable within ${timeout / 1000} s.` + (detached
           ? ' Its debugger is detached (the user canceled debugging or opened DevTools on it); it is still yours. Call tab_claim on it to re-attach (DevTools must be closed).'
           : '')));
       }, timeout);
     });
-    return Promise.race([mapped, timedOut]).finally(() => clearTimeout(timer));
+    return Promise.race([mapped, timedOut]).finally(() => {
+      clearTimeout(timer);
+      stopListening();
+      this._waiters.get(tabId)?.delete(resolve);
+      if (!this._waiters.get(tabId)?.size) this._waiters.delete(tabId);
+    });
   }
 }
 

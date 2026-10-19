@@ -15,6 +15,9 @@ const MASKED = '"••••••••"';
 
 export default {
   name: 'security',
+  // FowlBrowser lets two of its tabs go (a hidden file, its own page): the notices about that start the session's next
+  // results, which on the shared server would be other jobs'.
+  ownServer: true,
   async run(t) {
     const refused = async (name, args, pattern) => {
       const error = await t.call(name, args).then(() => null, (e) => e);
@@ -66,7 +69,7 @@ export default {
       if (framed) {
         for (const [name, args] of [['snapshot', {}], ['snapshot', { mode: 'text' }], ['evaluate', { function: '() => document.title' }]]) {
           const read = await t.call(name, { tab: framed, ...args }).then((r) => r.text, (e) => e.message);
-          t.ok(!read.includes(hiddenText) && /can't open|can't control|can't be controlled|unavailable|not controlled|did not become controllable/.test(read), `${name} of the framing tab refused: ${read.slice(0, 800)}`);
+          t.ok(!read.includes(hiddenText) && /can't open|can't control|can't be controlled|unavailable|not controlled/.test(read), `${name} of the framing tab refused: ${read.slice(0, 800)}`);
         }
       }
 

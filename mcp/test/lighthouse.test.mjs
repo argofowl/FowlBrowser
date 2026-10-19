@@ -2,8 +2,10 @@
 import assert from 'node:assert/strict';
 import EventEmitter from 'node:events';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 import { auditor, formatResult, restore, rootSession } from '../src/lighthouse.mjs';
 import { TRACE_WAIT } from '../src/perf.mjs';
@@ -469,6 +471,68 @@ test('an audit during which the page loaded a refused local file is discarded: n
     assert.equal(ok.isError, undefined, ok.content[0].text);
     assert.equal(reports.length, 1);
     fs.rmSync(path.dirname(/Report: (\S+)/.exec(ok.content[0].text)[1]), { recursive: true });
+  } finally {
+    auditor.load = real;
+  }
+});
+
+// Measured on a test Mac at --parallel 4 (2026-10-19): Lighthouse's own about:blank went through the debugger (the
+// extension's origin and process), the audited load then landed in a renderer Chrome started during the recording, and
+// the run failed with NO_NAVSTART. The page goes to about:blank itself first (trace.mjs blank) and Lighthouse skips its own.
+test('a navigation run blanks the page from the page itself, then has Lighthouse load the URL without its own about:blank', async (t) => {
+  const { Tab } = await import('../src/browsers.mjs');
+  const { registerTools } = await import('../src/tools.mjs');
+  let shown = 'https://app.example/';
+  const page = Object.assign(new EventEmitter(), {
+    setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => shown, mainFrame: () => page, frames: () => [page], isClosed: () => false,
+    async waitForURL(u) { sent.push(`waitForURL ${u}`); }, async reload() { sent.push('reload'); },
+  });
+  const sent = [];
+  const host = Object.assign(new EventEmitter(), {
+    async request(method, params) {
+      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'App', url: shown } };
+      if (method === 'tabs.info') return { id: 12, owner: 'you', origin: 'agent' };
+      sent.push(params?.[1] === 'Runtime.evaluate' ? `Runtime.evaluate ${params[2].expression}` : params?.[1] ?? method);
+      // The empty trace that checks the browser's tracing is free.
+      if (params?.[1] === 'Tracing.end') setImmediate(() => host.emit('chrome.debugger.onEvent', [{ tabId: 12 }, 'Tracing.tracingComplete', { stream: 's0' }]));
+      return {};
+    },
+  });
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { viewports: new Map(), model: { hasTab: () => true, _knownTabs: new Map() } } };
+  browser.waitForTab = async (id) => browser.tabs.get(id);
+  const tab = new Tab(browser, 12, page);
+  browser.tabs.set(12, tab);
+  const tools = {};
+  registerTools({ registerTool: (name, meta, handler) => { tools[name] = handler; } }, { get: async () => browser, all: async () => [browser] });
+  let run;
+  const real = auditor.load;
+  auditor.load = async () => ({
+    navigation: async (_page, url, { flags }) => {
+      run = { url, skipAboutBlank: flags.skipAboutBlank, before: [...sent] };
+      if (!/^https?:/.test(url)) throw new Error('INVALID_URL'); // as Lighthouse 13.5, before it does anything
+      return { lhr: fakeLhr() };
+    },
+    generateReport: () => '<html>',
+  });
+  try {
+    const result = await tools.lighthouse({ tab: tab.id, mode: 'navigation' });
+    assert.equal(result.isError, undefined, result.content[0].text);
+    fs.rmSync(path.dirname(/Report: (\S+)/.exec(result.content[0].text)[1]), { recursive: true });
+    assert.equal(run.url, 'https://app.example/', 'the URL read before the blank');
+    assert.equal(run.skipAboutBlank, true, 'Lighthouse does not blank the page through the debugger');
+    assert.deepEqual(run.before.slice(-2), ['Runtime.evaluate location.replace("about:blank")', 'waitForURL about:blank'], 'the page blanked itself just before the run');
+    assert.ok(!sent.includes('Page.navigate'), sent.join(', '));
+    // A local file Lighthouse refuses: left as it is, not blanked first.
+    const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'fb-lh-')));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(dir, 'proto.html'), '<p>A</p>');
+    shown = pathToFileURL(path.join(dir, 'proto.html')).href;
+    tab._newDocument(shown);
+    sent.length = 0;
+    const refused = await tools.lighthouse({ tab: tab.id, mode: 'navigation' });
+    assert.equal(refused.isError, true);
+    assert.match(refused.content[0].text, /INVALID_URL/);
+    assert.ok(!sent.some((s) => s.startsWith('Runtime.evaluate') || s.startsWith('waitForURL')), sent.join(', '));
   } finally {
     auditor.load = real;
   }

@@ -47,6 +47,8 @@ const waitsOnPage = (method, params) => method === 'Page.navigate' || (/^Runtime
 const EXPECT_CHILD_MAX_MS = 5000;     // also how long the user's turn of a tab lasts (a page's transient activation)
 const LAST_OWNED_MS = 5000; // how long a closed owned tab can still open the popup it asked for (tabs.openChild)
 const CLEANUP_RETRY_MS = [200, 1000];
+const SWAP_RETRY_MS = 50; // a page between documents is asked again this often (onActivePage),
+const SWAP_TRIES = 40; // this many times (2 s)
 const DOWNLOAD_MATCH_MS = 10_000;      // how long downloads and Page.downloadWillBegin signals are kept for matching
 const DOWNLOAD_SETTLE_MS = 800;        // quiet time after the latest of them before any is attributed
 const DOWNLOAD_PAIR_MS = 2000;         // a download and its tab's signal arrive this close together, or they don't pair
@@ -329,6 +331,20 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function requireFileAccess(url) {
     if (isFileUrl(url) && !(await chrome.extension.isAllowedFileSchemeAccess())) {
       throw new Error(`${url} can't be opened: FowlBrowser has no access to local files. Ask the user to turn on "Allow access to file URLs" in FowlBrowser's Details on the extensions page`);
+    }
+  }
+
+  // A command to a tab whose page is between documents, as a new tab's first cross-site page commits, fails with "Not
+  // attached to an active page" while Chrome swaps the page the debugger is on (seen on Helium: an OAuth popup attached
+  // just then failed its attach, and the agent could never drive it). The debugger stays attached: asked again shortly.
+  async function onActivePage(tabId, method, params) {
+    for (let tries = 1; ; tries++) {
+      try {
+        return await chrome.debugger.sendCommand({ tabId }, method, params);
+      } catch (error) {
+        if (tries >= SWAP_TRIES || !/Not attached to an active page/.test(String(error?.message))) throw error;
+      }
+      await new Promise((resolve) => timers.setTimeout(resolve, SWAP_RETRY_MS));
     }
   }
 
@@ -984,7 +1000,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         // would run there with the extension's powers before any commit is seen (leftTheWeb). Checked at every attach
         // (tab_open, claim, resume), which is enough: an agent tab never gains such an entry later (Page.navigate and
         // navigateToHistoryEntry go to web pages only, and Chrome keeps web pages from this extension's pages).
-        const history = await chrome.debugger.sendCommand({ tabId }, 'Page.getNavigationHistory').catch(async (error) => {
+        const history = await onActivePage(tabId, 'Page.getNavigationHistory').catch(async (error) => {
           await chrome.debugger.detach({ tabId }).catch(() => {});
           throw error;
         });
@@ -1004,7 +1020,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         }
         blankedByUs.delete(tabId);
         // Background tabs stop painting and running rAF without focus emulation.
-        await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+        await onActivePage(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true });
         await chrome.debugger.sendCommand({ tabId }, 'Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
       } catch (error) {
         if (owner.parked?.resuming) await serialize(tabId, () => rollBack(tabId, owner)).catch(() => {});

@@ -5,10 +5,11 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import zlib from 'node:zlib';
 import { z } from 'zod';
+import { debug } from './debug.mjs';
 import { cdp, cdpEvent, fileTab, isUsersTab, outputDir, readStream, stamp, startTracing, traceBusy, tracingSlot, waitForTracing } from './perf.mjs';
 import { cap } from './snapshots.mjs';
 import { notice } from './takeover.mjs';
-import { sleep } from './util.mjs';
+import { sleep, within } from './util.mjs';
 
 const INSIGHT_MAX_CHARS = 20_000;
 const gunzip = promisify(zlib.gunzip);
@@ -464,6 +465,24 @@ async function stop(tab, { header, text, blockedSince }) {
   }
 }
 
+// Before a page-load trace (and a Lighthouse navigation run) the page itself goes to about:blank, so the blank page stays
+// in the page's renderer process (with its origin) and the reload commits there too: a process recording from the
+// start. A blank page the debugger opens takes the extension's origin (Chrome counts the extension as the navigation's
+// initiator) and lives in the extension's process, so the reload then needs another renderer: Chrome's spare one, which
+// a busy browser lacks, and one started during the recording loses its first events, the load's navigationStart among
+// them (the trace engine then finds no page load, NO_NAVIGATION only; Lighthouse fails with NO_NAVSTART). No page script
+// runs for it (location can't be overridden; the reply comes before the navigation commits). A page that doesn't go
+// within BLANK_MS (a busy main thread, a navigate handler that cancels it) is blanked the debugger's way, as before.
+const BLANK_MS = 5000;
+export async function blank(tab) {
+  const deadline = Date.now() + BLANK_MS;
+  const evaluated = await within(cdp(tab, 'Runtime.evaluate', { expression: 'location.replace("about:blank")' }), BLANK_MS, null);
+  if (evaluated && !evaluated.exceptionDetails
+    && await tab.page.waitForURL('about:blank', { waitUntil: 'load', timeout: Math.max(1, deadline - Date.now()) }).then(() => true, () => false)) return;
+  debug('blank: the page did not go to about:blank itself', tab.id);
+  await tab.page.goto('about:blank', { waitUntil: 'load' });
+}
+
 function endRecording(tab) {
   tab.trace.startedAt = null;
   if (tab.trace.release) tab.page.off('close', tab.trace.release);
@@ -505,7 +524,7 @@ export function registerTrace(tool, manager, helpers) {
           waitedMs = await waitForTracing(tab);
           takenOver();
           blanked = true; // from here the page may have changed, even if the load wait fails
-          await tab.page.goto('about:blank', { waitUntil: 'load' });
+          await blank(tab);
         }
         // As puppeteer records (what chrome-devtools-mcp uses): a 1.2 GB buffer, so a busy page's load is not cut short.
         // Gzipped by Chrome: many times fewer bytes through the extension and the host (a 39 MB trace is 2.8 MB).

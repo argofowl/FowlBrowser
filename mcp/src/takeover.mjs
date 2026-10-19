@@ -85,6 +85,7 @@ const usersInput = new Map(); // "chrome:52" -> when the user's latest input in 
 const appLinks = new Map(); // "chrome:52" -> { url, at } of the page's latest navigation to a link for another app
 const reattached = new Map(); // "chrome:52" -> notice: attached again after a link for another app, not told yet
 const recovering = new Map(); // "chrome:52" -> a detach after a link for another app, until judged and attached again
+const takeoverWaits = new Map(); // "chrome:52" -> listeners told of its takeover as it is noted (onTakeover)
 const calls = new AsyncLocalStorage(); // the tool call code runs for: { tabKey, onParked } (see inCall)
 
 const keyOf = (browser, tabId) => `${browser.key}:${tabId}`;
@@ -164,6 +165,17 @@ export async function settled(key) {
   await parking.get(key)?.catch(() => {});
 }
 
+// Calls listener with the tab's notice when it is taken over from now on, until the returned function is called: a
+// wait for the tab to become controllable ends then, not at its timeout (Browser.waitForTab).
+export function onTakeover(key, listener) {
+  if (!takeoverWaits.has(key)) takeoverWaits.set(key, new Set());
+  takeoverWaits.get(key).add(listener);
+  return () => {
+    takeoverWaits.get(key)?.delete(listener);
+    if (!takeoverWaits.get(key)?.size) takeoverWaits.delete(key);
+  };
+}
+
 // Runs a tool call's handler; `onParked`: the tool still works on a parked tab (tools.mjs ON_PARKED_TABS).
 export const inCall = (call, fn) => calls.run(call, fn);
 
@@ -214,6 +226,7 @@ export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tab
   records.set(key, { kind: 'takeover', at: Date.now(), tabId, how, gone, localFile });
   unseen.add(key);
   debug('takeover', key, how);
+  for (const listener of takeoverWaits.get(key) ?? []) listener(notice(key));
   const url = tab?.page.url();
   if (!gone) {
     await park(key, () => browser.host.request('tabs.park', { tabId, kind: 'takeover' }))
@@ -337,6 +350,16 @@ async function onDetach(browser, tabId, reason, left) {
   // on, or its page asked for a link for another app (the browser lets the debugger go as that navigation starts,
   // though it never leaves the page).
   if (reason !== 'target_closed' || recently(crashed, key, CRASH_MS)) return;
+  // A local file agents may not open, in the page or a frame (an allowed file can frame any other): no one took over,
+  // FowlBrowser let the tab go. Named for what it is, so the agent neither blames the user nor tries the file again.
+  // Noted at once, as the event comes and before the relay drops the tab's page: the extension says what it let go for,
+  // so nothing is judged, and judging (the settle wait, a tabInfo reply queued behind a busy browser's traffic) could
+  // outlast the 10 s the agent's next read waits for the tab (Browser.waitForTab).
+  const refused = /^file:/i.test(left ?? '') ? localFileBlock(left) : null;
+  if (refused) {
+    if (!recently(ending, key, ENDING_MS)) await takeOver(browser, tabId, `it showed a local file agents can't open: ${refused}`, { tab, localFile: true });
+    return;
+  }
   const judged = (async () => {
     await sleep(SETTLE_MS);
     if (records.has(key)) return;
@@ -351,12 +374,8 @@ async function onDetach(browser, tabId, reason, left) {
       // The user's input near the detach, however long the checks above took.
       if (!judging.get(tab)?.size && !((usersInput.get(key) ?? -Infinity) >= detachedAt - KEEP_MS) && await reattach(browser, tabId, link, url, tab)) return;
     }
-    // A local file agents may not open, in the page or a frame (an allowed file can frame any other): no one took over,
-    // FowlBrowser let the tab go. Named for what it is, so the agent neither blames the user nor tries the file again.
-    const refused = /^file:/i.test(left ?? '') ? localFileBlock(left) : null;
-    const how = refused ? `it showed a local file agents can't open: ${refused}`
-      : BROWSER_PAGE.test(info.url) && info.url !== 'about:blank' ? `opened a browser page (${info.url.slice(0, 60)})` : 'took the tab out of the agent\'s control';
-    await takeOver(browser, tabId, how, { tab, localFile: !!refused });
+    const how = BROWSER_PAGE.test(info.url) && info.url !== 'about:blank' ? `opened a browser page (${info.url.slice(0, 60)})` : 'took the tab out of the agent\'s control';
+    await takeOver(browser, tabId, how, { tab });
   })();
   if (link) {
     recovering.set(key, judged);

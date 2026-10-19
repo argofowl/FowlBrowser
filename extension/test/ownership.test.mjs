@@ -681,6 +681,33 @@ test('attach refuses a tab showing a non-web page, also unrecorded (a restarted 
   assert.deepEqual(last, ['debugger.detach', tab.id], 'detached after the attach');
 });
 
+// Measured on a test Mac (Helium 155, 2026-10-19): an OAuth popup attached as its first cross-site page committed got
+// "Not attached to an active page" for Page.getNavigationHistory; the attach failed and the popup was never the agent's.
+test('attach asks again while the tab\'s page is between documents, and still lets go of the tab on any other error', async () => {
+  const { call, chrome } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  const send = chrome.debugger.sendCommand;
+  const sent = (method) => chrome.calls.filter((c) => c[0] === 'debugger.sendCommand' && c[1] === tab.id && c[2] === method).length;
+  const swapping = { 'Page.getNavigationHistory': 3, 'Emulation.setFocusEmulationEnabled': 2 };
+  chrome.debugger.sendCommand = async (target, method, params) => {
+    const result = await send(target, method, params);
+    if (swapping[method] > 0 && swapping[method]--) throw new Error('{"code":-32000,"message":"Not attached to an active page"}');
+    return result;
+  };
+  assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
+  assert.deepEqual([sent('Page.getNavigationHistory'), sent('Emulation.setFocusEmulationEnabled')], [4, 3], 'asked again until the page was there');
+  assert.ok(!chrome.calls.some((c) => c[0] === 'debugger.detach' && c[1] === tab.id), 'still attached');
+
+  chrome.debugger.sendCommand = async (target, method, params) => {
+    const result = await send(target, method, params);
+    if (method === 'Page.getNavigationHistory') throw new Error('{"code":-32000,"message":"Inspected target navigated or closed"}');
+    return result;
+  };
+  assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error?.message ?? '', /Inspected target navigated or closed/);
+  assert.equal(sent('Page.getNavigationHistory'), 5, 'not asked again');
+  assert.ok(chrome.calls.some((c) => c[0] === 'debugger.detach' && c[1] === tab.id), 'let go');
+});
+
 // Sol: a script added for new documents, then history.back() into this extension's own page, runs there with the
 // extension's powers before any commit is seen. A tab with such an entry is never attached.
 test("a tab with this extension's own page in its history is refused at attach and detached; other browser pages there don't matter", async () => {

@@ -3,7 +3,11 @@
 // close), the notices agents get, tab_handoff, tab_claim with resume, tab_list and turn end.
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { Browser, Tab } from '../src/browsers.mjs';
 import { installPopups, POPUP_BINDING } from '../src/popups.mjs';
 import { Activity, agentInput, markEnding, USER_BINDING, userSettled, wasGivenBack, watchTakeovers, watchUserInput } from '../src/takeover.mjs';
@@ -234,6 +238,60 @@ test('a detach for a refused local file (in the page or a frame) is named as suc
   const text = (await toolsFor(browser)('console', { tab: `${browser.key}:1` })).text;
   assert.match(text, /FowlBrowser let go of \S+:1 at \d\d:\d\d \(it showed a local file agents can't open: (it is hidden|there is no such file)/);
   assert.ok(!text.includes(`The user took over ${browser.key}:1 `), text);
+});
+
+// The waits for a tab the server runs itself (Browser.waitForTab), on a browser double: its tabs `ids` mapped at first.
+async function waitingBrowser(options) {
+  const browser = await fakeBrowser(options);
+  Object.assign(browser, { _waiters: new Map(), waitForTab: Browser.prototype.waitForTab });
+  return browser;
+}
+
+// Measured on a test Mac at --parallel 4 (2026-10-16): the extension let the tab go for a hidden file its page framed,
+// and the next snapshot waited out its 10 s with "did not become controllable"; the notice came later.
+test('a detach for a refused local file is noted as it comes, with nothing asked: a read of the tab right after gets the notice at once', async () => {
+  const never = new Promise(() => {});
+  const browser = await waitingBrowser({ ids: [1], hold: { 'tabs.info': never } }); // a busy browser: no answer
+  browser.host.emit('event', 'chrome.debugger.onDetach', [{ tabId: 1 }, 'target_closed', { url: 'file:///Users/me/.ssh/id.html' }]);
+  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }], 'parked as the event came');
+  browser.tabs.delete(1); // the relay dropped its page
+  const started = Date.now();
+  const read = await toolsFor(browser)('snapshot', { tab: `${browser.key}:1` });
+  assert.ok(Date.now() - started < 1000, `${Date.now() - started} ms`);
+  assert.equal(read.error, true);
+  assert.match(read.text, /FowlBrowser let go of \S+:1 at \d\d:\d\d \(it showed a local file agents can't open: (it is hidden|there is no such file)/);
+  assert.ok(!browser.requests.some(([method]) => method === 'tabs.info'), 'no tabs.info asked');
+});
+
+test('a read waiting for a tab ends with its notice as the takeover is noted, not at its 10 s timeout', async () => {
+  const browser = await waitingBrowser({ ids: [2] });
+  browser.tabs.delete(2); // not mapped (yet)
+  const started = Date.now();
+  const read = toolsFor(browser)('snapshot', { tab: `${browser.key}:2` });
+  await sleep(50);
+  detach(browser, 2);
+  const result = await read;
+  assert.ok(Date.now() - started < 1000, `${Date.now() - started} ms`);
+  assert.equal(result.error, true);
+  assert.match(result.text, /The user took over \S+:2 at \d\d:\d\d \(pressed Cancel on the browser's debugging bar\)/);
+  assert.deepEqual([...browser._waiters.keys()], [], 'nothing left waiting');
+});
+
+test('a tab let go before it was ever mapped (a page framing a hidden file): tab_open ends with the notice at once, not after 30 s', async (t) => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'fb-takeover-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, '.private'));
+  fs.writeFileSync(path.join(dir, '.private', 'key.html'), 'SECRET PLANS');
+  fs.writeFileSync(path.join(dir, 'framed.html'), '<iframe src=".private/key.html"></iframe>');
+  const browser = await waitingBrowser({ ids: [], answers: { 'tabs.open': () => ({ id: 7, groupId: -1 }) } });
+  const started = Date.now();
+  const opened = toolsFor(browser)('tab_open', { browser: browser.key, url: pathToFileURL(path.join(dir, 'framed.html')).href });
+  await sleep(50);
+  browser.host.emit('event', 'chrome.debugger.onDetach', [{ tabId: 7 }, 'target_closed', { url: pathToFileURL(path.join(dir, '.private', 'key.html')).href }]);
+  const result = await opened;
+  assert.ok(Date.now() - started < 1000, `${Date.now() - started} ms`);
+  assert.equal(result.error, true);
+  assert.match(result.text, /Tab \S+:7 was opened and is controlled by this session .*but: FowlBrowser let go of \S+:7 at \d\d:\d\d \(it showed a local file/);
 });
 
 // Measured on a test Mac (Chrome 155, Helium 0.19, 2026-10-14): a page navigating to zoommtg:, mailto: or a scheme no app

@@ -34,7 +34,8 @@ export default {
     // Only a tab a script opened may close itself: the opener is a window.open popup of the first tab.
     t.step('self-close: the opener closes itself right after window.open');
     const res = await t.call('click', { tab, ref: t.ref(s, 'button', 'Open window'), snapshot: false });
-    const closer = tabIdsIn(res.text, t.browser).find(id => id !== tab); // not tracked: it closes itself
+    const closer = tabIdsIn(res.text, t.browser).find(id => id !== tab);
+    t.track(closer); // closed by cleanup unless it closes itself (below)
     await t.call('navigate', { tab: closer, url: `${t.site}/popups.html?tag=${t.tag}` });
     await t.call('click', { tab: closer, ref: await t.refOf(closer, 'button', 'Open and close this tab'), snapshot: false }).catch(() => {});
     const entry = await t.until(async () => (await t.listMine()).find(x => x.url.includes(`via=self-close&tag=${t.tag}`)), 'popup via=self-close listed as mine');
@@ -42,6 +43,7 @@ export default {
     t.eq(entry.active, false, 'popup stays in the background');
     t.eq(await t.resultOf(entry.tab), 'popup:self-close', 'popup page drivable');
     t.ok(!(await t.listMine()).some((x) => x.tab === closer), 'the opener closed itself');
+    t.closed.add(closer);
     await t.close(entry.tab);
   },
 };

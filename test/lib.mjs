@@ -54,7 +54,7 @@ export async function connect(label, { ownTurns = false, env = {}, command = MCP
   await client.connect(transport).catch(e => { throw new Error(`${e.message}; server stderr: ${stderr.slice(-1500)}`); });
   const server = {
     // opened: tabs a running job holds now; everOpened: every tab any job of this server tracked.
-    label, client, opened: new Set(), everOpened: new Set(), pendingOpens: 0,
+    label, client, opened: new Set(), everOpened: new Set(),
     stderr: () => stderr,
     async call(name, args = {}, timeout = 90_000) {
       const res = await client.callTool({ name, arguments: args }, undefined, { timeout });
@@ -157,9 +157,16 @@ export function makeContext({ server, browser, tag }) {
     call: (name, args, timeout) => server.call(name, args, timeout),
 
     async open(url, extra = {}) {
-      server.pendingOpens++;
-      const res = await server.call('tab_open', { browser, url, ...extra }).finally(() => server.pendingOpens--);
-      const tab = res.structured?.tab ?? res.structured?.id ?? tabIdsIn(res.text, browser)[0];
+      const res = await server.call('tab_open', { browser, url, ...extra }).catch((e) => {
+        // Opened, then failed (its page never loaded): the tab is this job's all the same, to close and not to be taken
+        // by a sibling job's ownership check for another session's.
+        const opened = /\bTab ([a-z0-9-]+:\d+) was opened and is controlled by this session/.exec(e.message)?.[1];
+        if (opened) t.track(opened);
+        throw e;
+      });
+      // The result's own header first: notices about other tabs may come before it (a let-go tab's once made export
+      // drive the security job's tab).
+      const tab = res.structured?.tab ?? res.structured?.id ?? /^Browser: .*? · Tab: ([a-z0-9-]+:\d+)\b/m.exec(res.text)?.[1] ?? tabIdsIn(res.text, browser)[0];
       if (!tab) throw new Error(`tab_open returned no tab id: ${res.text.slice(0, 300)}`);
       t.track(tab);
       return tab;
@@ -260,15 +267,23 @@ export async function loadScenarios(only) {
 
 let tagCounter = 0;
 
+// On a shared server a sibling job's tab is this server's before the call that opened it returns (tab_open, an action's
+// popup), and the job tracks it only then: a slow page (a load running to its 30 s timeout) makes that long. Of `tabs`,
+// the ones no job has tracked within the time such a call can take: opened by no job.
+const SIBLING_GRACE_MS = 75_000;
+async function untracked(server, tabs) {
+  let left = tabs.filter(tab => !server.everOpened.has(tab));
+  for (const end = Date.now() + SIBLING_GRACE_MS; left.length && Date.now() < end;) {
+    await sleep(250);
+    left = left.filter(tab => !server.everOpened.has(tab));
+  }
+  return left;
+}
+
 // Runs one scenario in one browser on its own tabs, then checks it only saw its own tabs and closes them.
-// Tabs this server controls that no job opened, after the same grace as the ownership check; they are closed and
-// remembered as seen.
+// Tabs this server controls that no job opened (untracked); they are closed and remembered as seen.
 async function foreignTabs(server, t) {
-  let foreign = (await t.listMine()).map(x => x.tab).filter(tab => !server.everOpened.has(tab));
-  if (!foreign.length) return [];
-  for (let i = 0; i < 40 && server.pendingOpens > 0; i++) await sleep(250);
-  await sleep(1000);
-  foreign = foreign.filter(tab => !server.everOpened.has(tab));
+  const foreign = await untracked(server, (await t.listMine()).map(x => x.tab));
   for (const tab of foreign) {
     server.everOpened.add(tab);
     await server.call('tab_close', { tab, confirm_close_users_tab: true }).catch(() => {});
@@ -276,10 +291,15 @@ async function foreignTabs(server, t) {
   return foreign;
 }
 
-export async function runJob(server, scenario, browser) {
+// ownServer: the scenario runs on a server of its own, so what it does to its session (notices about tabs FowlBrowser let
+// go start the session's next results) never shows in another job's results.
+export async function runJob(shared, scenario, browser) {
   const tag = `${scenario.name}-${browser}-${process.pid}-${++tagCounter}`;
-  const t = makeContext({ server, browser, tag });
   const started = Date.now();
+  const own = scenario.ownServer ? await connect(`e2e-${tag}`).catch((e) => e) : null;
+  if (own instanceof Error) return { scenario: scenario.name, browser, ok: false, ms: Date.now() - started, error: `[start] ${own.message}` };
+  const server = own ?? shared;
+  const t = makeContext({ server, browser, tag });
   let error = null;
   try {
     await scenario.run(t);
@@ -289,14 +309,7 @@ export async function runJob(server, scenario, browser) {
       // Tabs the scenario already closed itself are fine to be missing.
       if (!mine.includes(tab) && !t.closed?.has(tab)) throw new AssertionError(`own tab ${tab} missing from tab_list mine`);
     }
-    // On a shared server, a sibling job's tab can be owned before its tab_open (or popup poll) returns,
-    // so unknown tabs get a grace period before they count as cross-talk.
-    let foreign = mine.filter(tab => !server.everOpened.has(tab));
-    if (foreign.length) {
-      for (let i = 0; i < 40 && server.pendingOpens > 0; i++) await sleep(250);
-      await sleep(1000);
-      foreign = foreign.filter(tab => !server.everOpened.has(tab));
-    }
+    const foreign = await untracked(server, mine);
     if (foreign.length) throw new AssertionError(`tab_list mine shows tabs this server never opened: ${foreign.join(', ')}`);
   } catch (e) {
     error = `[${t.stepName}] ${e.message}`;
@@ -306,6 +319,7 @@ export async function runJob(server, scenario, browser) {
     if (strays.length) error += ` (it left ${strays.join(', ')}, closed now)`;
   }
   await t.cleanup();
+  await own?.close();
   return { scenario: scenario.name, browser, ok: !error, ms: Date.now() - started, error };
 }
 
