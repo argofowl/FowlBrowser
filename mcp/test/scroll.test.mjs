@@ -10,13 +10,15 @@ import { registerTools, WHEEL_TARGET_FN } from '../src/tools.mjs';
 const LAND_MS = 40; // a wheel turn lands this long after mouse.wheel returned
 
 // A box (or the page's root) with overflow, sizes and a parent; scrolled by `top`.
-function box(name, { overflowY = 'visible', height = 600, content = height, parent = null, id = '' } = {}) {
-  return { localName: name, id, style: { overflowY, overflowX: 'visible' }, scrollTop: 0, scrollLeft: 0, clientHeight: height, scrollHeight: content,
+function box(name, { overflowY = 'visible', height = 600, content = height, parent = null, id = '', reversed = false } = {}) {
+  const style = { overflowY, overflowX: 'visible', ...(reversed && { display: 'flex', flexDirection: 'column-reverse' }) };
+  return { localName: name, id, style, scrollTop: 0, scrollLeft: 0, clientHeight: height, scrollHeight: content,
     clientWidth: 800, scrollWidth: 800, parentElement: parent, getRootNode: () => ({}) };
 }
 
-// A window 1200x800 whose page is pageHeight tall, with `hit` under the viewport centre.
-function setup({ pageHeight, hit }) {
+// A window 1200x800 whose page is pageHeight tall, with `hit` under the viewport centre. afterWheel(scroller) runs
+// once the wheel has landed (a list that loads more, or puts the scroll back).
+function setup({ pageHeight, hit, afterWheel }) {
   const html = box('html', { height: 800, content: pageHeight });
   const body = box('body', { parent: html });
   const win = { innerWidth: 1200, innerHeight: 800, scrollX: 0, scrollY: 0 };
@@ -41,8 +43,11 @@ function setup({ pageHeight, hit }) {
       // The wheel moves the scroller under the pointer (else the page), clamped, a moment after the call returns.
       wheel: async (dx, dy) => setTimeout(() => {
         const s = scroller(target);
-        if (s) s.scrollTop = Math.max(0, Math.min(s.scrollHeight - s.clientHeight, s.scrollTop + dy));
+        // A box laid out from its end (flex column-reverse) counts 0 at its bottom and negative upward.
+        const [low, high] = s?.style.flexDirection === 'column-reverse' ? [s.clientHeight - s.scrollHeight, 0] : [0, s ? s.scrollHeight - s.clientHeight : 0];
+        if (s) s.scrollTop = Math.max(low, Math.min(high, s.scrollTop + dy));
         else win.scrollY = Math.max(0, Math.min(pageHeight - 800, win.scrollY + dy));
+        afterWheel?.(s);
       }, LAND_MS),
     },
     on: EventEmitter.prototype.on, off: EventEmitter.prototype.off,
@@ -118,4 +123,27 @@ test('scroll over an iframe that took the wheel itself says the window did not m
   const result = await scroll({ direction: 'down' });
   assert.equal(result.error, false, result.text);
   assert.match(result.text, /over an iframe \(<iframe#map>\): the window did not move, so the page in the iframe may have scrolled \(it can't be read from here; take a screenshot to see\)\. Window scroll position: x=0 y=0 \(max y 0\)\./);
+});
+
+test('a box at its top is "at its top for now", never the start of what it holds; content that loads a moment later is reported', async () => {
+  let list;
+  // Like a chat that loads older messages once its top is reached: 2000 px more arrive 100 ms after the wheel landed,
+  // and the rows on screen are kept where they were.
+  const { scroll } = setup({ pageHeight: 800, hit: (body) => { list ??= box('div', { overflowY: 'auto', height: 500, content: 3000, parent: body }); list.scrollTop = list.scrollTop || 300; return box('li', { parent: list }); },
+    afterWheel: (s) => setTimeout(() => { if (s.scrollTop === 0) { s.scrollHeight += 2000; s.scrollTop += 2000; } }, 100) });
+  const result = await scroll({ direction: 'up' });
+  assert.equal(result.error, false, result.text);
+  assert.doesNotMatch(result.text, /at the start/);
+  assert.match(result.text, /up 1 page: scrollTop 0 of 2500; a moment later the page had moved it to scrollTop 2000 of 4500 \(its content grew by 2000 px\)\./);
+});
+
+test('a chat laid out bottom up (flex column-reverse) is counted from its top: at its bottom it scrolls up, and says where it is', async () => {
+  let list;
+  const { scroll, run } = setup({ pageHeight: 800, hit: (body) => { list ??= box('div', { overflowY: 'auto', height: 500, content: 3000, parent: body, reversed: true }); return box('li', { parent: list }); } });
+  assert.equal(run(() => WHEEL_TARGET_FN({ vertical: true, sign: 1 })), null, 'at its bottom (scrollTop 0) a down wheel goes on to the page');
+  const result = await scroll({ direction: 'up' });
+  assert.equal(result.error, false, result.text);
+  assert.equal(list.scrollTop, -400);
+  assert.match(result.text, /Scrolled the box under the viewport centre \(<div>\) up 1 page: scrollTop 2100 of 2500\./);
+  assert.match((await scroll({ direction: 'up', pages: 10 })).text, /up 10 pages: scrollTop 0 of 2500 \(at its top for now; a list that loads more as you scroll may still add some there, and read_all reads one whole\)\./);
 });

@@ -1,0 +1,180 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Re: Your NuPhy order - Mail</title>
+<link rel="stylesheet" href="threads.css">
+<style>
+  body { height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+  [role=main] { flex: 1; min-height: 0; display: flex; flex-direction: column; max-width: 900px; width: 100%; margin: 0 auto; }
+  .toolbar { display: flex; gap: 4px; padding: 6px 12px; border-bottom: 1px solid #eee; }
+  .box { flex: 1; overflow-y: auto; padding: 0 16px 40px; }
+  h2 { font-weight: 400; font-size: 22px; margin: 16px 0; }
+  [role=list] > div { border-bottom: 1px solid #eee; }
+  .msg { padding: 10px 8px; cursor: pointer; }
+  .msg.collapsed { display: grid; grid-template-columns: 180px 1fr auto; gap: 12px; color: #5f6368; }
+  .msg.collapsed > div:first-child { color: #202124; font-weight: 600; }
+  .msg.collapsed > div:nth-child(2) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .head { display: grid; grid-template-columns: 1fr auto auto; align-items: start; }
+  .head .from { font-weight: 600; }
+  .head .to, .head .date { color: #5f6368; font-size: 13px; }
+  .head .to { grid-column: 1; }
+  .head .date { grid-row: 1; grid-column: 2; }
+  .head .acts { grid-row: 1; grid-column: 3; }
+  .body { cursor: auto; margin-top: 10px; }
+  .body > div + div { margin-top: 8px; }
+  .trim { display: inline-block; margin-top: 8px; padding: 0 8px; border-radius: 8px; background: #e8eaed; cursor: pointer; }
+  .quote { color: #5f6368; border-left: 2px solid #ccc; padding-left: 8px; margin-top: 8px; }
+  .older { position: relative; display: block; height: 0; }
+  .older span { position: absolute; left: 24px; top: -16px; width: 32px; height: 32px; border-radius: 50%; border: 1px solid #ccc; background: #fff; display: grid; place-items: center; cursor: pointer; font-size: 13px; }
+  .placeholder { height: 4px; border-bottom: 1px solid #eee; }
+  .replies { display: flex; gap: 8px; margin: 24px 0 12px; }
+  .msg .loading { justify-content: flex-start; gap: 8px; align-items: center; padding: 8px 0; }
+</style>
+<!-- Gmail-style thread: the box scrolls, not the document; the middle messages hide behind "<k> older messages",
+     collapsed messages expand on click (body after a delay), some gain a late line a moment after they open, quotes
+     hide behind "Show trimmed content". Every
+     click on Reply, Forward, Archive, Delete, Mark as unread, Like or the Show more link is recorded in __danger. -->
+<div class="bar">Mail</div>
+<div role="main">
+  <div class="toolbar">
+    <button class="icon" aria-label="Archive" data-danger><svg viewBox="0 0 24 24"><path d="M3 4h18v4H3zM5 9h14v11H5zm4 3v2h6v-2z"/></svg></button>
+    <button class="icon" aria-label="Delete" data-danger><svg viewBox="0 0 24 24"><path d="M6 7h12l-1 14H7zM9 3h6l1 2h4v2H4V5h4z"/></svg></button>
+    <button class="icon" aria-label="Mark as unread" data-danger><svg viewBox="0 0 24 24"><path d="M3 5h18v14H3zm2 2v1l7 5 7-5V7l-7 5z"/></svg></button>
+    <span style="flex:1"></span>
+    <button class="icon" id="expand-all" aria-label="Expand all"><svg viewBox="0 0 24 24"><path d="M12 4l5 5H7zm0 16l-5-5h10z"/></svg></button>
+  </div>
+  <div class="box">
+    <h2>Re: Your NuPhy order</h2>
+    <div role="list"></div>
+    <div class="replies">
+      <button class="pill" data-danger>Reply</button>
+      <button class="pill" data-danger>Reply all</button>
+      <button class="pill" data-danger>Forward</button>
+    </div>
+    <a href="mail.html?danger=1">Show more</a>
+  </div>
+</div>
+<script type="module">
+  import { params, truth, delays } from './data.js';
+  const p = params('mail', location.search);
+  const msgs = truth('mail', location.search);
+  const delay = delays(p);
+  window.__danger = new URLSearchParams(location.search).has('danger') ? ['Show more (landed here)'] : [];
+  const list = document.querySelector('[role=list]');
+  const nameOf = el => el.getAttribute('aria-label') || el.textContent.trim();
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest('[data-danger], a[href]');
+    if (el) window.__danger.push(nameOf(el));
+  }, true);
+
+  const ICON = { Reply: 'M10 9V5l-7 7 7 7v-4c5 0 8 1.5 11 5-1-5-4-10-11-11z', Like: 'M12 21l-1.5-1.3C5 15 2 12.3 2 8.5 2 5.4 4.4 3 7.5 3c1.7 0 3.4.8 4.5 2.1C13.1 3.8 14.8 3 16.5 3 19.6 3 22 5.4 22 8.5c0 3.8-3 6.5-8.5 11.2z' };
+  const div = (parent, text, cls) => {
+    const el = parent.appendChild(document.createElement('div'));
+    if (text != null) el.textContent = text;
+    if (cls) el.className = cls;
+    return el;
+  };
+
+  // A message's state: collapsed, loading (expanded, body on its way) or open; trimmed: its quote is shown; late: its
+  // late line is.
+  const state = msgs.map((m, i) => ({ el: null, view: i === msgs.length - 1 ? 'open' : 'collapsed', trimmed: !!p.all, late: !!p.all }));
+  function draw(i) {
+    const m = msgs[i], s = state[i], el = s.el;
+    el.replaceChildren();
+    el.setAttribute('role', 'listitem');
+    el.setAttribute('aria-expanded', String(s.view !== 'collapsed'));
+    el.className = `msg ${s.view === 'collapsed' ? 'collapsed' : 'expanded'}`;
+    if (s.view === 'collapsed') { el.tabIndex = 0; for (const text of m.collapsed) div(el, text); return; }
+    el.removeAttribute('tabindex');
+    const head = div(el, null, 'head');
+    div(head, m.lines[0], 'from');
+    div(head, 'to me', 'to');
+    div(head, m.date, 'date');
+    const acts = div(head, null, 'acts');
+    for (const name of ['Like', 'Reply']) {
+      acts.insertAdjacentHTML('beforeend', `<button class="icon" aria-label="${name}" data-danger><svg viewBox="0 0 24 24"><path d="${ICON[name]}"/></svg></button>`);
+    }
+    if (s.view === 'loading') {
+      div(el, null, 'loading').innerHTML = '<svg class="spin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg><div>Loading…</div>';
+      return;
+    }
+    const body = div(el, null, 'body');
+    for (const text of m.body) div(body, text);
+    // The late line comes a moment after the message opens, in place (no redraw).
+    if (m.late) div(body, s.late ? m.late : null, 'late');
+    if (m.late && !s.late && !s.lateTimer) {
+      s.lateTimer = setTimeout(() => {
+        s.late = true;
+        const line = s.el.querySelector('.late');
+        if (line) line.textContent = m.late;
+      }, 1500 + delay());
+    }
+    if (!m.quote.length) return;
+    if (s.trimmed) {
+      const quote = div(body, null, 'quote');
+      for (const text of m.quote) div(quote, text);
+    } else {
+      const trim = div(body, '•••', 'trim');
+      Object.assign(trim, { tabIndex: 0 });
+      trim.setAttribute('role', 'button');
+      trim.setAttribute('aria-label', 'Show trimmed content');
+      trim.addEventListener('click', (e) => { e.stopPropagation(); s.trimmed = true; draw(i); });
+    }
+  }
+  function expand(i) {
+    const s = state[i];
+    if (s.view !== 'collapsed') return;
+    s.view = 'loading';
+    draw(i);
+    setTimeout(() => { if (s.view === 'loading') { s.view = 'open'; draw(i); } }, delay());
+  }
+  function create(i) {
+    const el = state[i].el = document.createElement('div');
+    // Clicking a collapsed message opens it; clicking an open message's header folds it again, as Gmail does.
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-danger]')) return;
+      if (state[i].view === 'collapsed') expand(i);
+      else if (e.target.closest('.head')) { state[i].view = 'collapsed'; draw(i); }
+    });
+    draw(i);
+    return el;
+  }
+
+  const hidden = p.all || msgs.length <= 3 ? [] : msgs.slice(1, -2).map((_, k) => k + 1);
+  if (p.all) state.forEach(s => { s.view = 'open'; });
+  const shown = msgs.map((_, i) => i).filter(i => !hidden.includes(i));
+  let older = null;
+  for (const i of shown) {
+    list.appendChild(create(i));
+    if (i === 0 && hidden.length) {
+      // The middle messages: empty placeholders and a round "<k>" control that reveals them collapsed.
+      older = document.createElement('div');
+      older.className = 'older';
+      older.innerHTML = `<span role="button" tabindex="0" aria-label="${hidden.length} older messages">${hidden.length}</span>`;
+      list.appendChild(older);
+      for (const _ of hidden) div(list, null, 'placeholder');
+    }
+  }
+  function reveal() {
+    if (!older) return;
+    for (const el of [...list.querySelectorAll('.placeholder')]) el.remove();
+    older.replaceWith(...hidden.map(create));
+    older = null;
+  }
+  list.addEventListener('click', (e) => { if (e.target.closest('.older span')) reveal(); });
+
+  const all = document.getElementById('expand-all');
+  all.addEventListener('click', () => {
+    if (all.getAttribute('aria-label') === 'Expand all') {
+      reveal();
+      msgs.forEach((_, i) => expand(i));
+      all.setAttribute('aria-label', 'Collapse all');
+    } else {
+      state.forEach((s, i) => { if (s.el?.isConnected) { s.view = 'collapsed'; draw(i); } });
+      all.setAttribute('aria-label', 'Expand all');
+    }
+  });
+
+  window.__rows = () => [...list.querySelectorAll('[role=listitem]')].map(el => el.innerText);
+  window.__state = () => ({ views: state.map(s => (s.el?.isConnected ? s.view : 'hidden')), trimmed: state.filter(s => s.trimmed).length, older: !!older,
+    late: state.filter(s => s.late).length });
+</script>

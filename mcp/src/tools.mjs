@@ -12,6 +12,7 @@ import { debug } from './debug.mjs';
 import { EXPORT_DESCRIPTION, exportShape, exportTab } from './exports.mjs';
 import { registerPerf } from './perf.mjs';
 import { backgroundClick, openingLines, uninstallPopups } from './popups.mjs';
+import { READ_ALL_DESCRIPTION, readAll, readAllShape } from './reader.mjs';
 import * as record from './record.mjs';
 import * as takeover from './takeover.mjs';
 import { callsByTab } from './turns.mjs';
@@ -726,8 +727,57 @@ const PAGE_TEXT_FN = (el) => {
   const early = !el && !document.body && document.readyState === 'loading';
   if (!root) return { name: 'html', text: '', early };
   const name = root.tagName.toLowerCase() + (root.id ? `#${root.id}` : '') + (root.getAttribute('role') === 'main' && root.tagName !== 'MAIN' ? '[role=main]' : '');
-  return { name, text: root.innerText ?? root.textContent ?? '', early };
+  const text = root.innerText ?? root.textContent ?? '';
+  // innerText leaves open shadow roots out, and X draws its whole app in one: a root with little text of its own is
+  // read through them, in order: its own text, each shadow tree, and what slots show of the light DOM.
+  const through = (n) => {
+    if (n.nodeType === Node.TEXT_NODE) return n.data.trim();
+    if (n.nodeType !== Node.ELEMENT_NODE) return '';
+    if (n.localName === 'slot') return n.assignedNodes({ flatten: true }).map(through).filter(Boolean).join('\n');
+    if (!n.checkVisibility() && getComputedStyle(n).display !== 'contents') return '';
+    if (n.shadowRoot) return [...n.shadowRoot.childNodes].map(through).filter(Boolean).join('\n');
+    if (![...n.querySelectorAll('*')].some((c) => c.shadowRoot)) return n.innerText ?? '';
+    return [...n.childNodes].map(through).filter(Boolean).join('\n');
+  };
+  const shadowed = !!root.shadowRoot || (!!root.querySelector && [...root.querySelectorAll('*')].some((c) => c.shadowRoot));
+  return { name, text: text.trim().length < 200 && shadowed ? through(root) : text, early };
 };
+
+// A list in or around what snapshot mode "text" reads that may hold more than the page has rendered: the box (crossing
+// open shadow roots) or the page that scrolls by more than a screen around it or inside it, when it holds a chat log or
+// feed, rows numbered by index (data-index, aria-setsize, aria-rowcount, a virtualizer) or rows placed absolutely, as
+// virtualized lists keep only the rows near the view (runs in the page). { what, at, max } or null.
+const LIST_HINT_FN = (el) => {
+  const root = el ?? document.querySelector('main, [role=main]') ?? document.querySelector('article') ?? document.body;
+  if (!root) return null;
+  const scrolls = (n) => n.clientHeight > 100 && n.scrollHeight - n.clientHeight > n.clientHeight && /auto|scroll|overlay/.test(getComputedStyle(n).overflowY);
+  const elements = [];
+  const collect = (node) => {
+    for (const c of node.querySelectorAll('*')) {
+      if (elements.length >= 20000) return;
+      elements.push(c);
+      if (c.shadowRoot) collect(c.shadowRoot);
+    }
+  };
+  collect(root);
+  let box = null;
+  for (let n = root; n && n !== document.body && n !== document.documentElement && !box; n = n.parentElement ?? n.getRootNode().host) if (scrolls(n)) box = n;
+  box ??= elements.find(scrolls);
+  const page = document.scrollingElement ?? document.documentElement;
+  if (!box && page.scrollHeight - innerHeight > innerHeight) box = page;
+  if (!box) return null;
+  const placed = (n) => n.children.length >= 3 && [...n.children].slice(0, 6).filter((c) => getComputedStyle(c).position === 'absolute').length >= 3;
+  const inside = box === page ? [root, ...elements] : [box, ...elements.filter((n) => box.contains(n) || n.getRootNode() !== document)];
+  if (!inside.some((n) => n.matches('[role=log], [role=feed], [data-index], [aria-setsize], [aria-rowcount], [data-virtualizer]') || placed(n))) return null;
+  if (box === page) return { what: 'the page', at: Math.round(scrollY), max: page.scrollHeight - innerHeight };
+  const style = getComputedStyle(box);
+  const max = box.scrollHeight - box.clientHeight;
+  const role = box.getAttribute('role');
+  return { what: `the box <${box.localName}>${role ? ` (${role}${box.getAttribute('aria-label') ? ` "${box.getAttribute('aria-label')}"` : ''})` : ''}`,
+    at: Math.round(box.scrollTop + (/flex/.test(style.display) && style.flexDirection === 'column-reverse' ? max : 0)), max };
+};
+const listHint = (hint) => (hint ? `\n(Only what the page has rendered now: ${hint.what} scrolls (scrollTop ${hint.at} of ${hint.max}) and holds a list ` +
+  'that may render only the rows near the view, or load more as you scroll, so items above or below may be missing here. To read the whole list, call read_all.)' : '');
 
 // The links of the ref, else of the page's <main> or <article>, else of the body (snapshot mode "links"): text and URL,
 // each URL once (its first text), in page order; in-page anchors ("#top", and "#": a control a script handles) and
@@ -797,11 +847,14 @@ async function pageText(tab, { ref, maxChars = SNAPSHOT_MAX_CHARS } = {}) {
     ({ name, text: raw } = await read());
   }
   const frames = ref ? [] : await framesText(tab); // the whole page's text takes in its iframes'
+  const hint = listHint(await listHintOf(tab, ref));
   refuseBlockedPage(tab, before); // it went there while the text was read
   const body = [collapseText(raw), ...frames].filter(Boolean).join('\n') || '(no text)';
   return `Text of ${ref ? `${ref} (<${name}>)` : `<${name}>`} (readable text only, no refs; to act on the page, call snapshot without mode for refs):\n` +
-    capText(body, maxChars - 150, 'To read them, call snapshot with mode "text" and ref=<eN> of a section, or with a larger max_chars');
+    capText(body, maxChars - 150 - hint.length, 'To read them, call snapshot with mode "text" and ref=<eN> of a section, or with a larger max_chars') + hint;
 }
+const listHintOf = async (tab, ref) => within((async () => (ref ? locator(tab, ref).evaluate(LIST_HINT_FN, null, { timeout: ACTION_TIMEOUT_MS }) : tab.page.evaluate(LIST_HINT_FN, null)))()
+  .catch(() => null), 2000, null);
 
 function dialogLine(tab) {
   const d = tab.dialog;
@@ -1366,16 +1419,20 @@ export const WHEEL_TARGET_FN = ({ vertical, sign }) => {
   if (n?.localName === 'iframe') return n;
   for (; n && n !== document.body && n !== document.documentElement; n = n.parentElement ?? n.getRootNode().host) {
     const style = getComputedStyle(n);
-    const at = vertical ? n.scrollTop : n.scrollLeft;
     const max = vertical ? n.scrollHeight - n.clientHeight : n.scrollWidth - n.clientWidth;
+    // A box laid out from its end (a chat in flex column-reverse, a right-to-left row) counts 0 there and negative back.
+    const fromEnd = vertical ? /flex/.test(style.display) && style.flexDirection === 'column-reverse'
+      : (style.direction === 'rtl') !== (/flex/.test(style.display) && style.flexDirection === 'row-reverse');
+    const at = (vertical ? n.scrollTop : n.scrollLeft) + (fromEnd ? max : 0);
     if (/auto|scroll|overlay/.test(vertical ? style.overflowY : style.overflowX) && (sign > 0 ? at < max - 1 : at > 0)) return n;
   }
   return null;
 };
 
-// Where a box (null: the window) is scrolled along the axis (at, of max), the size of one of its pages, and its tag.
-// For an iframe the window is read: the iframe's own page may be another site's, and a wheel it can't use (its page
-// fits, or is at its end) moves the page around it (runs in the page).
+// Where a box (null: the window) is scrolled along the axis (at, of max, from its top or left even when it is laid out
+// from its end, as WHEEL_TARGET_FN counts), the size of one of its pages, and its tag. For an iframe the window is read:
+// the iframe's own page may be another site's, and a wheel it can't use (its page fits, or is at its end) moves the page
+// around it (runs in the page).
 const SCROLLED_FN = (el, vertical) => {
   const tag = el && `<${el.localName}${el.id ? `#${el.id}` : ''}>`;
   if (!el || el.localName === 'iframe') {
@@ -1383,8 +1440,11 @@ const SCROLLED_FN = (el, vertical) => {
     return { tag, frame: !!el, x: Math.round(scrollX), y: Math.round(scrollY), at: Math.round(vertical ? scrollY : scrollX),
       max: vertical ? root.scrollHeight - innerHeight : root.scrollWidth - innerWidth, page: vertical ? innerHeight : innerWidth };
   }
-  return { tag, at: Math.round(vertical ? el.scrollTop : el.scrollLeft), max: vertical ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth,
-    page: vertical ? el.clientHeight : el.clientWidth };
+  const style = getComputedStyle(el);
+  const max = vertical ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth;
+  const fromEnd = vertical ? /flex/.test(style.display) && style.flexDirection === 'column-reverse'
+    : (style.direction === 'rtl') !== (/flex/.test(style.display) && style.flexDirection === 'row-reverse');
+  return { tag, at: Math.round((vertical ? el.scrollTop : el.scrollLeft) + (fromEnd ? max : 0)), max, page: vertical ? el.clientHeight : el.clientWidth };
 };
 
 // Chromium applies a wheel turn after Input.dispatchMouseEvent has returned (and may animate it), so the position read
@@ -1402,6 +1462,43 @@ async function wheelLanded(read, before, sign) {
   }
 }
 
+// A list that loads more as it nears an end, or puts a scroll back (X's chats send any scroll that isn't the user's own
+// back to the newest message), changes a moment after it moved: the requests that started are waited for and the
+// position read again, so the result says where it ended up, not where it was for a moment.
+async function scrolledLater(tab, read, landed, watch, generation) {
+  await settle(tab, watch, { watchMs: landed.moved ? WATCH_MS.snapshot : WATCH_MS.action, generation, trailing: false }).catch(() => {});
+  return read().catch(() => landed);
+}
+const scrollPosition = (p, vertical) => `${vertical ? 'scrollTop' : 'scrollLeft'} ${p.at} of ${p.max}`;
+const scrollMovedLater = (landed, now, shown) => (now.at === landed.at && now.max === landed.max ? ''
+  : `; a moment later the page had moved it to ${shown(now)}` +
+    (now.max === landed.max ? '' : ` (its content ${now.max > landed.max ? 'grew' : 'shrank'} by ${Math.abs(now.max - landed.max)} px)`));
+// Never "the start" of what it holds: a list that loads more as it is scrolled may still grow at either end.
+const scrollEnd = (p, vertical) => (p.max <= 0 || (p.at > 0 && p.at < p.max - 1) ? ''
+  : ` (at its ${p.at <= 0 ? (vertical ? 'top' : 'left') : (vertical ? 'bottom' : 'right')} for now; a list that loads more as you scroll may still add some there, and read_all reads one whole)`);
+
+// The middle of a box's part in its frame's viewport, and whether a wheel there reaches the box: the box or something
+// in it is under that point (crossing open shadow roots), not something covering it (runs in the page).
+const BOX_POINT_FN = (el) => {
+  const r = el.getBoundingClientRect();
+  const [left, right, top, bottom] = [Math.max(r.left, 0), Math.min(r.right, innerWidth), Math.max(r.top, 0), Math.min(r.bottom, innerHeight)];
+  if (right <= left || bottom <= top) return null;
+  const [x, y] = [(left + right) / 2, (top + bottom) / 2];
+  let n = document.elementFromPoint(x, y);
+  while (n?.shadowRoot) {
+    const inner = n.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === n) break;
+    n = inner;
+  }
+  while (n && n !== el) n = n.parentElement ?? n.getRootNode().host;
+  return { dx: x - r.left, dy: y - r.top, reached: n === el };
+};
+async function boxPoint(box) {
+  const p = await box.evaluate(BOX_POINT_FN).catch(() => null);
+  const b = p && await box.boundingBox();
+  return b && { x: b.x + p.dx, y: b.y + p.dy, reached: p.reached };
+}
+
 // scroll without ref: turns the mouse wheel at the viewport centre by pages (80% of what it moves, so no row is
 // skipped) and says what moved: the window, or the box or iframe under the centre that took the wheel (app shells
 // and phone mock-ups scroll in a box while the window stays put).
@@ -1415,15 +1512,24 @@ async function scrollPage(tab, { direction = 'down', pages = 1 }) {
     const read = () => target.evaluate(SCROLLED_FN, vertical);
     const before = await read();
     const step = sign * (before.page ?? (vertical ? h : w)) * 0.8 * pages;
-    await pointed(tab, { x: w / 2, y: h / 2 }, async () => {
-      await tab.page.mouse.move(w / 2, h / 2);
-      await tab.page.mouse.wheel(vertical ? 0 : step, vertical ? step : 0);
-    }, { feedback: false, cue: 'scroll' });
-    const after = await wheelLanded(read, before, sign);
+    const watch = watchRequests(tab.page);
+    const generation = tab.documentGeneration;
+    let after, now;
+    try {
+      await pointed(tab, { x: w / 2, y: h / 2 }, async () => {
+        await tab.page.mouse.move(w / 2, h / 2);
+        await tab.page.mouse.wheel(vertical ? 0 : step, vertical ? step : 0);
+      }, { feedback: false, cue: 'scroll' });
+      after = await wheelLanded(read, before, sign);
+      now = await scrolledLater(tab, read, after, watch, generation);
+    } finally {
+      watch.stop();
+    }
     const box = before.tag && !before.frame && `the box under the viewport centre (${before.tag})`;
     const position = box
-      ? `${vertical ? 'scrollTop' : 'scrollLeft'} ${after.at} of ${after.max}${after.at <= 0 ? ' (at the start)' : after.at >= after.max - 1 ? ' (at the end)' : ''}`
-      : `Window scroll position: x=${after.x} y=${after.y} (max ${vertical ? 'y' : 'x'} ${after.max})`;
+      ? `${scrollPosition(after, vertical)}${scrollMovedLater(after, now, (p) => scrollPosition(p, vertical))}${scrollEnd(now, vertical)}`
+      : `Window scroll position: x=${after.x} y=${after.y} (max ${vertical ? 'y' : 'x'} ${after.max})${scrollMovedLater(after, now, (p) => `x=${p.x} y=${p.y}`)}` +
+        (before.frame || !after.moved ? '' : scrollEnd(now, vertical));
     if (after.moved) return box ? `Scrolled ${box} ${direction} ${plural}: ${position}.` : `Scrolled ${direction} ${plural}. ${position}.`;
     if (before.frame) {
       return `Turned the mouse wheel ${direction} ${plural} at the viewport centre, over an iframe (${before.tag}): the window did not move, so the page in the ` +
@@ -1442,7 +1548,10 @@ async function scrollPage(tab, { direction = 'down', pages = 1 }) {
 }
 
 // scroll with ref and direction: moves that box by pages of its own height (80% of it, like page scrolls, so no row
-// is skipped). With no such box it turns the mouse wheel over the ref (the page, or a scroller driven by wheel events).
+// is skipped) with the mouse wheel over it, as a person does: a list that follows only its user's input (X's chats put
+// a script's scroll back at once) moves for it. Where the wheel doesn't reach the box (something covers it there) or
+// doesn't move it, a script does. With no such box it turns the mouse wheel over the ref (the page, or a scroller
+// driven by wheel events).
 async function scrollBox(tab, { ref, direction, pages = 1 }) {
   const vertical = direction === 'up' || direction === 'down';
   const sign = direction === 'up' || direction === 'left' ? -1 : 1;
@@ -1464,20 +1573,33 @@ async function scrollBox(tab, { ref, direction, pages = 1 }) {
       return `Nothing around ${cleanRef(ref)} scrolls on its own; turned the mouse wheel ${direction} ${plural} of its height over it. Window scroll position: x=${pos.x} y=${pos.y}.`;
     }
     await box.scrollIntoViewIfNeeded({ timeout: POINT_TIMEOUT_MS }).catch(() => {});
-    const where = async () => {
-      const b = await box.boundingBox();
-      return b && { x: b.x + b.width / 2, y: b.y + b.height / 2, w: b.width, h: b.height };
-    };
-    const { tag, at, max } = await pointed(tab, where, () => box.evaluate((el, { vertical, step }) => {
-      el.scrollBy({ [vertical ? 'top' : 'left']: step * (vertical ? el.clientHeight : el.clientWidth), behavior: 'instant' });
-      return {
-        tag: `<${el.localName}${el.id ? `#${el.id}` : ''}>`,
-        at: Math.round(vertical ? el.scrollTop : el.scrollLeft),
-        max: vertical ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth,
-      };
-    }, { vertical, step: sign * 0.8 * pages }), { feedback: false, cue: 'scroll' });
-    const end = at <= 0 ? ' (at the start)' : at >= max - 1 ? ' (at the end)' : '';
-    return `Scrolled the box around ${cleanRef(ref)} (${tag}) ${direction} ${plural}: ${vertical ? 'scrollTop' : 'scrollLeft'} ${at} of ${max}${end}.`;
+    const read = () => box.evaluate(SCROLLED_FN, vertical);
+    const before = await read();
+    const point = await boxPoint(box);
+    const watch = watchRequests(tab.page);
+    const generation = tab.documentGeneration;
+    let landed, now, byScript = false;
+    try {
+      landed = await pointed(tab, async () => point, async () => {
+        if (point?.reached) {
+          const step = sign * before.page * 0.8 * pages;
+          await tab.page.mouse.move(point.x, point.y);
+          await tab.page.mouse.wheel(vertical ? 0 : step, vertical ? step : 0);
+          const wheeled = await wheelLanded(read, before, sign);
+          if (wheeled.moved || !wheeled.waited) return wheeled; // not waited: already at its end that way
+        }
+        byScript = true;
+        await box.evaluate((el, { vertical, step }) => el.scrollBy({ [vertical ? 'top' : 'left']: step * (vertical ? el.clientHeight : el.clientWidth), behavior: 'instant' }),
+          { vertical, step: sign * 0.8 * pages });
+        return { ...(await read()), moved: true };
+      }, { feedback: false, cue: 'scroll' });
+      now = await scrolledLater(tab, read, landed, watch, generation);
+    } finally {
+      watch.stop();
+    }
+    const how = byScript ? ` by script (the mouse wheel ${point?.reached ? 'did not move it' : 'could not reach it: something covers it'})` : '';
+    return `Scrolled the box around ${cleanRef(ref)} (${before.tag}) ${direction} ${plural}${how}: ${scrollPosition(landed, vertical)}` +
+      `${scrollMovedLater(landed, now, (p) => scrollPosition(p, vertical))}${scrollEnd(now, vertical)}.`;
   } finally {
     handle.dispose().catch(() => {});
   }
@@ -2009,13 +2131,19 @@ export function registerTools(server, manager) {
     `Output is cut at max_chars (default ${SNAPSHOT_MAX_CHARS}); a cut snapshot ends with a line saying how much was left out. ` +
     'mode "text" returns the readable text instead (of ref, else the page\'s main content), without refs: for reading articles and lists, not for acting. ' +
     'mode "links" returns its links as text and URL, each URL once: for collecting URLs (search results, threads, listings) without the whole snapshot. ' +
-    'find returns only the lines containing that text (any case), with the lines they sit in and what they hold, refs included: for finding a control on a big page.',
+    'find returns only the lines containing that text (any case), with the lines they sit in and what they hold, refs included: for finding a control on a big page. ' +
+    'A long list that loads more as you scroll or keeps only the rows near the view (a chat or DM thread, an email thread, comments, a feed) shows here only in part: read it whole with read_all.',
     { tab: tabArg, ref: refArg.optional(), find: z.string().min(1).optional().describe('Only the snapshot lines with this text, with their context and refs.'),
       mode: z.enum(['snapshot', 'text', 'links']).optional().describe('"snapshot" (default): accessibility tree with refs. "text": readable text only, no refs. "links": link texts and URLs, no refs.'),
       max_chars: z.number().int().min(1000).max(SNAPSHOT_MAX_CHARS_LIMIT).optional().describe(`Cut the output at this many characters (default ${SNAPSHOT_MAX_CHARS}, max ${SNAPSHOT_MAX_CHARS_LIMIT}).`) },
-    withTab(manager, (tab, { ref, mode, max_chars: maxChars, find }) => cued(tab, 'observe', async () => (mode === 'text' || mode === 'links'
-      ? text(`${await header(tab)}\n${await (mode === 'text' ? pageText : pageLinks)(tab, { ref, maxChars })}`)
-      : report(tab, { ref, maxChars, find })))));
+    withTab(manager, (tab, { ref, mode, max_chars: maxChars, find }) => cued(tab, 'observe', async () => {
+      if (mode === 'text' || mode === 'links') return text(`${await header(tab)}\n${await (mode === 'text' ? pageText : pageLinks)(tab, { ref, maxChars })}`);
+      const result = await report(tab, { ref, maxChars, find });
+      // A section that is a long list says it may be only part of one, as its text does.
+      const hint = ref && listHint(await listHintOf(tab, ref));
+      if (hint) result.content.find((c) => c.type === 'text').text += hint;
+      return result;
+    })));
 
   // A main-frame ref the last snapshot doesn't show as a link, field, toggle or row: worth asking the page whether its
   // click may carry the hidden new-tab modifier (BACKGROUND_CLICK_FN decides; this only saves its round trip).
@@ -2176,9 +2304,11 @@ export function registerTools(server, manager) {
     }));
 
   tool('scroll',
-    'Scroll the page (or the scrollable area under the viewport centre) by pages in a direction. With ref and direction, ' +
+    'Scroll the page (or the scrollable area under the viewport centre) by pages in a direction, with the mouse wheel. With ref and direction, ' +
     'scroll the box that ref is in instead (a list, panel or table that scrolls on its own, e.g. a long or virtualized list), ' +
-    'by pages of its own height. ref alone scrolls that element into view.',
+    'by pages of its own height. ref alone scrolls that element into view. The result says where it ended up once the page has reacted ' +
+    '(a list may load more, or put the scroll back); a box at its top or bottom may still grow there. To read a whole list that loads as you scroll, ' +
+    'use read_all instead of scrolling and reading by hand.',
     { tab: tabArg, ref: refArg.optional(), direction: z.enum(['up', 'down', 'left', 'right']).optional(), pages: z.number().positive().optional(),
       snapshot: snapshotArg, screenshot: screenshotArg, frames: framesArg, frame_ms: frameMsArg, timeout_ms: timeoutArg },
     withTab(manager, (tab, args) => act(tab, args, async () => {
@@ -2191,6 +2321,10 @@ export function registerTools(server, manager) {
       }
       return scrollPage(tab, args);
     })));
+
+  tool('read_all', READ_ALL_DESCRIPTION, readAllShape(tabArg),
+    withTab(manager, async (tab, args) => text(await cued(tab, 'scroll', () => readAll(tab, args,
+      { header, locator, pointed, wheelLanded, boxPoint, refuseBlockedPage, SCROLL_TARGET_FN })))));
 
   tool('drag',
     'Drag one element onto another (from_ref, to_ref), or along points in CSS pixels (from_x, from_y to to_x, to_y; a ref and a ' +

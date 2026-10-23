@@ -408,7 +408,7 @@ honest pages; a page can always show its own field's value, so a page faking its
   `tab_close {tab, confirm_close_users_tab?}` (the user's tabs, claimed or not, are refused without the flag; an unowned one is
   closed with `tabs.closeUnowned`, no claim, so it never wakes), `tab_keep {tab}` (hands over now), `tab_mute {tab, muted}`
   (tab audio, `tabs.setMuted`), `tab_focus {tab}`,
-  `navigate {tab, url? | action:"back"|"forward"|"reload"}`, `snapshot {tab, ref?, mode?: "snapshot"|"text", max_chars?}` (text: innerText of ref, else <main>/<article>, else body, else the root element (SVG, XML), read once the body is parsed; no refs; without ref it also takes in up to 5 iframes inside that element with a box of 50x50 px or more, each after an `[iframe: host]` line: innerText leaves iframes out, and sign-in forms live in them),
+  `navigate {tab, url? | action:"back"|"forward"|"reload"}`, `snapshot {tab, ref?, mode?: "snapshot"|"text", max_chars?}` (text: innerText of ref, else <main>/<article>, else body, else the root element (SVG, XML), read once the body is parsed; no refs; without ref it also takes in up to 5 iframes inside that element with a box of 50x50 px or more, each after an `[iframe: host]` line: innerText leaves iframes out, and sign-in forms live in them; a root with under 200 characters of its own text that holds open shadow roots is read through them (X draws its app in one); text, and a snapshot with ref, end with a line saying they show only what is rendered when a box or the page around or inside them scrolls by more than a screen and holds a log, feed, rows numbered by index (`data-index`, `aria-setsize`, `aria-rowcount`, a virtualizer) or absolutely placed rows, and point to `read_all`),
   `click {tab, ref? | x,y, button?, double?, modifiers?}`, `hover {tab, ref}`,
   `type {tab, ref, text, submit?, slowly?, append?}`, `fill_form {tab, fields:[{ref, value}]}` (textbox,
   checkbox, radio, combobox/select, slider), `select_option {tab, ref, values}`, `press_key {tab, key, ref?}`,
@@ -417,7 +417,30 @@ honest pages; a page can always show its own field's value, so a page faking its
   read once the wheel has landed (Chromium applies it after the input call returns; up to 1 s), or says at once that
   nothing there can move that way; ref and
   direction: the ref's own box if it scrolls that way, else its nearest scrolling ancestor, by `pages` of that box's
-  height (80% each, like page scrolls); with no such box, the mouse wheel over the ref; ref alone: into view), `drag {tab, from_ref, to_ref}`, `upload_files {tab, ref, paths}` (paths resolved through symlinks, `/System/Volumes/Data/<x>` counted as `/<x>`; hidden files and folders, `~/Library` other than iCloud
+  height (80% each, like page scrolls), with the mouse wheel at the middle of its visible part when the box is what is
+  there (X's chats put back any scroll that isn't wheel or key input), else by script, which the result says; with no
+  such box, the mouse wheel over the ref; ref alone: into view. After it moved, the requests it started are waited for
+  and the position read again: "a moment later the page had moved it to …" when a list loaded more or put the scroll
+  back. A box at an end is "at its top/bottom for now" (never "the start": a list that loads as it is scrolled grows
+  there). Positions of a box laid out from its end (flex `column-reverse`, right to left) count from its top or left),
+  `read_all {tab, ref?, direction?: "both"|"up"|"down", expand?, max_items?, max_seconds?, max_chars?, continue?}` (mcp/src/reader.mjs:
+  a whole list that loads as it is scrolled or mounts only the rows near the view, every item once, top first. The box is
+  the ref's scroller, else the page's main scrolling list, found through open shadow roots; the items are the children
+  of the element holding them (the outermost list role or tag with half of the box's text, re-picked after an expander
+  click). It turns the real mouse wheel over the box (script only where the wheel can't move it, and says so), 0.6 of
+  a page into unread rows, and merges each view by item keys (data-key, data-*-item-key, data-*message-id and the
+  like, never data-index or user, author or thread ids), else the same node with the same text, else text runs aligned
+  by position (duplicate texts stay as many as the page has; a jump with no overlap is a `[gap: …]` line). An end is
+  reached when a wheel toward it moves nothing and nothing new comes for 2.5 s, again after scrolling away and back,
+  with no loading indicator (a spinner up to 15 s), no list load it started still in flight (requestfinished, up to
+  15 s) and no expander left there. expand (default) clicks only allowlisted expanders ("Load more", "13 older
+  messages", "View 3 replies", "Show trimmed content", "Expand all", collapsed list items), never links, submits,
+  menus or names that act (send, reply, like, delete, archive, mark, …); each press is guarded in the page so only the
+  expander gets it. `Complete: yes.` only when every end asked was reached and no gap, unopened or disabled expander,
+  stale copy, removed item or partial container remains; else `Complete: NO.` saying what may be missing and how to go
+  on. Over max_chars (default 40000) the whole result goes to a private file in `fowlbrowser-exports` and the result
+  says where. continue resumes an incomplete read of the same box and document, keeping its items and checking both
+  ends again), `drag {tab, from_ref, to_ref}`, `upload_files {tab, ref, paths}` (paths resolved through symlinks, `/System/Volumes/Data/<x>` counted as `/<x>`; hidden files and folders, `~/Library` other than iCloud
   Drive and `~/Library/CloudStorage`, `/etc`, `/System`, `/private/var/db`, `/Library/Keychains` and `/private/var/log` are refused, and so is
   anything that isn't a regular file or folder (a device like `/dev/zero`, a pipe, a socket); a folder is refused if anything in it is hidden,
   not a regular file or folder, or a link into those places, or it holds more than 10,000 entries; a path is also refused

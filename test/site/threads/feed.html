@@ -1,0 +1,123 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Home / X</title>
+<link rel="stylesheet" href="threads.css">
+<style>
+  .bar { position: sticky; top: 0; background: #fffe; z-index: 1; }
+  main { width: 600px; max-width: 100%; margin: 0 auto; border: 1px solid #eff3f4; border-width: 0 1px; min-height: 100vh; }
+  .cells { position: relative; }
+  .cells > div { position: absolute; top: 0; left: 0; width: 100%; padding: 12px 16px; border-bottom: 1px solid #eff3f4; overflow-wrap: anywhere; }
+  .cells.flow > div { position: static; }
+  .post > div:first-child { font-weight: 700; }
+  .post > div:nth-child(2) { color: #536471; }
+  .post > div:nth-child(n+3) { margin-top: 4px; }
+  .end { text-align: center; color: #536471; padding: 32px 16px !important; }
+</style>
+<!-- X-style home timeline on the window: an IntersectionObserver near the bottom loads the next batch after a delay,
+     and with virtual=1 only the cells near the viewport stay mounted (absolute, translateY). See test/NOTES.md. -->
+<div class="bar">Home</div>
+<main>
+  <div class="cells" aria-label="Timeline: Your Home Timeline"></div>
+  <div class="loader"></div>
+</main>
+<script type="module">
+  import { params, truth, feedPosts, FEED_END, delays } from './data.js';
+  const p = params('feed', location.search);
+  const delay = delays(p);
+  window.__danger = [];
+  const cells = document.querySelector('.cells');
+  const loader = document.querySelector('.loader');
+
+  function fill(el, item) {
+    el.className = item.kind;
+    if (p.keys) el.dataset.key = item.key;
+    for (const text of item.lines) el.appendChild(Object.assign(document.createElement('div'), { textContent: text }));
+    return el;
+  }
+
+  if (p.all) {
+    cells.classList.add('flow');
+    for (const item of truth('feed', location.search)) cells.appendChild(fill(document.createElement('div'), item));
+    window.__rows = () => [...cells.children].map(el => el.innerText);
+  } else {
+    const posts = feedPosts(p);
+    const loaded = [];
+    let ended = false, loading = false, created = 0;
+    const take = (count) => {
+      for (let i = 0; i < count && !ended; i++) {
+        if (!p.endless && loaded.length >= p.n) break;
+        loaded.push(posts.next().value);
+      }
+      if (!p.endless && loaded.length >= p.n) { loaded.push({ key: 'end', kind: 'end', lines: FEED_END }); ended = true; }
+    };
+    const sizes = new Map();
+    const size = item => sizes.get(item.key) ?? 26 + item.lines.reduce((h, s) => h + 21 * Math.ceil(s.length / 60), 0);
+    let offs = [];
+    const layout = () => {
+      let y = 0;
+      offs = loaded.map((item) => { const at = y; y += size(item); return at; });
+      cells.style.height = `${y}px`;
+    };
+    const mounted = new Map();
+
+    // Mounts what is near the viewport (all of it with virtual=0), measures it, and keeps the view still when cells
+    // above it change height.
+    function render() {
+      for (let pass = 0; pass < 5; pass++) {
+        const top = -cells.getBoundingClientRect().top, bottom = top + innerHeight;
+        const near = i => !p.virtual || (offs[i] + size(loaded[i]) > top - 600 && offs[i] < bottom + 600);
+        for (const [key, el] of mounted) if (!near(Number(el.dataset.index))) { el.remove(); mounted.delete(key); }
+        loaded.forEach((item, i) => {
+          if (!near(i)) return;
+          let el = mounted.get(item.key);
+          if (!el) {
+            mounted.set(item.key, el = cells.appendChild(fill(document.createElement('div'), item)));
+            created++;
+          }
+          el.dataset.index = i;
+          el.style.transform = p.virtual ? `translateY(${offs[i]}px)` : '';
+        });
+        let delta = 0, changed = false;
+        for (const [key, el] of mounted) {
+          const i = Number(el.dataset.index);
+          const h = el.offsetHeight;
+          if (h === size(loaded[i])) continue;
+          if (offs[i] + size(loaded[i]) <= top) delta += h - size(loaded[i]);
+          sizes.set(key, h);
+          changed = true;
+        }
+        if (!changed) return;
+        layout();
+        if (delta) scrollBy(0, delta);
+      }
+    }
+
+    // The loader under the cells: near the viewport, the next batch comes after a delay; watched again after each load.
+    const io = new IntersectionObserver((entries) => {
+      if (!entries.at(-1).isIntersecting || loading || ended) return;
+      loading = true;
+      if (p.spinner) loader.innerHTML = '<div class="loading" role="progressbar" aria-label="Loading timeline"><svg class="spin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg></div>';
+      if (p.stall) return;
+      setTimeout(() => {
+        take(p.batch);
+        layout();
+        render();
+        loader.replaceChildren();
+        loading = false;
+        io.unobserve(loader);
+        if (!ended) io.observe(loader);
+      }, delay());
+    }, { rootMargin: '0px 0px 800px 0px' });
+
+    take(p.batch);
+    layout();
+    render();
+    addEventListener('scroll', render, { passive: true });
+    addEventListener('resize', render);
+    io.observe(loader);
+
+    window.__rows = () => [...mounted].sort((a, b) => Number(a[1].dataset.index) - Number(b[1].dataset.index)).map(([, el]) => el.innerText);
+    window.__state = () => ({ loaded: loaded.length, ended, loading, created, mounted: mounted.size, scrollY: Math.round(scrollY),
+      max: document.documentElement.scrollHeight - innerHeight, spinner: !!loader.querySelector('svg') });
+  }
+</script>

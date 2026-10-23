@@ -108,6 +108,8 @@ To update, run `git pull` and `sh install.sh` again. To remove it, run `sh unins
 - **Asks before acting for you.** Agents are told to check with you before they send, post, buy, delete or change
   account settings, and to treat text on web pages as information, never as instructions.
 - **Runs many agents at once.** Every agent session works in its own tabs.
+- **Reads whole threads.** Long chats, DMs, email threads, feeds and comments that load as you scroll are read to
+  both ends, with collapsed messages opened, and the agent is told plainly when a read is incomplete.
 - **Measures pages.** Performance traces with Core Web Vitals, Lighthouse audits and memory readings.
 
 ## What you can ask
@@ -185,7 +187,7 @@ Extension: chrome.debugger and chrome.tabs
 | Area | Tools |
 | --- | --- |
 | Browsers and tabs | `browser_list`, `tab_list`, `tab_open`, `tab_claim`, `tab_release`, `tab_close`, `tab_keep`, `tab_handoff`, `tab_mute`, `tab_focus` |
-| Reading | `snapshot` (also as text, a list of links, or just the lines with some text), `screenshot`, `evaluate`, `console`, `network`, `wait_for` (or until the page settles), `viewport` (sizes, phones, dark mode, reduced motion) |
+| Reading | `snapshot` (also as text, a list of links, or just the lines with some text), `read_all` (a whole chat, email thread, feed or comments, to both ends), `screenshot`, `evaluate`, `console`, `network`, `wait_for` (or until the page settles), `viewport` (sizes, phones, dark mode, reduced motion) |
 | Acting | `navigate`, `click`, `hover`, `type`, `fill_form`, `select_option`, `press_key`, `scroll`, `drag`, `upload_files` (inputs, buttons and drop zones), `dialog`, `media` |
 | Files and data | `download`, `downloads`, `export`, `browser_data` |
 | Performance | `trace_start`, `trace_stop`, `trace_insight`, `lighthouse`, `memory` |

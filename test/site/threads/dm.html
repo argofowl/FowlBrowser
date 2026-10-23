@@ -1,0 +1,199 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Kai Moreno / X</title>
+<link rel="stylesheet" href="threads.css">
+<style>
+  body { height: 100vh; display: flex; flex-direction: column; }
+  dm-pane { display: flex; flex-direction: column; width: 600px; max-width: 100%; height: min(720px, 100vh - 80px); margin: auto; border: 1px solid #eff3f4; }
+</style>
+<!-- X-style DM thread: a TanStack-like virtualized log in an open shadow root, newest at the bottom, older messages
+     loading at the top, scrolls without wheel/key/pointer/touch input thrown back to the bottom. See test/NOTES.md. -->
+<dm-pane id="pane"></dm-pane>
+<script type="module">
+  import { params, truth, delays } from './data.js';
+  const p = params('dm', location.search);
+  const all = truth('dm', location.search);
+  const delay = delays(p);
+  window.__danger = [];
+
+  const root = document.getElementById('pane').attachShadow({ mode: 'open' });
+  root.innerHTML = `<style>
+      :host { display: flex; flex-direction: column; font: 15px/1.4 -apple-system, system-ui, sans-serif; }
+      .bar { height: 53px; padding: 0 16px; display: flex; align-items: center; font-weight: 700; border-bottom: 1px solid #eff3f4; }
+      .log { flex: 1; overflow-y: auto; overflow-anchor: none; position: relative; outline: none; }
+      .slot { position: sticky; top: 0; height: 0; z-index: 1; display: flex; justify-content: center; }
+      .slot svg { margin-top: 12px; width: 26px; height: 26px; animation: spin 0.8s linear infinite; }
+      .slot circle { fill: none; stroke: #1d9bf0; stroke-width: 3; stroke-dasharray: 40 30; }
+      @keyframes spin { to { transform: rotate(1turn); } }
+      .sizer { position: relative; width: 100%; }
+      .sizer > div { position: absolute; top: 0; left: 0; width: 100%; padding: 4px 16px; }
+      .flow > div { position: static; }
+      .msg .bubble { max-width: 75%; width: fit-content; padding: 10px 14px; border-radius: 20px; background: #eff3f4; overflow-wrap: anywhere; }
+      .msg.out .bubble { margin-left: auto; background: #1d9bf0; color: #fff; }
+      .msg .time { font-size: 13px; color: #536471; margin-top: 2px; }
+      .msg.out .time { text-align: right; }
+      .date { text-align: center; font-size: 13px; color: #536471; padding: 14px 16px !important; }
+      .marker { text-align: center; padding: 24px 16px !important; color: #536471; border-bottom: 1px solid #eff3f4; }
+      .marker a { display: block; color: #1d9bf0; text-decoration: none; margin-top: 8px; }
+      form { display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid #eff3f4; }
+      input { flex: 1; border: 0; background: #eff3f4; border-radius: 16px; padding: 8px 12px; font: inherit; }
+    </style>
+    <div class="bar">Kai Moreno</div>
+    <div class="log" role="log" aria-label="Messages" tabindex="0"><div class="slot" role="status" aria-label="Loading messages"><div></div></div><div class="sizer"></div></div>
+    <form><input aria-label="Start a new message" placeholder="Start a new message"><button aria-label="Send">Send</button></form>`;
+  const log = root.querySelector('.log');
+  const slot = root.querySelector('.slot');
+  const sizer = root.querySelector('.sizer');
+  root.querySelector('form').addEventListener('submit', (e) => { e.preventDefault(); window.__danger.push('Send'); });
+
+  // One row's DOM: a block per line, so its innerText is exactly item.lines.
+  const isTime = s => /^\d{1,2}:\d\d [AP]M$/.test(s);
+  function fill(el, item) {
+    el.className = item.kind === 'msg' ? `msg ${item.side}` : item.kind;
+    el.replaceChildren();
+    const line = (parent, text, tag = 'div') => parent.appendChild(Object.assign(document.createElement(tag), { textContent: text }));
+    if (item.kind === 'msg') {
+      const timed = item.lines.length > 1 && isTime(item.lines.at(-1));
+      const bubble = line(el, '');
+      for (const text of timed ? item.lines.slice(0, -1) : item.lines) line(bubble, text);
+      if (timed) line(el, item.lines.at(-1)).className = 'time';
+    } else if (item.kind === 'marker') {
+      line(el, item.lines[0]);
+      line(el, item.lines[1]);
+      const a = line(el, item.lines[2], 'a');
+      a.href = 'feed.html';
+      a.addEventListener('click', () => window.__danger.push('View Profile'));
+    } else line(el, item.lines[0]);
+  }
+
+  if (p.all) {
+    sizer.classList.add('flow');
+    for (const item of all) sizer.appendChild(document.createElement('div')).dataset.key = item.key;
+    [...sizer.children].forEach((el, i) => fill(el, all[i]));
+    window.__rows = () => [...sizer.children].map(el => el.innerText);
+  } else {
+    let start = Math.max(0, all.length - p.batch);
+    let loaded = all.slice(start);
+    let loading = false, snapbacks = 0, created = 0;
+    const sizes = new Map();
+    let offs = [];
+    const estimate = item => item.kind === 'date' ? 47 : item.kind === 'marker' ? 140 :
+      28 + item.lines.reduce((h, s) => h + 20 * Math.ceil(s.length / 48), 0);
+    const size = item => sizes.get(item.key) ?? estimate(item);
+    const layout = () => {
+      let y = 0;
+      offs = loaded.map((item) => { const at = y; y += size(item); return at; });
+      sizer.style.height = `${y}px`;
+    };
+
+    // The page's own scrolls (anchoring, the bottom) are told apart from the rest by the position they set.
+    let expected = null;
+    const setTop = (v) => { log.scrollTop = v; expected = log.scrollTop; };
+    const toBottom = () => setTop(log.scrollHeight);
+
+    // Mounted rows: key -> element. With recycle=1 a fixed pool of elements takes whatever items are in view.
+    const mounted = new Map();
+    const pool = [];
+    function mount(from, to) {
+      const want = new Set(loaded.slice(from, to + 1).map(x => x.key));
+      for (const [key, el] of mounted) {
+        if (want.has(key)) continue;
+        mounted.delete(key);
+        if (p.recycle) { el.hidden = true; el.replaceChildren(); el.removeAttribute('data-key'); el.dataset.free = '1'; }
+        else el.remove();
+      }
+      for (let i = from; i <= to; i++) {
+        const item = loaded[i];
+        let el = mounted.get(item.key);
+        if (!el) {
+          el = p.recycle ? pool.find(x => x.dataset.free) : null;
+          if (!el) {
+            el = sizer.appendChild(document.createElement('div'));
+            created++;
+            if (p.recycle) pool.push(el);
+          }
+          el.hidden = false;
+          delete el.dataset.free;
+          fill(el, item);
+          if (p.keys) el.dataset.key = item.key;
+          mounted.set(item.key, el);
+        }
+        el.dataset.index = i;
+        el.style.transform = `translateY(${offs[i]}px)`;
+      }
+    }
+
+    // Mounts the rows in view (+2 either side), measures them, and keeps the rows in view still when rows above change.
+    function render() {
+      for (let pass = 0; pass < 5; pass++) {
+        const top = log.scrollTop, bottom = top + log.clientHeight;
+        let first = offs.findIndex((y, i) => y + size(loaded[i]) > top);
+        if (first < 0) first = loaded.length - 1;
+        let last = first;
+        while (last < loaded.length - 1 && offs[last + 1] < bottom) last++;
+        mount(Math.max(0, first - 2), Math.min(loaded.length - 1, last + 2));
+        let delta = 0, changed = false;
+        for (const [key, el] of mounted) {
+          const i = Number(el.dataset.index);
+          const h = el.offsetHeight;
+          if (h === size(loaded[i])) continue;
+          if (offs[i] < top) delta += h - size(loaded[i]);
+          sizes.set(key, h);
+          changed = true;
+        }
+        if (!changed) return;
+        layout();
+        if (delta) setTop(log.scrollTop + delta);
+      }
+    }
+
+    function load() {
+      loading = true;
+      if (p.spinner) slot.firstElementChild.innerHTML = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>';
+      if (p.stall) return;
+      setTimeout(() => {
+        const from = Math.max(0, start - p.batch);
+        const added = all.slice(from, start);
+        start = from;
+        loaded = all.slice(start);
+        layout();
+        setTop(log.scrollTop + added.reduce((h, item) => h + size(item), 0));
+        render();
+        slot.firstElementChild.replaceChildren();
+        loading = false;
+      }, delay());
+    }
+
+    // Like X: a scroll that no wheel, key, pointer or touch input started within 300 ms goes back to the newest
+    // messages at once. A scroll that keeps going (a wheel's smooth scroll) counts as the input's.
+    let lastInput = -1e9, lastUserScroll = -1e9;
+    for (const type of ['wheel', 'keydown', 'pointerdown', 'touchstart']) {
+      addEventListener(type, () => { lastInput = performance.now(); }, { capture: true, passive: true });
+    }
+    log.addEventListener('scroll', () => {
+      const now = performance.now();
+      if (expected !== null && Math.abs(log.scrollTop - expected) < 1) { expected = null; render(); return; }
+      expected = null;
+      if (p.snapback && now - lastInput > 300 && now - lastUserScroll > 100) {
+        snapbacks++;
+        toBottom();
+        render();
+        return;
+      }
+      lastUserScroll = now;
+      render();
+      if (log.scrollTop < 400 && !loading && start > 0) load();
+    });
+
+    layout();
+    for (let i = 0; i < 4; i++) { toBottom(); render(); }
+
+    window.__rows = () => [...mounted].sort((a, b) => Number(a[1].dataset.index) - Number(b[1].dataset.index)).map(([, el]) => el.innerText);
+    window.__state = () => ({
+      loaded: loaded.length, total: all.length, start, loading, snapbacks, created,
+      scrollTop: Math.round(log.scrollTop), max: log.scrollHeight - log.clientHeight,
+      mounted: [...mounted].map(([key, el]) => ({ key, index: Number(el.dataset.index) })),
+      spinner: !!slot.querySelector('svg'),
+    });
+  }
+</script>

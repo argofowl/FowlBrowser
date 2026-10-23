@@ -1,0 +1,102 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Comments - Field notes</title>
+<link rel="stylesheet" href="threads.css">
+<style>
+  main { width: 640px; max-width: 100%; margin: 0 auto; padding: 0 16px 80px; }
+  .thread { padding: 10px 0; border-bottom: 1px solid #eff3f4; }
+  .c { position: relative; padding-right: 80px; overflow-wrap: anywhere; }
+  .c > div:first-child { font-weight: 700; font-size: 13px; }
+  .c > div:nth-child(2) { color: #536471; font-size: 12px; }
+  .c .acts { position: absolute; top: 0; right: 0; }
+  .replies { margin: 8px 0 0 32px; }
+  .replies .c + .c { margin-top: 8px; }
+  .more { color: #065fd4; background: none; border: 0; padding: 6px 0; font-weight: 600; }
+</style>
+<!-- Comments that grow only through buttons: "Show older comments" on top, "Load more comments" at the bottom (a new
+     button after each load) and "View k replies" per comment (each a delay with a spinner). Like and Reply are recorded
+     in __danger. See test/NOTES.md. -->
+<div class="bar">Field notes</div>
+<main>
+  <h1>Twelve small things I changed in my studio this year</h1>
+  <p>Short post. The comments are the point.</p>
+  <section aria-label="Comments">
+    <div class="top"></div>
+    <div class="threads"></div>
+    <div class="bottom"></div>
+  </section>
+</main>
+<script type="module">
+  import { params, truth, delays } from './data.js';
+  const p = params('comments', location.search);
+  const items = truth('comments', location.search);
+  const delay = delays(p);
+  window.__danger = [];
+  const threads = document.querySelector('.threads');
+  const [topSlot, bottomSlot] = [document.querySelector('.top'), document.querySelector('.bottom')];
+  const SPIN = '<div class="loading"><svg class="spin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg></div>';
+  const ICON = { Like: 'M2 21h4V9H2zm20-11a2 2 0 0 0-2-2h-6.3l1-4.6V3a1.5 1.5 0 0 0-.4-1L13 1 6.6 7.6A2 2 0 0 0 6 9v10a2 2 0 0 0 2 2h9a2 2 0 0 0 1.8-1.2l3-7.1c.1-.2.2-.5.2-.7z',
+    Reply: 'M10 9V5l-7 7 7 7v-4c5 0 8 1.5 11 5-1-5-4-10-11-11z' };
+
+  function block(lines) {
+    const el = document.createElement('div');
+    el.className = 'c';
+    for (const text of lines) el.appendChild(Object.assign(document.createElement('div'), { textContent: text }));
+    const acts = el.appendChild(document.createElement('div'));
+    acts.className = 'acts';
+    for (const name of ['Like', 'Reply']) {
+      acts.insertAdjacentHTML('beforeend', `<button class="icon" aria-label="${name}"><svg viewBox="0 0 24 24"><path d="${ICON[name]}"/></svg></button>`);
+    }
+    acts.addEventListener('click', e => window.__danger.push(e.target.closest('button')?.getAttribute('aria-label')));
+    return el;
+  }
+  function thread(item) {
+    const el = document.createElement('div');
+    el.className = 'thread';
+    if (p.keys) el.dataset.key = item.key;
+    el.appendChild(block(item.comment));
+    if (!item.replies.length) return el;
+    const replies = el.appendChild(document.createElement('div'));
+    replies.className = 'replies';
+    const show = () => { for (const r of item.replies) replies.appendChild(block(r)); };
+    if (p.all) { show(); return el; }
+    const n = item.replies.length;
+    const btn = Object.assign(document.createElement('button'), { className: 'more', textContent: `View ${n} ${n === 1 ? 'reply' : 'replies'}` });
+    btn.addEventListener('click', () => {
+      replies.innerHTML = SPIN;
+      setTimeout(() => { replies.replaceChildren(); show(); }, delay());
+    });
+    replies.appendChild(btn);
+    return el;
+  }
+
+  let start = p.all ? 0 : Math.floor(p.n * 0.4), end = p.all ? p.n : Math.min(p.n, start + p.batch);
+  threads.append(...items.slice(start, end).map(thread));
+  // Each load puts a new button in place (a new element, as YouTube and Reddit do), until nothing is left that way.
+  function pager(slot, label, left, load) {
+    if (!left()) return slot.replaceChildren();
+    const btn = Object.assign(document.createElement('button'), { className: 'more', textContent: label });
+    btn.addEventListener('click', () => {
+      slot.innerHTML = SPIN;
+      if (p.stall) return;
+      setTimeout(() => { load(); pager(slot, label, left, load); }, delay());
+    });
+    slot.replaceChildren(btn);
+  }
+  if (!p.all) {
+    pager(topSlot, 'Show older comments', () => start > 0, () => {
+      const from = Math.max(0, start - p.batch);
+      threads.prepend(...items.slice(from, start).map(thread));
+      start = from;
+    });
+    pager(bottomSlot, 'Load more comments', () => end < p.n, () => {
+      const to = Math.min(p.n, end + p.batch);
+      threads.append(...items.slice(end, to).map(thread));
+      end = to;
+    });
+  }
+
+  window.__rows = () => [...threads.children].map(el => el.innerText);
+  window.__state = () => ({ start, end, total: p.n, spinners: document.querySelectorAll('.spin').length,
+    replies: document.querySelectorAll('.replies .c').length });
+</script>

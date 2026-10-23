@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Chat with Kai Moreno</title>
+<link rel="stylesheet" href="threads.css">
+<style>
+  body { height: 100vh; display: flex; flex-direction: column; }
+  .pane { width: 600px; max-width: 100%; height: min(720px, 100vh - 80px); margin: auto; border: 1px solid #eff3f4; display: flex; flex-direction: column; }
+  /* Newest first in the DOM, drawn bottom up: scrollTop is 0 at the bottom and negative above it. */
+  .chat { flex: 1; overflow-y: auto; display: flex; flex-direction: column-reverse; }
+  .chat > div { padding: 4px 16px; flex: none; }
+  .msg .bubble { max-width: 75%; width: fit-content; padding: 10px 14px; border-radius: 18px; background: #eff3f4; overflow-wrap: anywhere; }
+  .msg.out .bubble { margin-left: auto; background: #7856ff; color: #fff; }
+  .msg .time { font-size: 13px; color: #536471; margin-top: 2px; }
+  .msg.out .time { text-align: right; }
+  .date, .marker { text-align: center; font-size: 13px; color: #536471; padding: 14px 16px !important; }
+  .top { min-height: 1px; }
+</style>
+<!-- A chat in a flex column-reverse box (Messenger, Slack and Discord style): not virtualized, older messages load at
+     the top after a delay, no row keys by default. See test/NOTES.md. -->
+<div class="pane">
+  <div class="bar">Kai Moreno</div>
+  <div class="chat" role="log" aria-label="Conversation"><div class="top"></div></div>
+</div>
+<script type="module">
+  import { params, truth, delays } from './data.js';
+  const p = params('chat-reverse', location.search);
+  const all = truth('chat-reverse', location.search);
+  const delay = delays(p);
+  window.__danger = [];
+  const chat = document.querySelector('.chat');
+  const top = chat.querySelector('.top');
+
+  const isTime = s => /^\d{1,2}:\d\d [AP]M$/.test(s);
+  function row(item) {
+    const el = document.createElement('div');
+    el.className = item.kind === 'msg' ? `msg ${item.side}` : item.kind;
+    if (p.keys) el.dataset.key = item.key;
+    const line = (parent, text) => parent.appendChild(Object.assign(document.createElement('div'), { textContent: text }));
+    if (item.kind === 'msg') {
+      const timed = item.lines.length > 1 && isTime(item.lines.at(-1));
+      const bubble = line(el, '');
+      for (const text of timed ? item.lines.slice(0, -1) : item.lines) line(bubble, text);
+      if (timed) line(el, item.lines.at(-1)).className = 'time';
+    } else for (const text of item.lines) line(el, text);
+    return el;
+  }
+  // Older rows go in just before the top sentinel (the end of the DOM is the top of the view).
+  const prepend = items => { for (const item of [...items].reverse()) chat.insertBefore(row(item), top); };
+
+  let start = p.all ? 0 : Math.max(0, all.length - p.batch);
+  let loading = false;
+  prepend(all.slice(start));
+  window.__rows = () => [...chat.children].filter(el => el !== top).reverse().map(el => el.innerText);
+  window.__state = () => ({ loaded: all.length - start, total: all.length, start, loading, scrollTop: Math.round(chat.scrollTop),
+    max: chat.scrollHeight - chat.clientHeight, spinner: !!top.querySelector('svg') });
+
+  if (!p.all) {
+    // A sentinel at the top: near the view (400 px), the next older batch loads; it is watched again after each load.
+    const io = new IntersectionObserver((entries) => {
+      if (!entries.at(-1).isIntersecting || loading || start === 0) return;
+      loading = true;
+      if (p.spinner) top.innerHTML = '<div class="loading"><svg class="spin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg></div>';
+      if (p.stall) return;
+      setTimeout(() => {
+        const from = Math.max(0, start - p.batch);
+        prepend(all.slice(from, start));
+        start = from;
+        top.replaceChildren();
+        loading = false;
+        io.unobserve(top);
+        io.observe(top);
+      }, delay());
+    }, { root: chat, rootMargin: '400px 0px 0px 0px' });
+    io.observe(top);
+  }
+</script>

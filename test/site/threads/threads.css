@@ -1,0 +1,13 @@
+/* Shared look of the thread pages. No generated text (::before content, text-transform): rows' innerText is the truth. */
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.4 -apple-system, system-ui, sans-serif; color: #0f1419; background: #fff; }
+button { font: inherit; cursor: pointer; }
+.bar { height: 53px; padding: 0 16px; display: flex; align-items: center; font-weight: 700; border-bottom: 1px solid #eff3f4; }
+.spin { width: 26px; height: 26px; animation: spin 0.8s linear infinite; }
+.spin circle { fill: none; stroke: #1d9bf0; stroke-width: 3; stroke-dasharray: 40 30; }
+@keyframes spin { to { transform: rotate(1turn); } }
+.icon { width: 34px; height: 34px; border: 0; border-radius: 50%; background: none; color: #536471; display: inline-grid; place-items: center; }
+.icon svg { width: 18px; height: 18px; fill: currentColor; }
+.icon:hover { background: #e8f5fd; color: #1d9bf0; }
+.pill { border: 1px solid #cfd9de; border-radius: 999px; background: #fff; padding: 6px 14px; font-weight: 600; color: #0f1419; }
+.loading { display: flex; justify-content: center; padding: 16px; }

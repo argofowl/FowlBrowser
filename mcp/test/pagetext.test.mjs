@@ -118,3 +118,38 @@ test('snapshot mode "links" leaves out in-page anchors, "#" (the usual script-dr
   assert.match(text, /Links of <body> \(2;/);
   assert.match(text, /- Blue mug → https:\/\/shop\.example\/item\/1\n- Next page → https:\/\/shop\.example\/list\?page=2$/);
 });
+
+test('a page drawn inside open shadow roots (X\'s app) is read through them, keeping its own text and what slots show', async () => {
+  // A stand-in DOM: text nodes, elements with childNodes, an open shadow root holding a slot, and the light DOM child the
+  // slot shows. innerText leaves shadow content out, as Chromium's does.
+  const text = (data) => ({ nodeType: 3, data });
+  const el = (localName, childNodes = [], { shadow, own = '' } = {}) => {
+    const node = { nodeType: 1, localName, tagName: localName.toUpperCase(), id: '', childNodes, getAttribute: () => null, checkVisibility: () => localName !== 'style' };
+    node.children = childNodes.filter((c) => c.nodeType === 1);
+    const all = () => node.children.flatMap((c) => [c, ...c.querySelectorAll('*')]);
+    Object.assign(node, { querySelectorAll: () => all(), querySelector: () => all()[0] ?? null, innerText: own });
+    if (shadow) node.shadowRoot = { childNodes: shadow };
+    return node;
+  };
+  const slotted = el('span', [text('Slotted text')], { own: 'Slotted text' });
+  const slot = Object.assign(el('slot'), { assignedNodes: () => [slotted] });
+  const widget = el('my-widget', [slotted], { shadow: [el('style', [text('p { color: red }')]), el('p', [text('Widget text')], { own: 'Widget text' }), slot] });
+  const main = el('main', [text('Important direct text.'), widget], { own: 'Important direct text.\nSlotted text' });
+  const doc = { readyState: 'complete', querySelector: (s) => (s.startsWith('main') ? main : null), body: main, documentElement: main };
+  const { text: read } = setup(doc);
+  Object.assign(globalThis, { Node: { TEXT_NODE: 3, ELEMENT_NODE: 1 }, getComputedStyle: () => ({ display: 'block' }) });
+  try {
+    const result = await read();
+    assert.equal(result.error, false, result.text);
+    assert.match(result.text, /Text of <main> .*\n^Important direct text\.\nWidget text\nSlotted text$/m);
+    // The root itself the host (a ref to it, or a <main> that is one): its shadow tree is read too.
+    main.shadowRoot = { childNodes: [el('p', [text('Messages in the host')], { own: 'Messages in the host' })] };
+    main.childNodes = [];
+    main.children = [];
+    main.innerText = '';
+    assert.match((await read()).text, /Text of <main> .*\n^Messages in the host$/m);
+  } finally {
+    delete globalThis.Node;
+    delete globalThis.getComputedStyle;
+  }
+});
