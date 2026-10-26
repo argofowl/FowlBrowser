@@ -20,8 +20,9 @@ export const LABEL = process.env.FOWLBROWSER_LABEL || 'Claude';
 const AGENTS = { claude: 'Claude', codex: 'Codex' };
 
 // Who this session is, for other sessions' tab_list and the browser's log, e.g. "Codex via FowlTweets in Project X (pid
-// 70289)": the agent (FOWLBROWSER_LABEL, else the program that started this server), the app above it (the outermost
-// bundle of the nearest ancestor inside one), the project folder.
+// 70289)": the agent (FOWLBROWSER_LABEL, else the program that started this server), what started that agent (the nearest
+// ancestor that isn't a shell, runtime or agent: its outermost app bundle, else its program), the project folder.
+const PLUMBING = /^(node|bun|deno|npm|npx|python\d*(\.\d+)?|ruby|zsh|bash|sh|fish|dash|env|login|sudo|script|tmux|screen|claude|codex)$/i;
 let session;
 export function sessionName() {
   session ??= new Promise((resolve) => {
@@ -36,8 +37,12 @@ export function sessionName() {
       const name = process.env.FOWLBROWSER_LABEL || AGENTS[agentName.toLowerCase()] || LABEL;
       let app = null;
       for (let pid = agent?.ppid, hops = 0; !app && pid > 1 && procs.has(pid) && hops < 20; pid = procs.get(pid).ppid, hops++) {
-        app = /^\/(?:[^/]+\/)*?([^/]+)\.app\//.exec(procs.get(pid).comm)?.[1]?.replace(/ Helper\b.*$/, '') ?? null;
+        const { comm } = procs.get(pid);
+        const bundle = /^\/(?:[^/]+\/)*?([^/]+)\.app\//.exec(comm)?.[1]?.replace(/ Helper\b.*$/, '');
+        const program = path.basename(comm);
+        app = bundle ?? (comm.includes('.app/') || PLUMBING.test(program) ? null : program);
       }
+      if (app?.toLowerCase() === agentName.toLowerCase()) app = null; // the agent's own app (Claude's desktop app)
       resolve(`${name}${app ? ` via ${app}` : ''} in ${path.basename(process.cwd())} (pid ${process.ppid})`);
     });
   });
