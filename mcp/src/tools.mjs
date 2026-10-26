@@ -1818,6 +1818,7 @@ export function registerTools(server, manager) {
       let tabKey = null;
       try { if (typeof args?.tab === 'string') { const { key, tabId } = parseTabId(args.tab); tabKey = `${key}:${tabId}`; } } catch {}
       if (tabKey) callsByTab.set(tabKey, (callsByTab.get(tabKey) ?? 0) + 1);
+      manager.markActive?.();
       let result;
       try {
         // A parked tab (taken over by the user, or handed to them) refuses everything but resuming or letting it go, at once.
@@ -1831,6 +1832,7 @@ export function registerTools(server, manager) {
       } finally {
         if (tabKey && callsByTab.get(tabKey) > 1) callsByTab.set(tabKey, callsByTab.get(tabKey) - 1);
         else if (tabKey) callsByTab.delete(tabKey);
+        manager.markActive?.();
       }
       // The user took the tab over while this call ran on it: that, not the call's own outcome, is what the agent needs.
       const takenOver = tabKey && takeover.takenOverSince(tabKey, started);
@@ -1874,8 +1876,10 @@ export function registerTools(server, manager) {
         out.push(`Browser: ${b.name} ("${b.key}") · ${tabs.length} tab${tabs.length === 1 ? '' : 's'}${scope === 'mine' ? ' controlled by you' : ''}`);
         for (const t of tabs) {
           const parkedAs = { takeover: '; taken over by the user', handoff: '; handed to the user' }[t.parked] ?? '';
+          // Who holds another session's tab, so a tab held too long can be traced (an extension before this names nobody).
+          const holder = [t.ownerSession, Date.now() - t.ownerSeenAt >= 60_000 && `idle ${Math.floor((Date.now() - t.ownerSeenAt) / 60_000)} min`, t.releasing && 'letting go of it now'].filter(Boolean);
           const owner = t.owner === 'you' ? `you (${t.origin === 'user' ? 'claimed from the user' : 'agent tab'}${parkedAs})`
-            : t.owner === 'other' ? 'another agent (do not touch)' : 'user (claimable)';
+            : t.owner === 'other' ? `another agent${holder.length ? `: ${holder.join(', ')}` : ''} (do not touch)` : 'user (claimable)';
           const flags = [t.active && 'active', t.pinned && 'pinned', t.audible && 'playing audio', t.muted && 'muted', t.groupTitle && `group "${t.groupTitle}"`].filter(Boolean);
           out.push(`- ${b.key}:${t.id} · ${t.title || '(no title)'} · ${t.url} · owner: ${owner}${flags.length ? ` · ${flags.join(', ')}` : ''}`);
         }

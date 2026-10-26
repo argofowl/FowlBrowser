@@ -99,10 +99,12 @@ test('the instructions say what to do after a takeover and when to hand a tab ov
   assert.ok(instructions.length <= 4096, `${instructions.length} characters`);
 });
 
-test('authenticates and says hello with the label', async () => {
+test('authenticates and says hello with the label and who this session is', async () => {
   await call('browser_list');
   assert.equal(seen[0].method, 'host.auth');
-  assert.deepEqual(seen.find((m) => m.method === 'client.hello').params, { label: 'unit' });
+  const { label, session } = seen.find((m) => m.method === 'client.hello').params;
+  assert.equal(label, 'unit');
+  assert.match(session, new RegExp(`^unit( via .+)? in ${path.basename(process.cwd()).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(pid \\d+\\)$`));
 });
 
 test('browser_list names the browser, version and silence', async () => {

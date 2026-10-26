@@ -17,6 +17,33 @@ import { CDPRelay } from './vendor/cdpRelay.mjs';
 import { keepViewportSize } from './viewport.mjs';
 
 export const LABEL = process.env.FOWLBROWSER_LABEL || 'Claude';
+const AGENTS = { claude: 'Claude', codex: 'Codex' };
+
+// Who this session is, for other sessions' tab_list and the browser's log, e.g. "Codex via FowlTweets in Project X (pid
+// 70289)": the agent (FOWLBROWSER_LABEL, else the program that started this server), the app above it (the outermost
+// bundle of the nearest ancestor inside one), the project folder.
+let session;
+export function sessionName() {
+  session ??= new Promise((resolve) => {
+    execFile('ps', ['-axo', 'pid=,ppid=,comm='], { timeout: 2000 }, (_error, stdout = '') => {
+      const procs = new Map();
+      for (const line of String(stdout).split('\n')) {
+        const m = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+        if (m) procs.set(Number(m[1]), { ppid: Number(m[2]), comm: m[3] });
+      }
+      const agent = procs.get(process.ppid);
+      const agentName = path.basename(agent?.comm ?? '');
+      const name = process.env.FOWLBROWSER_LABEL || AGENTS[agentName.toLowerCase()] || LABEL;
+      let app = null;
+      for (let pid = agent?.ppid, hops = 0; !app && pid > 1 && procs.has(pid) && hops < 20; pid = procs.get(pid).ppid, hops++) {
+        app = /^\/(?:[^/]+\/)*?([^/]+)\.app\//.exec(procs.get(pid).comm)?.[1]?.replace(/ Helper\b.*$/, '') ?? null;
+      }
+      resolve(`${name}${app ? ` via ${app}` : ''} in ${path.basename(process.cwd())} (pid ${process.ppid})`);
+    });
+  });
+  return session;
+}
+
 const RESCAN_MS = 5000;
 const BUFFER_LIMIT = 1000;
 const NAMES = { chrome: 'Chrome', helium: 'Helium', chromium: 'Chromium', brave: 'Brave', edge: 'Edge' };
@@ -502,7 +529,7 @@ export class BrowserManager {
     const attempt = (async () => {
       const host = new HostClient(socketPath);
       try {
-        await host.connect(LABEL);
+        await host.connect(LABEL, await sessionName());
       } catch {
         host.close();
         return; // stale socket file or a browser mid-restart; the next scan retries
@@ -540,6 +567,12 @@ export class BrowserManager {
       throw new Error(`Browser "${key}" is not connected. ${others} Use browser_list.`);
     }
     return browser;
+  }
+
+  // Tells every browser this session is at work (a tool call starting or ending): only that keeps the tabs it holds from
+  // being given back as idle, never the traffic its pages cause on their own (workers, iframes, loads).
+  markActive() {
+    for (const browser of this.browsers.values()) browser.host.notify('client.active');
   }
 
   async all() {

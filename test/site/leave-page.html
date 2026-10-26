@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Leave page</title>
+<link rel="stylesheet" href="style.css">
+<h1>Leave page</h1>
+<label>Draft <textarea id="draft"></textarea></label>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  // Like a chat or mail composer: once there is a draft, leaving the page asks first (beforeunload).
+  document.getElementById('draft').addEventListener('input', () => {
+    document.getElementById('result').textContent = 'draft';
+    window.onbeforeunload = (event) => { event.preventDefault(); event.returnValue = ''; };
+  });
+</script>

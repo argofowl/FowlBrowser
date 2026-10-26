@@ -84,6 +84,7 @@ const givenBack = new Set(); // "chrome:52" popups the extension gave back to th
 const usersInput = new Map(); // "chrome:52" -> when the user's latest input in it was (onReport)
 const appLinks = new Map(); // "chrome:52" -> { url, at } of the page's latest navigation to a link for another app
 const reattached = new Map(); // "chrome:52" -> notice: attached again after a link for another app, not told yet
+const idled = new Map(); // "chrome:52" -> notice: given back to the user after this session sent nothing for 10 min, not told yet
 const recovering = new Map(); // "chrome:52" -> a detach after a link for another app, until judged and attached again
 const takeoverWaits = new Map(); // "chrome:52" -> listeners told of its takeover as it is noted (onTakeover)
 const calls = new AsyncLocalStorage(); // the tool call code runs for: { tabKey, onParked } (see inCall)
@@ -143,11 +144,12 @@ export function takenOverSince(key, since) {
 // app is told about once, in the next result of any tool.
 export function withNotices(result, tabKey) {
   const keys = [...unseen].filter((key) => key !== tabKey);
-  if (!keys.length && !reattached.size) return result;
+  if (!keys.length && !reattached.size && !idled.size) return result;
   for (const key of keys) unseen.delete(key);
   const first = result.content?.find((c) => c.type === 'text');
-  const lines = [...keys.map(notice), ...reattached.values()].filter(Boolean);
+  const lines = [...keys.map(notice), ...reattached.values(), ...idled.values()].filter(Boolean);
   reattached.clear();
+  idled.clear();
   if (!lines.length) return result;
   if (first) first.text = `${lines.join('\n')}\n${first.text}`;
   else result.content = [{ type: 'text', text: lines.join('\n') }, ...(result.content ?? [])];
@@ -420,6 +422,10 @@ async function onRemoved(browser, tabId, removeInfo) {
   // tabs.openChild child likewise.
   const download = recently(downloaded, key, CLOSED_BY_PAGE_MS) && ['', 'about:blank'].includes(tab?.page.url());
   for (const map of [inputs, ending, crashed, downloaded, usersInput, appLinks, reattached]) map.delete(key);
+  if (removeInfo?.idle) { // still open, the user's again: this session had sent nothing for 10 minutes
+    idled.set(key, `FowlBrowser gave ${key} back to the user at ${clock(Date.now())}, as this session had not used the browser for 10 minutes. To go on there, tab_claim it again.`);
+    return;
+  }
   if (removeInfo?.usersPopup) { // still open: a popup the extension gave back to the user who opened it
     givenBack.add(key);
     setTimeout(() => givenBack.delete(key), KEEP_MS).unref();

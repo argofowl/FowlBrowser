@@ -74,6 +74,8 @@ export async function endTurn(manager) {
       const tab = tabs.get(info.id);
       // A parked tab (taken over, handed off) stays this session's, so the next turn can resume it once the user says so.
       // The server notes a takeover before the extension has parked the tab: both count, here and right before closing.
+      // One the extension is letting go of already (idle) needs nothing more.
+      if (info.releasing) return;
       if (!tab || info.parked || parked(id) || tab.busy || callsByTab.get(id) > 0) return result.skipped.push(id);
       // Older extensions don't send kept; handedOver was their rule.
       const close = info.origin === 'agent' && !(info.kept ?? info.handedOver);

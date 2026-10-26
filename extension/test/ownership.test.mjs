@@ -2772,3 +2772,128 @@ test('a client that leaves while tabs.open still sets up its tab: the tab leaves
   assert.deepEqual(chrome.closedInGroup, []);
   assert.equal(core.owners.size, 0);
 });
+
+// argo's X chat tab (2026-10-26): an agent closed it with a draft in it, the page asked "leave page?" through the debugger,
+// nobody answered, and the tab stayed frozen, active, muted and held by a session that had long ended.
+test('a page asking "leave page?" as the extension closes it is answered: the close goes through', async () => {
+  const { chrome, core, call } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://chat.example/' });
+  const remove = chrome.tabs.remove;
+  chrome.tabs.remove = async (id) => {
+    let answered;
+    const left = new Promise((resolve) => { answered = resolve; });
+    const send = chrome.debugger.sendCommand;
+    chrome.debugger.sendCommand = async (target, method, params) => {
+      if (method === 'Page.handleJavaScriptDialog' && target.tabId === id && params.accept) answered();
+      return send(target, method, params);
+    };
+    await core.onDebuggerEvent({ tabId: id }, 'Page.javascriptDialogOpening', { type: 'beforeunload', message: '' });
+    await left;
+    return remove(id);
+  };
+  assert.ok(!(await call(1, 'chrome.tabs.remove', [tab.id])).error);
+  assert.ok(!chrome.tabsById.has(tab.id));
+  // Not the extension's close: the question goes to the client as usual.
+  const { result: other } = await call(1, 'tabs.open', {});
+  chrome.calls.length = 0;
+  await core.onDebuggerEvent({ tabId: other.id }, 'Page.javascriptDialogOpening', { type: 'beforeunload', message: '' });
+  assert.ok(!chrome.calls.some(([, , method]) => method === 'Page.handleJavaScriptDialog'));
+});
+
+test('a close the page holds up stops being waited for: the leaving session\'s cleanup gives the tab to the user, unmuted and detached', async () => {
+  const timers = manualTimers();
+  const { chrome, core, call, start } = setup({ timers });
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://chat.example/' });
+  chrome.tabs.remove = () => new Promise(() => {}); // the page's question is never answered
+  const closing = start(1, 'chrome.tabs.remove', [tab.id]);
+  for (let i = 0; i < 20 && !timers.pending.size; i++) await tick();
+  await timers.fire(10_000);
+  await closing.done;
+  assert.match(closing.reply().error.message, /did not close within 10 s: its page asks before it is left/);
+  assert.equal(core.owners.get(tab.id).client, 1, 'still the agent\'s, which may try again');
+
+  const leaving = core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } });
+  for (let i = 0; i < 20 && !timers.pending.size; i++) await tick();
+  await timers.fire(10_000);
+  await leaving;
+  assert.ok(!core.owners.has(tab.id), 'nobody holds it');
+  assert.equal(chrome.tabsById.get(tab.id).mutedInfo.muted, false);
+  assert.equal(chrome.tabsById.get(tab.id).groupId, -1);
+  assert.ok(chrome.calls.some(([c, id]) => c === 'debugger.detach' && id === tab.id));
+});
+
+test('a connected session quiet for 10 min gives back the tabs the user sees as theirs; its background work tabs stay', async () => {
+  const { chrome, core, call, sent } = setup();
+  const usersTab = chrome.addTab({ url: 'https://user.example/' });
+  await call(1, 'tabs.claim', { tabId: usersTab.id });
+  const { result: work } = await call(1, 'tabs.open', { url: 'https://work.example/' });
+  const { result: front } = await call(1, 'tabs.open', { url: 'https://front.example/' });
+  chrome.tabsById.get(front.id).active = true; // the user is looking at it
+  const { result: kept } = await call(1, 'tabs.open', { url: 'https://kept.example/', forUser: true });
+  const busyTab = chrome.addTab({ url: 'https://busy.example/' });
+  await call(2, 'tabs.claim', { tabId: busyTab.id });
+  const now = Date.now;
+  try {
+    await core.releaseIdle();
+    Date.now = () => now() + 9 * 60_000;
+    // Session 2 is at work in another tab of its own; session 1 still sends nothing.
+    await call(2, 'tabs.listAll', {});
+    await core.releaseIdle();
+    assert.equal(core.owners.size, 5, 'nothing quiet for 10 min yet');
+    Date.now = () => now() + 10 * 60_000 + 1;
+    await core.releaseIdle();
+  } finally {
+    Date.now = now;
+  }
+  assert.deepEqual([...core.owners.keys()].sort(), [work.id, busyTab.id].sort(), 'the background work tab and the busy session\'s tab stay held');
+  for (const id of [usersTab.id, front.id, kept.id]) {
+    assert.ok(chrome.tabsById.has(id), 'never closed');
+    assert.equal(chrome.tabsById.get(id).mutedInfo.muted, false);
+  }
+  assert.equal(chrome.tabsById.get(front.id).groupId, -1);
+  // A dialog the session left open would pop up in front of the user after the detach: dismissed first.
+  const steps = chrome.calls.filter(([, id]) => id === usersTab.id).map(([c, , method]) => method ?? c);
+  assert.ok(steps.includes('Page.handleJavaScriptDialog') && steps.indexOf('Page.handleJavaScriptDialog') < steps.lastIndexOf('debugger.detach'), String(steps));
+  const told = sent.filter((m) => m.method === 'chrome.tabs.onRemoved' && m.client === 1);
+  assert.deepEqual(told.map((m) => m.params[0]).sort(), [usersTab.id, front.id, kept.id].sort(), 'the session hears each one is gone');
+  assert.ok(told.every((m) => m.params[1].idle === true), 'and why');
+  assert.match((await call(1, 'chrome.debugger.sendCommand', [{ tabId: usersTab.id }, 'Page.reload'])).error.message, /not controlled by this session/);
+});
+
+test('tabs.listAll names the session holding another session\'s tab and when it was last at work', async () => {
+  const { chrome, call } = setup();
+  await call(1, 'client.hello', { label: 'Codex', session: 'Codex via FowlTweets in Project X (pid 70289)' });
+  await call(2, 'client.hello', { label: 'Claude' });
+  const usersTab = chrome.addTab({ url: 'https://x.example/i/chat' });
+  await call(1, 'tabs.claim', { tabId: usersTab.id });
+  const listed = (await call(2, 'tabs.listAll', {})).result.find((t) => t.id === usersTab.id);
+  assert.equal(listed.owner, 'other');
+  assert.equal(listed.ownerSession, 'Codex via FowlTweets in Project X (pid 70289)');
+  assert.ok(listed.ownerSeenAt <= Date.now() && listed.ownerSeenAt > Date.now() - 60_000, 'when the holder last showed it is at work');
+  assert.equal(listed.releasing, false);
+  const own = (await call(1, 'tabs.listAll', {})).result.find((t) => t.id === usersTab.id);
+  assert.equal(own.ownerSession, null, 'a session\'s own tab names nobody');
+});
+
+test('a client that marks its tool calls (client.active) is at work only then: its pages\' own traffic keeps no tab held', async () => {
+  const { chrome, core, call } = setup();
+  const usersTab = chrome.addTab({ url: 'https://chat.example/' });
+  await call(1, 'tabs.claim', { tabId: usersTab.id });
+  const active = () => core.handleMessage({ method: 'client.active', params: {}, client: 1 });
+  await active();
+  const now = Date.now;
+  try {
+    Date.now = () => now() + 9 * 60_000;
+    await active(); // a tool call
+    Date.now = () => now() + 18 * 60_000;
+    await core.releaseIdle();
+    assert.ok(core.owners.has(usersTab.id), 'at work 9 min ago');
+    // Playwright attaching a worker the page started, a document load's body fetch: not the agent.
+    await call(1, 'chrome.debugger.sendCommand', [{ tabId: usersTab.id }, 'Runtime.runIfWaitingForDebugger']);
+    Date.now = () => now() + 19 * 60_000 + 1;
+    await core.releaseIdle();
+  } finally {
+    Date.now = now;
+  }
+  assert.ok(!core.owners.has(usersTab.id), 'quiet for 10 min whatever its page did');
+});

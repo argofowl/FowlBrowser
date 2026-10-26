@@ -47,6 +47,8 @@ const waitsOnPage = (method, params) => method === 'Page.navigate' || (/^Runtime
 const EXPECT_CHILD_MAX_MS = 5000;     // also how long the user's turn of a tab lasts (a page's transient activation)
 const LAST_OWNED_MS = 5000; // how long a closed owned tab can still open the popup it asked for (tabs.openChild)
 const CLEANUP_RETRY_MS = [200, 1000];
+const CLOSE_WAIT_MS = 10_000; // a close the page holds up (a "leave page?" nobody answers) stops being waited for
+const IDLE_MS = 10 * 60_000; // a session that sends nothing for a tab this long has gone quiet: the tab is let go
 const SWAP_RETRY_MS = 50; // a page between documents is asked again this often (onActivePage),
 const SWAP_TRIES = 40; // this many times (2 s)
 const DOWNLOAD_MATCH_MS = 10_000;      // how long downloads and Page.downloadWillBegin signals are kept for matching
@@ -170,6 +172,9 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // cancel).
   const owners = new Map();
   const labels = new Map();         // client -> label from client.hello
+  const sessions = new Map();       // client -> who it is (client.hello session: agent, app, project, pid), for tab_list and the log
+  const seenAt = new Map();         // client -> when it last showed it is at work (releaseIdle)
+  const marksActivity = new Set();  // clients that send client.active: only that counts for them, not every request
   const groups = new Map();         // `${client}|${label}|${windowId}` -> promise of the tab group id
   const givenGroups = new Map();    // tab group id -> title: groups made for the user (groupForUser), until removed or renamed
   // tabId -> the group made for the user that this extension put it in (groupForUser, reuseGiven): only these come back on
@@ -291,6 +296,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
   function labelFor(client) {
     return labels.get(client) ?? DEFAULT_LABEL;
+  }
+
+  function sessionName(client) {
+    return sessions.get(client) ?? labelFor(client);
   }
 
   async function pickWindow() {
@@ -439,11 +448,18 @@ export function createCore({ chrome, send, timers = globalThis }) {
       if (!windows.some(stays)) await chrome.tabs.create({ windowId, active: false });
     });
     lastWindowCheck = decided.catch(() => {});
+    let timer;
     try {
       await decided;
       await showUsersPrevious(tabId);
-      await chrome.tabs.remove(tabId);
+      // A page that asks before it is left holds the close until that is answered (onDebuggerEvent does while attached).
+      // Never waited for longer, so a close can't hold the tab's queue, and the cleanups behind it, for good.
+      const held = new Promise((_, reject) => {
+        timer = timers.setTimeout(() => reject(Object.assign(new Error(`Tab ${tabId} did not close within 10 s: its page asks before it is left`), { held: true })), CLOSE_WAIT_MS);
+      });
+      await Promise.race([chrome.tabs.remove(tabId), held]);
     } finally {
+      timers.clearTimeout(timer);
       leaving.delete(tabId);
     }
   }
@@ -664,10 +680,17 @@ export function createCore({ chrome, send, timers = globalThis }) {
           // Unmuted before the detach: Helium can lose an unmute sent right after one.
           if (owner.origin === 'agent' && !owner.handedOver) await handOver(tabId);
           else if (owner.agentMuted) await endAgentMute(tabId, owner);
+          // A dialog the client left unanswered would pop up in front of the user once the debugger lets go: dismissed.
+          await chrome.debugger.sendCommand({ tabId }, 'Page.handleJavaScriptDialog', { accept: false }).catch(() => {});
           await chrome.debugger.detach({ tabId }).catch(() => {});
         }
       } catch (error) {
         if (await chrome.tabs.get(tabId).then(() => true, () => false)) {
+          // An agent tab whose page held its close stays open: given to the user instead, never left held.
+          if (error.held && !owner.kept) {
+            owner.kept = true;
+            continue;
+          }
           if (attempt >= CLEANUP_RETRY_MS.length) {
             log('cleanup failed, kept the record', tabId, error.message);
             return false;
@@ -688,6 +711,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function disconnectClient(client) {
     liveClients.delete(client);
     labels.delete(client);
+    seenAt.delete(client);
+    marksActivity.delete(client);
     for (const key of groups.keys()) if (key.startsWith(`${client}|`)) groups.delete(key);
     for (const [id, record] of downloads) if (record.client === client) downloads.delete(id);
     for (const [tabId, expected] of downloadExpectations) if (expected.client === client) downloadExpectations.delete(tabId);
@@ -699,6 +724,38 @@ export function createCore({ chrome, send, timers = globalThis }) {
       forgetInput(tabId);
     }
     await Promise.allSettled([persist(), ...mine.map(([tabId, owner]) => serialize(tabId, () => cleanUp(tabId, owner)))]);
+    if (!liveClients.has(client)) sessions.delete(client); // named in tab_list until its tabs are let go
+  }
+
+  // A session that has sent nothing in IDLE_MS has finished or gone quiet without disconnecting (an app's agent left
+  // running, a stuck process): the tabs the user sees as theirs (claimed, kept, given to them) or has in front go back to
+  // them as at a disconnect, never closed, so none stays held, muted and maybe frozen. Its background work tabs harm
+  // nobody and stay until it ends (it may come back to them). Run from the worker's alarm.
+  async function releaseIdle() {
+    await ready;
+    const now = Date.now();
+    const quiet = [];
+    for (const [tabId, owner] of owners) {
+      if (owner.releasing || owner.parked) continue;
+      if (!seenAt.has(owner.client)) seenAt.set(owner.client, now);
+      else if (now - seenAt.get(owner.client) >= IDLE_MS) quiet.push([tabId, owner]);
+    }
+    const tabs = await Promise.all(quiet.map(([tabId]) => chrome.tabs.get(tabId).catch(() => null)));
+    const letGo = quiet.map(([tabId, owner], i) => ({ tabId, owner, tab: tabs[i] }))
+      .filter(({ tabId, owner, tab }) => tab && owners.get(tabId) === owner && !owner.releasing && !owner.parked
+        && Date.now() - seenAt.get(owner.client) >= IDLE_MS && (owner.origin === 'user' || owner.kept || owner.handedOver || tab.active));
+    for (const { tabId, owner } of letGo) {
+      owner.releasing = true;
+      owner.kept = true;
+      forgetInput(tabId);
+      log('let go of a tab its session left idle', tabId, sessionName(owner.client));
+    }
+    await Promise.allSettled([persist(), ...letGo.map(({ tabId, owner, tab }) => serialize(tabId, async () => {
+      const done = await cleanUp(tabId, owner);
+      // `idle`: the client tells its agent why, rather than reading it as the user closing the tab. Not for a tab still
+      // held (cleanup failed) or one Chrome swapped meanwhile (its new id is let go too, untold).
+      if (done && ![...owners.values()].includes(owner)) emit(owner.client, 'chrome.tabs.onRemoved', [tabId, { windowId: tab.windowId, isWindowClosing: false, idle: true }]);
+    }))]);
   }
 
   function disconnectAll() {
@@ -710,8 +767,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // Every handler gets (params, ctx); ctx.live() turns false once the client or the native port is gone,
   // ctx.emit/ctx.reply drop anything a dead client or an old port would otherwise receive.
   const handlers = {
-    async 'client.hello'({ label }, { client, msg, reply, emit: emitBack }) {
+    async 'client.hello'({ label, session }, { client, msg, reply, emit: emitBack }) {
       labels.set(client, label || DEFAULT_LABEL);
+      if (session) sessions.set(client, String(session).slice(0, 200));
+      log('client', client, 'is', sessionName(client));
       await persist();
       reply({ id: msg.id, result: { ok: true } });
       for (const [tabId, owner] of owners) {
@@ -1202,8 +1261,11 @@ export function createCore({ chrome, send, timers = globalThis }) {
       if (!handler) throw new Error(`Unknown method: ${msg.method}`);
       if (reloading) throw new Error('The extension is reloading');
       const started = Date.now();
-      const result = await handler(msg.params ?? {}, ctx);
-      if (Date.now() - started > 2000) log('slow request', msg.method, `${Date.now() - started} ms`);
+      // A client that doesn't send client.active (an older MCP server) is at work while it sends any request.
+      const seen = () => { if (live() && !marksActivity.has(client)) seenAt.set(client, Date.now()); };
+      seen();
+      const result = await handler(msg.params ?? {}, ctx).finally(seen);
+      if (Date.now() - started > 2000) log('slow request', msg.method, `${Date.now() - started} ms`, 'from', sessionName(client));
       if (result !== NO_REPLY) reply({ id: msg.id, result: result ?? null });
     } catch (error) {
       reply({ id: msg.id, error: { message: String(error?.message ?? error) } });
@@ -1231,6 +1293,11 @@ export function createCore({ chrome, send, timers = globalThis }) {
         return;
       case 'host.clientDisconnected':
         return disconnectClient(msg.params.client);
+      case 'client.active': // a tool call starting or ending (releaseIdle)
+        if (!liveClients.has(msg.client)) return;
+        marksActivity.add(msg.client);
+        seenAt.set(msg.client, Date.now());
+        return;
       default:
         if (msg.id !== undefined) return handleRequest(msg, gen);
     }
@@ -1252,6 +1319,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
       muted: !!t.mutedInfo?.muted,
       groupTitle: groupTitle ?? null,
       owner: owner ? (owner.client === client ? 'you' : 'other') : null,
+      // Another session's tab: who holds it and how long that session has sent nothing; any tab: whether it is being let go.
+      ownerSession: owner && owner.client !== client ? sessionName(owner.client) : null,
+      ownerSeenAt: owner && owner.client !== client && !owner.parked ? seenAt.get(owner.client) ?? null : null,
+      releasing: !!owner?.releasing,
       origin: owner?.origin ?? null,
       handedOver: !!owner?.handedOver,
       kept: !!owner?.kept,
@@ -1261,6 +1332,12 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
   async function onDebuggerEvent(source, method, params) {
     await ready;
+    // The page asks "leave page?" (beforeunload) as this extension closes it: the close was asked for, so it leaves. With
+    // the debugger attached Chrome shows no dialog, and unanswered the question would freeze the page and hold the close
+    // for good (Chrome even brings the tab to the front for it).
+    if (method === 'Page.javascriptDialogOpening' && params?.type === 'beforeunload' && !source.sessionId && leaving.has(source.tabId)) {
+      return chrome.debugger.sendCommand({ tabId: source.tabId }, 'Page.handleJavaScriptDialog', { accept: true }).catch(() => {});
+    }
     const owner = owners.get(source.tabId);
     if (!owner) return;
     // The tab's main frame (no parentId), or a child session's own frame (an out-of-process iframe, whose frame id is
@@ -1807,6 +1884,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     instanceId,
     handleMessage,
     portClosed,
+    releaseIdle,
     onDebuggerEvent,
     onDebuggerDetach,
     onTabCreated,

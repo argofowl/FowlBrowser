@@ -79,7 +79,9 @@ chrome.downloads.onCreated.addListener(core.onDownloadCreated);
 chrome.downloads.onChanged.addListener(core.onDownloadChanged);
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === RECONNECT_ALARM) connect();
+  if (alarm.name !== RECONNECT_ALARM) return;
+  connect();
+  core.releaseIdle().catch(() => {});
 });
 chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 chrome.runtime.onStartup.addListener(connect);
