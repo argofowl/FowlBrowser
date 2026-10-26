@@ -2737,7 +2737,7 @@ function orderedChrome() {
       getAll: () => handle(() => [{ id: 2, type: 'normal', tabs: [{ id: 1 }] }]), // the user's window, with a tab of theirs
     },
     tabGroups: { update: (id) => handle(() => { if (!groups.has(id)) throw new Error(`No group with id: ${id}`); return {}; }) },
-    debugger: { detach: () => handle(() => ({})) },
+    debugger: { detach: () => handle(() => ({})), sendCommand: () => handle(() => ({})) },
     tabs: {
       query: () => handle(() => []),
       create: (props) => handle(() => {
@@ -2896,4 +2896,30 @@ test('a client that marks its tool calls (client.active) is at work only then: i
     Date.now = now;
   }
   assert.ok(!core.owners.has(usersTab.id), 'quiet for 10 min whatever its page did');
+});
+
+test('an attached tab is closed through the debugger (no "leave page?", so Chrome never brings it to the front); else with tabs.remove', async () => {
+  const { chrome, core, call } = setup();
+  const send = chrome.debugger.sendCommand;
+  let closeFails = false;
+  chrome.debugger.sendCommand = async (target, method, params) => {
+    await send(target, method, params);
+    if (method === 'Target.getTargetInfo') return { targetInfo: { targetId: `T${target.tabId}` } };
+    if (method === 'Target.closeTarget') {
+      if (closeFails) throw new Error('Not allowed');
+      assert.equal(params.targetId, `T${target.tabId}`);
+      setTimeout(() => { chrome.tabsById.delete(target.tabId); core.onTabRemoved(target.tabId, { windowId: 1, isWindowClosing: false }); }, 0);
+      return { success: true };
+    }
+    return { ok: method };
+  };
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://chat.example/' });
+  assert.ok(!(await call(1, 'chrome.tabs.remove', [tab.id])).error);
+  assert.ok(!chrome.tabsById.has(tab.id));
+  assert.ok(!chrome.calls.some(([c, id]) => c === 'tabs.remove' && id === tab.id), 'not through tabs.remove');
+
+  closeFails = true;
+  const { result: other } = await call(1, 'tabs.open', { url: 'https://chat.example/' });
+  assert.ok(!(await call(1, 'chrome.tabs.remove', [other.id])).error);
+  assert.ok(chrome.calls.some(([c, id]) => c === 'tabs.remove' && id === other.id), 'tabs.remove when the debugger can\'t close it');
 });

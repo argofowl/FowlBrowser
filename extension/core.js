@@ -437,6 +437,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // closed one is gone). Decided one tab at a time, counting the tabs closing meanwhile (a turn end closes them at once,
   // also an agent tab and its popup's window).
   const leaving = new Set();
+  const removedWaits = new Map(); // tabId -> resolves once it is gone (a close through the debugger)
   let lastWindowCheck = Promise.resolve();
   async function removeTab(tabId) {
     const decided = lastWindowCheck.then(async () => {
@@ -457,10 +458,21 @@ export function createCore({ chrome, send, timers = globalThis }) {
       const held = new Promise((_, reject) => {
         timer = timers.setTimeout(() => reject(Object.assign(new Error(`Tab ${tabId} did not close within 10 s: its page asks before it is left`), { held: true })), CLOSE_WAIT_MS);
       });
+      // Attached, it is closed through the debugger, which skips that question: chrome.tabs.remove makes Chrome bring the
+      // tab to the front to ask it, a flash in front of the user even when it is answered at once.
+      const attached = owners.has(tabId) && !owners.get(tabId).detached;
+      const { targetInfo } = attached ? await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo').catch(() => ({})) ?? {} : {};
+      if (targetInfo?.targetId) {
+        const gone = new Promise((resolve) => removedWaits.set(tabId, resolve));
+        const closing = await chrome.debugger.sendCommand({ tabId }, 'Target.closeTarget', { targetId: targetInfo.targetId }).catch(() => null);
+        if (closing && closing.success !== false) return await Promise.race([gone, held]);
+        removedWaits.delete(tabId);
+      }
       await Promise.race([chrome.tabs.remove(tabId), held]);
     } finally {
       timers.clearTimeout(timer);
       leaving.delete(tabId);
+      removedWaits.delete(tabId);
     }
   }
 
@@ -1573,6 +1585,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   }
 
   async function onTabRemoved(tabId, removeInfo) {
+    removedWaits.get(tabId)?.();
     await ready;
     childTargets.delete(tabId);
     offWeb.delete(tabId);
