@@ -22,7 +22,7 @@ const AGENTS = { claude: 'Claude', codex: 'Codex' };
 // Who this session is, for other sessions' tab_list and the browser's log, e.g. "Codex via FowlTweets in Project X (pid
 // 70289)": the agent (FOWLBROWSER_LABEL, else the program that started this server), what started that agent (the nearest
 // ancestor that isn't a shell, runtime or agent: its outermost app bundle, else its program), the project folder.
-const PLUMBING = /^(node|bun|deno|npm|npx|python\d*(\.\d+)?|ruby|zsh|bash|sh|fish|dash|env|login|sudo|script|tmux|screen|claude|codex)$/i;
+const PLUMBING = /^(node|bun|deno|npm|npx|python\d*(\.\d+)?|ruby|zsh|bash|sh|fish|dash|env|login|sudo|script|tmux|screen|sshd(-session)?(:.*)?|claude|codex)$/i;
 let session;
 export function sessionName() {
   session ??= new Promise((resolve) => {
