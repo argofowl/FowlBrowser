@@ -151,8 +151,8 @@ Name your browsers (Work, Personal) by clicking the FowlBrowser icon in the tool
 
 ## Good to know
 
-- macOS only for now. Chrome and Helium are tested; Chromium, Brave, Edge, Arc and Vivaldi are set up by the installer
-  but less tested.
+- macOS only for now. Chrome and Helium are tested; Chromium, Brave, Edge, Arc, Vivaldi and Dia are set up by the
+  installer but less tested.
 - A sign-in or payment pop-up that talks back to its page brings the browser to the front for a moment if you're in
   another app. Everything else stays in the background.
 - With Claude Code, an agent's work tabs close when it finishes its reply. With other agents they close when the

@@ -21,6 +21,7 @@ const browsers = [
   ['Google Chrome Canary', 'Google/Chrome Canary', 'Google Chrome Canary'], ['Chromium', 'Chromium', 'Chromium'],
   ['Helium', 'net.imput.helium', 'Helium'], ['Brave', 'BraveSoftware/Brave-Browser', 'Brave Browser'],
   ['Microsoft Edge', 'Microsoft Edge', 'Microsoft Edge'], ['Arc', 'Arc/User Data', 'Arc'], ['Vivaldi', 'Vivaldi', 'Vivaldi'],
+  ['Dia', 'Dia/User Data', 'Dia'],
 ].filter(([, dir, app]) => installed(dir, app));
 if (mode === '--remove') {
   for (const [name, dir] of browsers) {

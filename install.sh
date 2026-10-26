@@ -34,7 +34,7 @@ JS
 "$NODE" -e "$LAUNCHER" "$APP/mcp/bin/fowlbrowser-mcp" "$NODE" "$APP/mcp/src/server.mjs"
 HOST_OUT=$(sh "$APP/host/install.sh") # a failed registration stops the install here
 REGISTERED=$(printf '%s\n' "$HOST_OUT" | grep '^registered ' || true)
-echo "${REGISTERED:-No supported browser found (Chrome, Chromium, Helium, Brave, Edge, Arc or Vivaldi).}"
+echo "${REGISTERED:-No supported browser found (Chrome, Chromium, Helium, Brave, Edge, Arc, Vivaldi or Dia).}"
 
 # Claude Code: the MCP server in user scope (~/.claude.json) and four hooks in ~/.claude/settings.json.
 if [ "${FOWLBROWSER_SKIP_CLAUDE:-}" = 1 ]; then
@@ -73,7 +73,8 @@ echo "$REGISTERED" | while IFS= read -r line; do
   name=${line#registered }; name=${name%%: *}
   case $name in
     Brave) page=brave://extensions ;; "Microsoft Edge") page=edge://extensions ;;
-    Arc) page=arc://extensions ;; Vivaldi) page=vivaldi://extensions ;; *) page=chrome://extensions ;;
+    Arc) page=arc://extensions ;; Vivaldi) page=vivaldi://extensions ;; Dia) page=dia://extensions ;;
+    *) page=chrome://extensions ;;
   esac
   echo "     $name: $page"
 done
