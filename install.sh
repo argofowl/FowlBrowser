@@ -20,6 +20,7 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 command -v node >/dev/null && node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 19) ? 0 : 1)' ||
   { echo "FowlBrowser needs Node.js 22.19 or newer (https://nodejs.org)." >&2; exit 1; }
 NODE=$(command -v node)
+command -v rsync >/dev/null || { echo "FowlBrowser's installer needs rsync (on Linux: install it with your package manager)." >&2; exit 1; }
 
 mkdir -p "$APP"
 rsync -a --delete --exclude test --exclude NOTES.md "$SRC/extension/" "$APP/extension/"
@@ -39,6 +40,7 @@ JS
 HOST_OUT=$(sh "$APP/host/install.sh") # a failed registration stops the install here
 REGISTERED=$(printf '%s\n' "$HOST_OUT" | grep '^registered ' || true)
 echo "${REGISTERED:-No supported browser found (Chrome, Chromium, Helium, Brave, Edge, Arc or Vivaldi).}"
+printf '%s\n' "$HOST_OUT" | grep '^skipped ' || true
 
 # Claude Code: the MCP server in user scope (~/.claude.json) and four hooks in ~/.claude/settings.json.
 if [ "${FOWLBROWSER_SKIP_CLAUDE:-}" = 1 ]; then

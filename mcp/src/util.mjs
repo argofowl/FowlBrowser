@@ -51,10 +51,15 @@ export function userPrivateGid() {
 }
 
 // Does the folder carry an access control list (ls marks it with "+")? Its entries can let other accounts write whatever
-// the mode bits say. Unreadable counts as yes.
+// the mode bits say. Unreadable counts as yes, and so does an ls that never shows the mark (BusyBox, which also has no
+// --version; GNU and uutils coreutils have both).
+let lsShowsAcls;
 export function hasAcl(dir) {
-  try { return /^\S+\+/.test(execFileSync('ls', ['-ld', '--', dir], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 })); }
-  catch { return true; }
+  const run = (args) => execFileSync('ls', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 });
+  try {
+    lsShowsAcls ??= /coreutils/i.test(run(['--version']));
+    return !lsShowsAcls || /^\S+\+/.test(run(['-ld', '--', dir]));
+  } catch { return true; }
 }
 
 // Does the file carry macOS's quarantine mark (com.apple.quarantine: set by browsers, Archive Utility and AirDrop on what

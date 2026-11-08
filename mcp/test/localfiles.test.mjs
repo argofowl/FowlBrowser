@@ -238,6 +238,13 @@ test('Linux: a user-private group\'s write bit is the user\'s alone, unless the 
   const file = path.join(folder, 'march.pdf');
   fs.writeFileSync(file, 'x');
   const gid = fs.statSync(folder).gid;
+  // An ls that can't show ACLs (BusyBox) leaves no way to tell: refused, like any group-writable folder.
+  let lsShowsAcls = false;
+  try { lsShowsAcls = /coreutils/i.test(execFileSync('ls', ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })); } catch {}
+  if (!lsShowsAcls) {
+    assert.throws(() => uploadPaths([file], home, null, gid), /it sits in .*invoices, where another account/, 'no way to see ACLs');
+    return;
+  }
   assert.deepEqual(uploadPaths([file], home, null, gid), [file], 'the group is the user\'s private group');
   assert.throws(() => uploadPaths([file], home, null, null), /it sits in .*invoices, where another account/, 'no private group known');
   assert.throws(() => uploadPaths([file], home, null, gid + 1), /it sits in .*invoices, where another account/, 'a group of others');

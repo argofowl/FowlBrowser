@@ -28,7 +28,11 @@ export const startedAs = (pid) => {
   if (process.platform !== 'linux') return '';
   try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[0]; } catch { return ''; }
 };
-const realPs = (args) => execFileSync('ps', args).toString();
+// Linux: read /proc, the same everywhere (BusyBox's ps, on Alpine, has no -p); elsewhere ps.
+const procPs = ([, field, , pid]) => (field === 'comm='
+  ? readFileSync(`/proc/${pid}/comm`, 'utf8')
+  : readFileSync(`/proc/${pid}/stat`, 'utf8').replace(/^.*\) /s, '').split(' ')[1]);
+const realPs = process.platform === 'linux' ? procPs : (args) => execFileSync('ps', args).toString();
 export function findSocket(pid = process.ppid, ps = realPs,
   dir = process.env.FOWLBROWSER_DIR || join(homedir(), '.fowlbrowser'), tmp = tmpdir(), argv0 = ps === realPs ? startedAs : () => '') {
   for (let depth = 0; depth < 8 && pid > 1; depth++) {

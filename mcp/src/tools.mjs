@@ -138,7 +138,8 @@ function refuseBlockedPage(tab, before) {
 // The file is read by path later (after the page checks, the click and a chooser wait), so nothing on its way may be
 // swappable by another account on this computer: every folder from / down is the user's or root's, and one that others can
 // write to (/tmp, /Users/Shared) only with the sticky bit and with what it holds on the way owned by the user or root.
-// ids (optional Map): filled with each checked path's dev and ino, so dropFiles reads only that same file.
+// ids (optional Map): filled with each checked path's dev, ino and change time, so dropFiles reads only that same file
+// (Linux filesystems hand a freed inode number to the next new file at once, so dev and ino alone can match a swap).
 const MAX_FOLDER_ENTRIES = 10_000;
 // Finder writes these into folders it shows: view settings, no content. A folder holding them uploads as before.
 const FINDER_FILES = new Set(['.DS_Store', '.localized']);
@@ -218,14 +219,14 @@ export function uploadPaths(paths, home = os.homedir(), ids = null, privateGid =
     checkWay(p, real);
     const stat = fs.statSync(real);
     if (special(stat)) refuseSpecial(p, 'it is');
-    ids?.set(real, { dev: stat.dev, ino: stat.ino });
+    ids?.set(real, { dev: stat.dev, ino: stat.ino, ctime: fs.statSync(real, { bigint: true }).ctimeNs });
     if (stat.isDirectory()) checkFolder(p, real);
     return real;
   });
 }
 
 // The files a drop carries, at most DROP_MAX_BYTES in all. Each is read only if it is still the file uploadPaths checked
-// (ids: its dev and ino): opened without following a link at its name, and without waiting on a pipe put in its place.
+// (ids: its dev, ino and change time): opened without following a link at its name, and without waiting on a pipe put in its place.
 const DROP_MAX_BYTES = 40 * 1024 * 1024; // as base64 in one message to the browser, under the host's 64 MB a message
 const TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
   '.pdf': 'application/pdf', '.txt': 'text/plain', '.csv': 'text/csv', '.json': 'application/json', '.zip': 'application/zip', '.mp4': 'video/mp4', '.mov': 'video/quicktime' };
@@ -240,7 +241,7 @@ export function dropPayload(files, ids) {
       if (fd !== null) opened.push(fd);
       const stat = fd === null ? null : fs.fstatSync(fd);
       const id = ids?.get(file);
-      if (!stat?.isFile() || !id || stat.dev !== id.dev || stat.ino !== id.ino) {
+      if (!stat?.isFile() || !id || stat.dev !== id.dev || stat.ino !== id.ino || fs.fstatSync(fd, { bigint: true }).ctimeNs !== id.ctime) {
         throw new Error(`${file} was not uploaded: it was replaced or changed into something else since it was checked. Call upload_files again.`);
       }
       if ((total += stat.size) > DROP_MAX_BYTES) throw new Error(`The files are over ${DROP_MAX_BYTES / 1024 / 1024} MB together, too big to drop on a page; use a file input or a file chooser instead.`);

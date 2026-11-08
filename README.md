@@ -153,7 +153,10 @@ Name your browsers (Work, Personal) by clicking the FowlBrowser icon in the tool
 
 - macOS and Linux. Chrome and Helium are tested on macOS, Google Chrome on Linux (Ubuntu, GNOME on Wayland); Chromium,
   Brave, Edge, Arc and Vivaldi are set up by the installer but less tested. Windows isn't supported yet.
-- On Linux, closing a browser's last window usually quits it, and agents can't reopen it in the background: keep a
+- On Linux any distribution should do (nothing depends on the desktop, X11 or Wayland), with the browser installed from
+  its .deb or .rpm, the AUR or your distribution's package, plus `rsync`. Browsers installed as a Snap (Ubuntu's
+  default Chromium) or a Flatpak run sandboxed and can't start FowlBrowser's helper; the installer names them and skips
+  them. Closing a browser's last window usually quits it there, and agents can't reopen it in the background: keep a
   window open. The paste-to-agent setup prompts (docs/agent-setup.md and the toolbar popup) are written for a Mac; on
   Linux follow the steps above by hand.
 - A sign-in or payment pop-up that talks back to its page brings the browser to the front for a moment if you're in

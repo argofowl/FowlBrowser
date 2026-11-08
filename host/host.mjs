@@ -33,8 +33,9 @@ const ps = (field) => {
 };
 // Linux: ps shows only the short program name ("chrome" for every Chrome channel), so read the executable's path.
 const linuxExe = () => { try { return fs.readlinkSync(`/proc/${browserPid}/exe`); } catch { return ''; } };
+const linuxArgs = () => { try { return fs.readFileSync(`/proc/${browserPid}/cmdline`, 'utf8').split('\0').join(' ').trim(); } catch { return ''; } };
 const browserPath = (process.platform === 'linux' && linuxExe()) || ps('comm');
-const browserArgs = ps('args');
+const browserArgs = (process.platform === 'linux' && linuxArgs()) || ps('args'); // BusyBox ps has no -p
 const browser = browserNameFrom(browserPath);
 const silentDebugger = browserArgs.includes('--silent-debugger-extension-api');
 
