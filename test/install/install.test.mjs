@@ -31,11 +31,13 @@ test('install.sh and uninstall.sh with spaces in every path, a fake node first o
   const repo = path.join(tmp, 'my code', 'FowlBrowser');
   const fakeBin = path.join(tmp, 'fake node', 'bin');
   const settings = path.join(home, '.claude', 'settings.json');
-  const app = path.join(home, 'Library', 'Application Support', 'FowlBrowser');
+  const mac = process.platform === 'darwin';
+  const app = mac ? path.join(home, 'Library', 'Application Support', 'FowlBrowser') : path.join(home, '.local', 'share', 'FowlBrowser');
   // A FowlBrowser hook from an earlier install with Claude Code: skipping Claude Code means it stays too.
   const ourHook = { hooks: { Stop: [{ hooks: [{ type: 'command', command: `node '${app}/mcp/bin/turn-ended.mjs'` }] }] } };
   const settingsText = `${JSON.stringify(ourHook, null, 2)}\n`;
-  fs.mkdirSync(path.join(home, 'Library', 'Application Support'), { recursive: true });
+  // The folders the system already has: the app's parent, and where browsers keep their native host registrations.
+  for (const dir of mac ? [['Library', 'Application Support']] : [['.local', 'share'], ['.config']]) fs.mkdirSync(path.join(home, ...dir), { recursive: true });
   fs.mkdirSync(path.dirname(settings));
   fs.writeFileSync(settings, settingsText);
   fs.mkdirSync(fakeBin, { recursive: true });
@@ -49,6 +51,8 @@ test('install.sh and uninstall.sh with spaces in every path, a fake node first o
     npm_config_cache: path.join(tmp, 'npm cache'),
   };
   delete env.CLAUDE_SETTINGS;
+  delete env.XDG_DATA_HOME;
+  delete env.XDG_CONFIG_HOME;
   const out = execFileSync('sh', [path.join(repo, 'install.sh'), '--lite'], { env, encoding: 'utf8' });
   assert.match(out, /Claude Code: skipped/);
 

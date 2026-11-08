@@ -31,12 +31,22 @@ const ps = (field) => {
   try { return execFileSync('ps', ['-o', `${field}=`, '-p', String(browserPid)], { encoding: 'utf8' }).trim(); }
   catch { return ''; }
 };
-const browserPath = ps('comm');
-const browserArgs = ps('args');
+// Linux: ps shows only the short program name ("chrome" for every Chrome channel), so read the executable's path.
+const linuxExe = () => { try { return fs.readlinkSync(`/proc/${browserPid}/exe`); } catch { return ''; } };
+const linuxArgs = () => { try { return fs.readFileSync(`/proc/${browserPid}/cmdline`, 'utf8').split('\0').join(' ').trim(); } catch { return ''; } };
+const browserPath = (process.platform === 'linux' && linuxExe()) || ps('comm');
+const browserArgs = (process.platform === 'linux' && linuxArgs()) || ps('args'); // BusyBox ps has no -p
 const browser = browserNameFrom(browserPath);
 const silentDebugger = browserArgs.includes('--silent-debugger-extension-api');
 
 function browserNameFrom(p) {
+  if (process.platform === 'linux') { // /opt/google/chrome/chrome, /opt/brave.com/brave/brave, /usr/lib/chromium/chromium...
+    const linux = [[/\/google\/chrome-beta\//, 'chrome-beta'], [/\/google\/chrome-unstable\//, 'chrome-dev'],
+      [/\/google\/chrome\//, 'chrome'], [/helium/i, 'helium'], [/chromium/i, 'chromium'], [/brave/i, 'brave'],
+      [/msedge|microsoft-edge/i, 'edge'], [/vivaldi/i, 'vivaldi']];
+    const hit = linux.find(([re]) => re.test(p));
+    if (hit) return hit[1];
+  }
   if (p.includes('Helium')) return 'helium';
   if (p.includes('Google Chrome Beta')) return 'chrome-beta';
   if (p.includes('Google Chrome Canary')) return 'chrome-canary';

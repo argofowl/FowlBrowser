@@ -4,23 +4,62 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-// Hidden files and folders (~/.ssh, ~/.aws, .env, ~/.config), ~/Library and system configuration: where keys, passwords
-// and app data live. Never uploaded, opened or read in a tab (uploads already send a file's bytes to a page, so viewing
-// the same files opens no new way out). iCloud Drive and the cloud drives (Dropbox, Google Drive, OneDrive) live in
-// ~/Library too and stay allowed. `real`: a path already resolved (natively, so "~/library" is ~/Library too).
+// Hidden files and folders (~/.ssh, ~/.aws, .env, ~/.config), ~/Library and system configuration (on Linux also /proc,
+// /sys and system state): where keys, passwords and app data live. Never uploaded, opened or read in a tab (uploads
+// already send a file's bytes to a page, so viewing the same files opens no new way out). iCloud Drive and the cloud
+// drives (Dropbox, Google Drive, OneDrive) live in ~/Library too and stay allowed. `real`: a path already resolved
+// (natively, so "~/library" is ~/Library too).
 // Why it is refused, or null.
 const DATA_VOLUME = '/System/Volumes/Data/';
 // The Data volume's firmlinks name the same folders: /System/Volumes/Data/Users/me/Downloads is /Users/me/Downloads.
 const unalias = (real) => (real.startsWith(DATA_VOLUME) ? real.slice(DATA_VOLUME.length - 1) : real);
 export function localFileRefusal(real, home = os.homedir()) {
   const library = path.join(unalias(fs.realpathSync.native(home)), 'Library');
-  const refusedDirs = [library, '/etc', '/private/etc', '/System', '/private/var/db', '/Library/Keychains', '/private/var/log'];
-  const cloudDirs = [path.join(library, 'Mobile Documents'), path.join(library, 'CloudStorage')];
+  const refusedDirs = [library, '/etc', '/private/etc', '/System', '/private/var/db', '/Library/Keychains', '/private/var/log',
+    // Linux: the kernel's views of processes and devices (/proc/self/environ holds this session's environment), runtime
+    // state, boot files, root's home and system state and logs.
+    '/proc', '/sys', '/run', '/boot', '/root', '/var/lib', '/var/log'];
+  // Allowed inside those: cloud drives in ~/Library, and removable drives some Linux systems mount in /run/media.
+  const cloudDirs = [path.join(library, 'Mobile Documents'), path.join(library, 'CloudStorage'), '/run/media'];
   const inside = (r, d) => r === d || r.startsWith(d + path.sep);
   real = unalias(real);
   const dir = cloudDirs.some((d) => inside(real, d)) ? null : refusedDirs.find((d) => inside(real, d));
   return real.split(path.sep).some((part) => part.startsWith('.')) ? 'it is hidden (a file or folder name starts with ".")'
     : dir ? `it is inside ${dir}` : null;
+}
+
+// Linux systems that give each user a group of their own (Debian, Ubuntu, Fedora...) create the user's folders
+// group-writable (umask 002). That write bit lets no other account in when the group really is private: it is the user's
+// primary group, no other account is a member (getent, so directory services count too) and none has it as its own
+// primary group. Its gid, else null (macOS, a shared group, or anything that can't be read). Read once per process.
+let privateGid;
+export function userPrivateGid() {
+  if (privateGid !== undefined) return privateGid;
+  privateGid = null;
+  if (process.platform !== 'linux') return privateGid;
+  try {
+    const getent = (...args) => execFileSync('getent', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 });
+    const gid = process.getgid();
+    const user = os.userInfo().username;
+    const group = getent('group', String(gid)).trim().split(':');
+    if (Number(group[2]) !== gid || (group[3] ?? '').split(',').some((member) => member && member !== user)) return privateGid;
+    const shared = getent('passwd').split('\n').map((line) => line.split(':'))
+      .some((fields) => fields.length > 3 && fields[0] !== user && Number(fields[3]) === gid);
+    if (!shared) privateGid = gid;
+  } catch {}
+  return privateGid;
+}
+
+// Does the folder carry an access control list (ls marks it with "+")? Its entries can let other accounts write whatever
+// the mode bits say. Unreadable counts as yes, and so does an ls that never shows the mark (BusyBox, which also has no
+// --version; GNU and uutils coreutils have both).
+let lsShowsAcls;
+export function hasAcl(dir) {
+  const run = (args) => execFileSync('ls', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 });
+  try {
+    lsShowsAcls ??= /coreutils/i.test(run(['--version']));
+    return !lsShowsAcls || /^\S+\+/.test(run(['-ld', '--', dir]));
+  } catch { return true; }
 }
 
 // Does the file carry macOS's quarantine mark (com.apple.quarantine: set by browsers, Archive Utility and AirDrop on what

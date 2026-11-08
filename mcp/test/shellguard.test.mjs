@@ -45,6 +45,10 @@ const DENY = [
   `python3 -c 'import webbrowser; webbrowser.open("http://localhost:3000")'`,
   `python -c "import webbrowser; webbrowser.open('http://localhost:8000')"`,
   'echo ok | (open https://example.com)',
+  // Linux: the desktop's openers and the default-browser commands
+  'xdg-open https://example.com', 'xdg-open ./proto.html', 'gio open file:///home/argo/proto.html',
+  'sensible-browser http://localhost:3000/', 'x-www-browser index.html', 'brave-browser https://example.com',
+  'microsoft-edge --app=https://example.com',
 ];
 const ALLOW = [
   `python3 -c 'from webbrowser import Error; print(Error.__name__)'`,
@@ -71,6 +75,9 @@ const ALLOW = [
   `osascript -e 'tell application "Finder" to open folder "Docs"'`,
   'python3 -c "print(1)"',
   'ls # open https://example.com',
+  // Linux: openers with no page, and a headless browser
+  'xdg-open report.pdf', 'xdg-open .', 'gio info proto.html', 'gio open notes.txt',
+  'google-chrome-beta --headless=new --screenshot https://example.com',
 ];
 
 test('shell-guard: commands that would show a page in a browser are denied, the rest pass', async () => {
