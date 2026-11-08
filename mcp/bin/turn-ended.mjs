@@ -23,11 +23,17 @@ export function privateTmp(tmp) {
 
 // The socket of the FIRST ancestor named `claude` (ps shows a full path when it was started by path), or null.
 // Never looks past it: a nested `claude -p` without FowlBrowser must not reach the outer session's server.
-export function findSocket(pid = process.ppid, ps = (args) => execFileSync('ps', args).toString(),
-  dir = process.env.FOWLBROWSER_DIR || join(homedir(), '.fowlbrowser'), tmp = tmpdir()) {
+// Linux: the name a process was started as (argv[0]); its comm can differ (Node renames its main thread "MainThread").
+export const startedAs = (pid) => {
+  if (process.platform !== 'linux') return '';
+  try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[0]; } catch { return ''; }
+};
+const realPs = (args) => execFileSync('ps', args).toString();
+export function findSocket(pid = process.ppid, ps = realPs,
+  dir = process.env.FOWLBROWSER_DIR || join(homedir(), '.fowlbrowser'), tmp = tmpdir(), argv0 = ps === realPs ? startedAs : () => '') {
   for (let depth = 0; depth < 8 && pid > 1; depth++) {
     try {
-      if (basename(ps(['-o', 'comm=', '-p', String(pid)]).trim()) === 'claude') {
+      if (basename(ps(['-o', 'comm=', '-p', String(pid)]).trim()) === 'claude' || basename(argv0(pid)) === 'claude') {
         return [join(dir, 'turns', `${pid}.sock`), privateTmp(tmp) && join(tmp, `fowlbrowser-turn-${pid}.sock`)]
           .find((path) => path && existsSync(path)) ?? null;
       }

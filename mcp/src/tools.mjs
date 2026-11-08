@@ -16,7 +16,7 @@ import { READ_ALL_DESCRIPTION, readAll, readAllShape } from './reader.mjs';
 import * as record from './record.mjs';
 import * as takeover from './takeover.mjs';
 import { callsByTab } from './turns.mjs';
-import { isBlockedUrl, localFileBlock, localFileRefusal, sleep, tabInfo, within } from './util.mjs';
+import { hasAcl, isBlockedUrl, localFileBlock, localFileRefusal, sleep, tabInfo, userPrivateGid, within } from './util.mjs';
 import { clearViewport, MAX_SIZE, MIN_SIZE, setMedia, setViewport } from './viewport.mjs';
 import { cap as capText, collapseText, findInSnapshot, functionSource, mainFramePrefixes, maskFields, newRefState, numberRefs, playwrightRef, REF_PATTERN,
   shownRef, shownValue, SNAPSHOT_MAX_CHARS, SNAPSHOT_MAX_CHARS_LIMIT, snapshotChanges, textFields, urlMatcher, yamlValue } from './snapshots.mjs';
@@ -136,13 +136,13 @@ function refuseBlockedPage(tab, before) {
 // What localFileRefusal refuses is never uploaded, also not through a symlink: paths are resolved first. A folder (a webkitdirectory
 // input) is uploaded with everything in it, so all of that is checked too.
 // The file is read by path later (after the page checks, the click and a chooser wait), so nothing on its way may be
-// swappable by another account on this Mac: every folder from / down is the user's or root's, and one that others can
+// swappable by another account on this computer: every folder from / down is the user's or root's, and one that others can
 // write to (/tmp, /Users/Shared) only with the sticky bit and with what it holds on the way owned by the user or root.
 // ids (optional Map): filled with each checked path's dev and ino, so dropFiles reads only that same file.
 const MAX_FOLDER_ENTRIES = 10_000;
 // Finder writes these into folders it shows: view settings, no content. A folder holding them uploads as before.
 const FINDER_FILES = new Set(['.DS_Store', '.localized']);
-export function uploadPaths(paths, home = os.homedir(), ids = null) {
+export function uploadPaths(paths, home = os.homedir(), ids = null, privateGid = userPrivateGid()) {
   // Why a resolved path can't be uploaded, or null.
   const refusal = (real) => localFileRefusal(real, home);
   const refuse = (p, real, why) => {
@@ -151,10 +151,15 @@ export function uploadPaths(paths, home = os.homedir(), ids = null) {
   };
   const uid = process.getuid();
   const mine = (st) => st.uid === uid || st.uid === 0;
+  // Can accounts other than the owner write in this folder? A user-private group's write bit (Linux, umask 002) is the
+  // user's alone, unless an ACL says otherwise.
+  const acls = new Map(); // dir -> hasAcl, once per folder (a folder upload asks for each entry)
+  const othersWrite = (st, dir) => (st.mode & 0o002) !== 0 || ((st.mode & 0o020) !== 0 &&
+    (privateGid === null || st.gid !== privateGid || (acls.has(dir) ? acls.get(dir) : acls.set(dir, hasAcl(dir)).get(dir))));
   // Could another account rename or replace `child` (its lstat) in a folder (its stat)?
-  const exposed = (dirStat, childStat) => !mine(dirStat) || ((dirStat.mode & 0o022) !== 0 && (!(dirStat.mode & 0o1000) || !mine(childStat)));
+  const exposed = (dirStat, childStat, dir) => !mine(dirStat) || (othersWrite(dirStat, dir) && (!(dirStat.mode & 0o1000) || !mine(childStat)));
   const refuseSwappable = (p, real, dir) => {
-    throw new Error(`${p}${real === p ? '' : ` (${real})`} can't be uploaded: it sits in ${dir}, where another account on this Mac could swap it for a ` +
+    throw new Error(`${p}${real === p ? '' : ` (${real})`} can't be uploaded: it sits in ${dir}, where another account on this computer could swap it for a ` +
       'different file before it is read. If the user really wants it uploaded, ask them to copy it into ~/Downloads first.');
   };
   // Every folder on the way to a resolved path, from /.
@@ -164,7 +169,7 @@ export function uploadPaths(paths, home = os.homedir(), ids = null) {
     for (const part of real.split(path.sep).filter(Boolean)) {
       const child = path.join(dir, part);
       const childStat = fs.lstatSync(child);
-      if (exposed(dirStat, childStat)) refuseSwappable(p, real, dir);
+      if (exposed(dirStat, childStat, dir)) refuseSwappable(p, real, dir);
       [dir, dirStat] = [child, childStat];
     }
   };
@@ -183,7 +188,7 @@ export function uploadPaths(paths, home = os.homedir(), ids = null) {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const full = path.join(dir, entry.name);
         const shown = path.join(rel, entry.name);
-        if (exposed(dirStat, dirStat.mode & 0o022 ? fs.lstatSync(full) : dirStat)) refuseSwappable(p, folder, dir);
+        if (exposed(dirStat, othersWrite(dirStat, dir) ? fs.lstatSync(full) : dirStat, dir)) refuseSwappable(p, folder, dir);
         if (++count > MAX_FOLDER_ENTRIES) {
           throw new Error(`${p} can't be uploaded: it holds more than ${MAX_FOLDER_ENTRIES.toLocaleString('en-US')} files and folders. ` +
             'Upload the files the page needs, or a smaller folder.');

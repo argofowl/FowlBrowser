@@ -3,7 +3,11 @@
 # hooks, the app folder). The extension itself is removed by hand in each browser.
 set -eu
 SRC=$(cd "$(dirname "$0")" && pwd)
-APP="$HOME/Library/Application Support/FowlBrowser"
+case "$(uname)" in
+  Darwin) APP="$HOME/Library/Application Support/FowlBrowser" ;;
+  Linux) APP="${XDG_DATA_HOME:-$HOME/.local/share}/FowlBrowser" ;;
+  *) echo "FowlBrowser runs on macOS and Linux only." >&2; exit 1 ;;
+esac
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 command -v node >/dev/null || { echo "FowlBrowser's uninstaller needs Node.js." >&2; exit 1; }
 

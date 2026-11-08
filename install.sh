@@ -1,6 +1,7 @@
 #!/bin/sh
-# FowlBrowser installer (macOS). Copies the app into ~/Library/Application Support/FowlBrowser, registers the
-# native host for every installed Chromium browser, and registers the MCP server and hooks with Claude Code.
+# FowlBrowser installer (macOS and Linux). Copies the app into ~/Library/Application Support/FowlBrowser (Linux:
+# ${XDG_DATA_HOME:-~/.local/share}/FowlBrowser), registers the native host for every installed Chromium browser, and
+# registers the MCP server and hooks with Claude Code.
 # Re-run to update. --lite skips Lighthouse. FOWLBROWSER_SKIP_CLAUDE=1 leaves Claude Code alone; uninstall.sh undoes it all.
 # Nothing keeps running on its own: the browser starts the host, Claude starts the MCP server.
 set -eu
@@ -8,10 +9,13 @@ set -eu
 OMIT=""
 for arg in "$@"; do [ "$arg" = --lite ] && OMIT="--omit=optional"; done
 SRC=$(cd "$(dirname "$0")" && pwd)
-APP="$HOME/Library/Application Support/FowlBrowser"
+case "$(uname)" in
+  Darwin) APP="$HOME/Library/Application Support/FowlBrowser" ;;
+  Linux) APP="${XDG_DATA_HOME:-$HOME/.local/share}/FowlBrowser" ;;
+  *) echo "FowlBrowser runs on macOS and Linux only." >&2; exit 1 ;;
+esac
 # The user's own node comes first; Homebrew's folders are only a fallback for a minimal PATH.
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
-[ "$(uname)" = Darwin ] || { echo "FowlBrowser runs on macOS only." >&2; exit 1; }
 # 22.19 is what the locked Lighthouse needs (mcp/package.json engines says the same).
 command -v node >/dev/null && node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 19) ? 0 : 1)' ||
   { echo "FowlBrowser needs Node.js 22.19 or newer (https://nodejs.org)." >&2; exit 1; }
@@ -81,4 +85,8 @@ echo "  2. Turn on Developer mode."
 echo "  3. Click Load unpacked and pick $APP/extension$CLIP."
 echo "  4. Open FowlBrowser's Details and turn on Allow access to file URLs (needed for uploads)."
 echo "Optional: to hide the \"started debugging\" bar, quit the browser and start it with --silent-debugger-extension-api,"
-echo "  for example: open -a \"Google Chrome\" --args --silent-debugger-extension-api"
+if [ "$(uname)" = Darwin ]; then
+  echo "  for example: open -a \"Google Chrome\" --args --silent-debugger-extension-api"
+else
+  echo "  for example: google-chrome --silent-debugger-extension-api"
+fi

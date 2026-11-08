@@ -7,7 +7,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { dropPayload, refuseNonWeb, uploadPaths } from '../src/tools.mjs';
-import { isBlockedUrl, localFileBlock } from '../src/util.mjs';
+import { isBlockedUrl, localFileBlock, localFileRefusal } from '../src/util.mjs';
 
 test('refused local files and view-source: URLs are refused however they are written; web URLs pass', () => {
   for (const url of ['file:///Users/me/.ssh/id_ed25519', 'fi\tle:///etc/passwd', 'fi\nle:///etc/passwd', '\u0001file:///etc/passwd',
@@ -66,7 +66,7 @@ test('local files open under the upload rule: hidden, ~/Library, folders and mis
   assert.equal(isBlockedUrl('https://example.com/'), false);
 });
 
-test('a downloaded file (macOS quarantine mark) is not opened, also through a symlink; once the mark is gone it is', (t) => {
+test('a downloaded file (macOS quarantine mark) is not opened, also through a symlink; once the mark is gone it is', { skip: process.platform !== 'darwin' }, (t) => {
   const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'fb-quarantine-')));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'proto.html');
@@ -100,8 +100,8 @@ test('uploads refuse hidden files and folders, ~/Library and system folders, als
   for (const p of ['.env', '.ssh/id_ed25519', 'photo.jpg']) {
     assert.throws(() => uploadPaths([ok, path.join(dir, p)]), /can't be uploaded: it is hidden.*~\/Downloads/, p);
   }
-  assert.throws(() => uploadPaths([path.join(dir, 'hosts.txt')]), /\(\/private\/etc\/hosts\) can't be uploaded: it is inside \/private\/etc/);
-  assert.throws(() => uploadPaths(['/etc/hosts']), /inside \/private\/etc/);
+  assert.throws(() => uploadPaths([path.join(dir, 'hosts.txt')]), /\((\/private)?\/etc\/hosts\) can't be uploaded: it is inside (\/private)?\/etc/);
+  assert.throws(() => uploadPaths(['/etc/hosts']), /inside (\/private)?\/etc/);
   const library = path.join(os.homedir(), 'Library');
   if (fs.existsSync(library)) assert.throws(() => uploadPaths([path.join(os.homedir(), 'library')]), /inside .*\/Library/);
   // iCloud Drive and the cloud drives live in ~/Library, and uploading from them is ordinary (a stand-in home here).
@@ -116,7 +116,7 @@ test('uploads refuse hidden files and folders, ~/Library and system folders, als
   fs.writeFileSync(path.join(home, 'Library', 'Keychains', 'login.keychain-db'), 'x');
   assert.throws(() => uploadPaths([path.join(home, 'Library', 'Keychains', 'login.keychain-db')], home), /inside .*\/Library/);
   // The same home named through the Data volume keeps ~/Library refused.
-  assert.throws(() => uploadPaths([path.join(home, 'Library', 'Keychains', 'login.keychain-db')], `/System/Volumes/Data${home}`), /inside .*\/Library/);
+  if (process.platform === 'darwin') assert.throws(() => uploadPaths([path.join(home, 'Library', 'Keychains', 'login.keychain-db')], `/System/Volumes/Data${home}`), /inside .*\/Library/);
 });
 
 test('a folder upload checks everything in it: hidden entries, links out to refused places, more than 10,000 entries', (t) => {
@@ -145,7 +145,7 @@ test('a folder upload checks everything in it: hidden entries, links out to refu
   assert.throws(() => uploadPaths([project]), /it holds src\/img\/photo\.jpg, a link to .*\.ssh\/id_ed25519: it is hidden/);
   fs.rmSync(path.join(project, 'src', 'img', 'photo.jpg'));
   fs.symlinkSync('/etc', path.join(project, 'config'));
-  assert.throws(() => uploadPaths([project]), /it holds config, a link to \/private\/etc: it is inside \/private\/etc/);
+  assert.throws(() => uploadPaths([project]), /it holds config, a link to (\/private)?\/etc: it is inside (\/private)?\/etc/);
   fs.rmSync(path.join(project, 'config'));
   assert.deepEqual(uploadPaths([project]), [project]);
 
@@ -164,7 +164,7 @@ test('a path on the Data volume counts as the same path without /System/Volumes/
   const onData = `/System/Volumes/Data${dir}/report.pdf`;
   if (!fs.existsSync(onData)) return t.skip('no Data volume here');
   assert.equal(uploadPaths([onData]).length, 1);
-  assert.throws(() => uploadPaths(['/System/Volumes/Data/private/etc/hosts']), /inside \/private\/etc/);
+  if (process.platform === 'darwin') assert.throws(() => uploadPaths(['/System/Volumes/Data/private/etc/hosts']), /inside \/private\/etc/);
   assert.throws(() => uploadPaths(['/System/Library/CoreServices/SystemVersion.plist']), /inside \/System/);
   const library = path.join(os.homedir(), 'Library');
   if (fs.existsSync(library)) assert.throws(() => uploadPaths([`/System/Volumes/Data${library}`]), /inside .*\/Library/);
@@ -176,7 +176,10 @@ test('uploads refuse devices, pipes and sockets, also inside a folder, and syste
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const fifo = path.join(dir, 'pipe');
   execFileSync('mkfifo', [fifo]);
-  for (const p of ['/dev/zero', '/dev/stdin', fifo]) assert.throws(() => uploadPaths([p]), /can't be uploaded: it is not a regular file or folder/, p);
+  // Linux: /dev/stdin leads into /proc (refused for that) or to a pipe that has no path.
+  for (const p of ['/dev/zero', ...(process.platform === 'darwin' ? ['/dev/stdin'] : []), fifo]) {
+    assert.throws(() => uploadPaths([p]), /can't be uploaded: it is not a regular file or folder/, p);
+  }
   const folder = path.join(dir, 'folder');
   fs.mkdirSync(folder);
   fs.writeFileSync(path.join(folder, 'notes.txt'), 'x');
@@ -205,7 +208,7 @@ test('uploads refuse what another account could swap before it is read: a folder
   // /tmp is sticky, and the user's own files in a sticky folder can't be swapped by others.
   assert.deepEqual(uploadPaths([path.join(sticky, 'report.pdf')]), [path.join(sticky, 'report.pdf')]);
   assert.throws(() => uploadPaths([path.join(open, 'report.pdf')]),
-    new RegExp(`can't be uploaded: it sits in ${open}, where another account on this Mac could swap it .*copy it into ~/Downloads first`));
+    new RegExp(`can't be uploaded: it sits in ${open}, where another account on this computer could swap it .*copy it into ~/Downloads first`));
   // Also below a folder given whole, and through a link that leads there.
   const project = path.join(dir, 'project');
   fs.mkdirSync(path.join(project, 'shared'), { recursive: true });
@@ -222,6 +225,35 @@ test('uploads refuse what another account could swap before it is read: a folder
       .find((f) => { try { const st = fs.lstatSync(f); return st.isFile() && st.uid !== process.getuid() && st.uid !== 0 && !path.basename(f).startsWith('.'); } catch { return false; } });
     if (theirs) assert.throws(() => uploadPaths([theirs]), /it sits in \/Users\/Shared, where another account/);
   }
+});
+
+test('Linux: a user-private group\'s write bit is the user\'s alone, unless the group is shared or an ACL adds someone', { skip: process.platform !== 'linux' }, (t) => {
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.homedir(), 'fb-private-group-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.chmodSync(home, 0o700);
+  const folder = path.join(home, 'Downloads', 'invoices');
+  fs.mkdirSync(folder, { recursive: true });
+  fs.chmodSync(path.dirname(folder), 0o755);
+  fs.chmodSync(folder, 0o775); // what umask 002 makes
+  const file = path.join(folder, 'march.pdf');
+  fs.writeFileSync(file, 'x');
+  const gid = fs.statSync(folder).gid;
+  assert.deepEqual(uploadPaths([file], home, null, gid), [file], 'the group is the user\'s private group');
+  assert.throws(() => uploadPaths([file], home, null, null), /it sits in .*invoices, where another account/, 'no private group known');
+  assert.throws(() => uploadPaths([file], home, null, gid + 1), /it sits in .*invoices, where another account/, 'a group of others');
+  assert.deepEqual(uploadPaths([path.join(home, 'Downloads')], home, null, gid), [path.join(home, 'Downloads')], 'a folder given whole');
+  let acl = false;
+  try { execFileSync('setfacl', ['-m', 'u:nobody:rwx', folder], { stdio: 'ignore' }); acl = true; } catch {}
+  if (acl) assert.throws(() => uploadPaths([file], home, null, gid), /it sits in .*invoices, where another account/, 'an ACL lets another account write');
+});
+
+test('Linux: the kernel\'s and the system\'s files are refused (/proc/self/environ holds this session\'s environment)', { skip: process.platform !== 'linux' }, () => {
+  for (const p of ['/proc/self/environ', '/proc/self/cmdline', '/sys/kernel/notes']) {
+    assert.throws(() => uploadPaths([p]), /can't be uploaded: it is inside \/(proc|sys)/, p);
+    assert.match(localFileBlock(`file://${p}`) ?? '', /\/(proc|sys)/, p);
+  }
+  assert.equal(localFileRefusal('/run/media/me/USB stick/photo.jpg'), null, 'removable drives some systems mount in /run/media');
+  assert.match(localFileRefusal('/run/user/1000/bus') ?? '', /inside \/run/);
 });
 
 test('a dropped file is read only if it is still the file that was checked', (t) => {

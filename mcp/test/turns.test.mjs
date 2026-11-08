@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mock, test } from 'node:test';
-import { findSocket } from '../bin/turn-ended.mjs';
+import { findSocket, privateTmp } from '../bin/turn-ended.mjs';
 import { Tab } from '../src/browsers.mjs';
 import { registerTools } from '../src/tools.mjs';
 import { callsByTab, endTurn, listenForTurns, SUBAGENTS_STALE_MS, turnSocketPath } from '../src/turns.mjs';
@@ -243,11 +243,13 @@ test('the turn socket is in the FowlBrowser folder, made private, else in the us
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-turns-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   assert.equal(turnSocketPath(4321, dir), path.join(dir, 'turns', '4321.sock'));
-  // Too long for a socket path: the user's own temp folder, never the shared /tmp.
+  // Too long for a socket path: the user's own temp folder (macOS gives each user one), never the shared /tmp (Linux
+  // without TMPDIR: then there is no fallback).
   const long = `/tmp/${'x'.repeat(90)}`;
-  assert.equal(turnSocketPath(4321, long), path.join(os.tmpdir(), 'fowlbrowser-turn-4321.sock'));
+  assert.equal(turnSocketPath(4321, long), privateTmp(os.tmpdir()) ? path.join(os.tmpdir(), 'fowlbrowser-turn-4321.sock') : null);
   const tmp = path.join(dir, 'T');
-  fs.mkdirSync(tmp);
+  fs.mkdirSync(tmp, { mode: 0o700 }); // a umask of 002 (Linux) would leave it group-writable
+  fs.chmodSync(tmp, 0o700);
   const fallback = turnSocketPath(4322, long, tmp);
   assert.equal(fallback, path.join(tmp, 'fowlbrowser-turn-4322.sock'));
   const late = listenForTurns({ browsers: new Map() }, fallback);

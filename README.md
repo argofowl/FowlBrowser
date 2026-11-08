@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  macOS · Chrome and Helium · MIT licensed · free
+  macOS and Linux · Chrome and Helium · MIT licensed · free
 </p>
 
 <p align="center">
@@ -55,7 +55,7 @@ How we tested and how to run it yourself: [docs/benchmarks.md](docs/benchmarks.m
 
 ## Install
 
-You need a Mac, [Node.js](https://nodejs.org) 22.19 or newer, and Google Chrome or [Helium](https://helium.computer).
+You need a Mac or a Linux PC, [Node.js](https://nodejs.org) 22.19 or newer, and Google Chrome or [Helium](https://helium.computer).
 
 ### The easy way: ask your agent
 
@@ -83,7 +83,7 @@ sh install.sh
 
 1. Open `chrome://extensions` and turn on **Developer mode** (top right).
 2. Click **Load unpacked** and pick `~/Library/Application Support/FowlBrowser/extension` (in the file picker, press
-   Cmd-Shift-G and paste the path).
+   Cmd-Shift-G and paste the path). On Linux it is `~/.local/share/FowlBrowser/extension` (press Ctrl-L to type a path).
 3. Open the extension's **Details** and turn on **Allow access to file URLs**, so agents can upload files for you and
    open local pages (like a prototype they made for you).
 
@@ -151,8 +151,11 @@ Name your browsers (Work, Personal) by clicking the FowlBrowser icon in the tool
 
 ## Good to know
 
-- macOS only for now. Chrome and Helium are tested; Chromium, Brave, Edge, Arc and Vivaldi are set up by the installer
-  but less tested.
+- macOS and Linux. Chrome and Helium are tested on macOS, Google Chrome on Linux (Ubuntu, GNOME on Wayland); Chromium,
+  Brave, Edge, Arc and Vivaldi are set up by the installer but less tested. Windows isn't supported yet.
+- On Linux, closing a browser's last window usually quits it, and agents can't reopen it in the background: keep a
+  window open. The paste-to-agent setup prompts (docs/agent-setup.md and the toolbar popup) are written for a Mac; on
+  Linux follow the steps above by hand.
 - A sign-in or payment pop-up that talks back to its page brings the browser to the front for a moment if you're in
   another app. Everything else stays in the background.
 - With Claude Code, an agent's work tabs close when it finishes its reply. With other agents they close when the

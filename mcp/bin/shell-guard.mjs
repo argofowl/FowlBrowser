@@ -1,5 +1,5 @@
 // Claude Code PreToolUse hook (matcher Bash): refuses shell commands that would show a page in a browser window
-// (`open` a URL or .html with the default or a named browser, a browser's own binary without --headless, osascript
+// (`open` a URL or .html with the default or a named browser, Linux's `xdg-open` and `gio open`, a browser's own binary without --headless, osascript
 // telling a browser to open something, Python's webbrowser). Loose tabs opened that way can't be told apart or reused;
 // pages for the user go through FowlBrowser's tab_open instead. Runs on every Bash call, so node builtins only, and it
 // fails open: anything it can't read or parse is allowed. Not a sandbox, just a guard against the habit.
@@ -12,7 +12,10 @@ export const REASON = 'Pages for the user open through FowlBrowser, not the shel
 
 const BROWSER = /^(google chrome( (canary|beta|dev))?|chrome|chromium|helium|safari( technology preview)?|arc|brave browser( (beta|nightly))?|microsoft edge( (beta|dev|canary))?|vivaldi|firefox( (developer edition|nightly))?|orion|dia)$/;
 const BUNDLE = /^(com\.google\.chrome|org\.chromium\.chromium|net\.imput\.helium|com\.apple\.safari|company\.thebrowser\.(browser|dia)|com\.brave\.browser|com\.microsoft\.edgemac|com\.vivaldi\.vivaldi|org\.mozilla\.firefox|com\.kagi\.kagimacos)/;
-const BINARIES = new Set(['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']);
+const BINARIES = new Set(['google-chrome', 'google-chrome-stable', 'google-chrome-beta', 'google-chrome-unstable', 'chromium',
+  'chromium-browser', 'brave-browser', 'microsoft-edge', 'microsoft-edge-stable', 'vivaldi', 'vivaldi-stable', 'helium', 'firefox',
+  // Linux: the system's default-browser commands
+  'sensible-browser', 'x-www-browser', 'gnome-www-browser', 'www-browser']);
 // Words that run the next word as the command: their own options and NAME=value words are skipped too.
 const PREFIXES = new Set(['env', 'command', 'exec', 'nohup', 'time', '!', '{', 'if', 'then', 'else', 'elif', 'do', 'while', 'until']);
 const OPEN_VALUE = new Set(['-a', '-b', '-s', '--env', '--stdin', '--stdout', '--stderr', '--arch']);
@@ -89,6 +92,9 @@ function showsPage(words, vars) {
   }
   const name = base(cmd);
   if (name === 'open') return openShowsPage(args);
+  // Linux: the desktop's openers hand a URL or .html to the default browser.
+  if (name === 'xdg-open' || name === 'kde-open' || name === 'kde-open5') return args.some(isPage);
+  if (name === 'gio' && args[0] === 'open') return args.slice(1).some(isPage);
   if (name === 'osascript') return osascriptShowsPage(args);
   if (/^python(\d+(\.\d+)?)?$/.test(name)) return pythonShowsPage(args);
   return binaryShowsPage(cmd, args);

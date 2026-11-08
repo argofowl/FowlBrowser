@@ -1,6 +1,7 @@
 #!/bin/sh
 # Registers the FowlBrowser native messaging host (com.fowl.browser) for every supported Chromium browser that is
-# installed (its app or its Application Support folder exists). With --remove, deletes those registrations instead.
+# installed (its app, or its folder in Application Support on macOS or ~/.config on Linux, exists). With --remove,
+# deletes those registrations instead.
 set -eu
 
 HOST_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -12,16 +13,26 @@ SCRIPT=$(cat <<'JS'
 const fs = require('fs');
 const path = require('path');
 const [node, hostDir, home, mode] = process.argv.slice(1);
-const support = path.join(home, 'Library', 'Application Support');
-// [name, its folder in Application Support, its app]: installed when either exists (an app never opened has no folder yet).
-const installed = (dir, app) => fs.existsSync(path.join(support, dir)) ||
-  ['/Applications', path.join(home, 'Applications')].some((apps) => fs.existsSync(path.join(apps, app + '.app')));
-const browsers = [
+const linux = process.platform === 'linux';
+// macOS: each browser's folder in Application Support. Linux: its folder in $XDG_CONFIG_HOME (~/.config), where it
+// looks for NativeMessagingHosts.
+const support = linux ? (process.env.XDG_CONFIG_HOME || path.join(home, '.config')) : path.join(home, 'Library', 'Application Support');
+// [name, its folder in support, its app]: installed when either exists (an app never opened has no folder yet). On
+// Linux the app is its command on PATH.
+const onPath = (cmd) => (process.env.PATH || '').split(':').some((dir) => dir && fs.existsSync(path.join(dir, cmd)));
+const installed = (dir, app) => fs.existsSync(path.join(support, dir)) || (linux ? onPath(app) :
+  ['/Applications', path.join(home, 'Applications')].some((apps) => fs.existsSync(path.join(apps, app + '.app'))));
+const browsers = (linux ? [
+  ['Google Chrome', 'google-chrome', 'google-chrome-stable'], ['Google Chrome Beta', 'google-chrome-beta', 'google-chrome-beta'],
+  ['Google Chrome Dev', 'google-chrome-unstable', 'google-chrome-unstable'], ['Chromium', 'chromium', 'chromium'],
+  ['Helium', 'net.imput.helium', 'helium'], ['Brave', 'BraveSoftware/Brave-Browser', 'brave-browser'],
+  ['Microsoft Edge', 'microsoft-edge', 'microsoft-edge'], ['Vivaldi', 'vivaldi', 'vivaldi'],
+] : [
   ['Google Chrome', 'Google/Chrome', 'Google Chrome'], ['Google Chrome Beta', 'Google/Chrome Beta', 'Google Chrome Beta'],
   ['Google Chrome Canary', 'Google/Chrome Canary', 'Google Chrome Canary'], ['Chromium', 'Chromium', 'Chromium'],
   ['Helium', 'net.imput.helium', 'Helium'], ['Brave', 'BraveSoftware/Brave-Browser', 'Brave Browser'],
   ['Microsoft Edge', 'Microsoft Edge', 'Microsoft Edge'], ['Arc', 'Arc/User Data', 'Arc'], ['Vivaldi', 'Vivaldi', 'Vivaldi'],
-].filter(([, dir, app]) => installed(dir, app));
+]).filter(([, dir, app]) => installed(dir, app));
 if (mode === '--remove') {
   for (const [name, dir] of browsers) {
     const file = path.join(support, dir, 'NativeMessagingHosts', 'com.fowl.browser.json');
