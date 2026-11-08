@@ -42,6 +42,21 @@ function countSubagents(delta) {
 // Only tabs this session had mapped when the turn ended, taken before any await, so a later turn's tabs are never
 // touched. Skipped: a tab with a call running or queued (a subagent may still use it), a parked one, and owned tabs not
 // among them (a tab_open or tab_claim in progress, or a later turn's). While background subagents run, nothing is cleaned.
+// FOWLBROWSER_KEEP_TABS=1: a session's own agent tabs are handed to the user (left open, out of the work group,
+// unmuted) when its turn or session ends, instead of closed. For people who would rather close a stray tab than lose a
+// page an agent found for them; agents are told to close their scratch tabs themselves.
+export const keepTabs = () => process.env.FOWLBROWSER_KEEP_TABS === '1';
+
+// Session end with FOWLBROWSER_KEEP_TABS=1 (clients without turn ends: Codex, OpenCode...): keeps this session's agent
+// tabs, so the extension's cleanup when the socket closes hands them back instead of closing them.
+export async function keepAgentTabs(manager) {
+  await Promise.all([...manager.browsers.values()].map(async (browser) => {
+    const all = await browser.host.request('tabs.listAll', {}).catch(() => []);
+    await Promise.all(all.filter((t) => t.owner === 'you' && t.origin === 'agent' && !(t.kept ?? t.handedOver))
+      .map((t) => browser.host.request('tabs.keep', { tabId: t.id }).catch(() => {})));
+  }));
+}
+
 export async function endTurn(manager) {
   const result = { closed: [], released: [], skipped: [] };
   if (subagents > 0 && Date.now() - subagentsChanged > SUBAGENTS_STALE_MS) countSubagents(-subagents);
@@ -78,7 +93,8 @@ export async function endTurn(manager) {
       if (info.releasing) return;
       if (!tab || info.parked || parked(id) || tab.busy || callsByTab.get(id) > 0) return result.skipped.push(id);
       // Older extensions don't send kept; handedOver was their rule.
-      const close = info.origin === 'agent' && !(info.kept ?? info.handedOver);
+      const unkept = info.origin === 'agent' && !(info.kept ?? info.handedOver);
+      const close = unkept && !keepTabs();
       // Re-checked when its turn on the tab queue comes: a later turn may have released and reclaimed the same id.
       const same = () => browser.tabs.get(info.id) === tab;
       const work = async () => {
@@ -93,6 +109,7 @@ export async function endTurn(manager) {
         }
         if (close) await browser.host.request('chrome.tabs.remove', [info.id]);
         else {
+          if (unkept) await browser.host.request('tabs.keep', { tabId: info.id }); // FOWLBROWSER_KEEP_TABS
           await uninstallPopups(tab);
           await browser.host.request('tabs.release', { tabId: info.id });
         }

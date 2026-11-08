@@ -4,12 +4,12 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { BrowserManager } from './browsers.mjs';
 import { removeAll as removeCursors } from './cursor/index.mjs';
 import { registerTools } from './tools.mjs';
-import { listenForTurns } from './turns.mjs';
+import { keepAgentTabs, keepTabs, listenForTurns } from './turns.mjs';
 
 const INSTRUCTIONS = `FowlBrowser drives the user's own Google Chrome and Helium (their real profiles and logins) in background tabs, without disturbing them.
 - Start with browser_list and pick the browser on purpose: the one the user named (by app, or by the name they gave a profile, like "Work"); only when they named none, the one where the site and their login live. A browser the user named is the only one you use: if the site asks to sign in there, never try it in another browser; hand them the tab with tab_handoff and wait.
 - Tab ids name their browser: "helium:1834", "chrome:52". Every tool takes an explicit tab id; there is no current tab, so parallel agents never collide. Each result starts with "Browser: … · Tab: …".
-- Open your own tab with tab_open, or tab_list (scope all) then tab_claim to work in one of the user's tabs; tab_release gives it back. When your session ends (in Claude Code: each turn's end), your tabs close unless opened for_user or kept with tab_keep, and claimed and kept tabs go back to the user.
+- Open your own tab with tab_open, or tab_list (scope all) then tab_claim to work in one of the user's tabs; tab_release gives it back. When your session ends (in Claude Code: each turn's end), ${keepTabs() ? 'your tabs stay open and go to the user (FOWLBROWSER_KEEP_TABS), so close the scratch tabs you no longer need with tab_close and leave open the ones the user should see' : 'your tabs close unless opened for_user or kept with tab_keep'}, and claimed and kept tabs go back to the user.
 - To show the user several pages (prototypes, variants, results), tab_open each with for_user and a group named for the project (on a redo, the same URLs and group: see tab_open).
 - Read pages with snapshot (refs like [ref=e12]) and act with click/type/fill_form/press_key/etc. using those refs. Never tab_focus unless the user asks to see a tab.
 - After an action on the same page, the result lists only what changed since the tab's previous snapshot (new lines marked +); refs of unchanged elements stay valid. Call snapshot for the whole page; snapshot mode "text" reads an article as plain text.
@@ -36,6 +36,7 @@ let exiting = false;
 const exit = async () => {
   if (exiting) return;
   exiting = true;
+  if (keepTabs()) await Promise.race([keepAgentTabs(manager), new Promise((resolve) => setTimeout(resolve, 3000))]).catch(() => {});
   await removeCursors().catch(() => {});
   process.exit(0);
 };

@@ -12,7 +12,7 @@ import { mock, test } from 'node:test';
 import { findSocket } from '../bin/turn-ended.mjs';
 import { Tab } from '../src/browsers.mjs';
 import { registerTools } from '../src/tools.mjs';
-import { callsByTab, endTurn, listenForTurns, SUBAGENTS_STALE_MS, turnSocketPath } from '../src/turns.mjs';
+import { callsByTab, endTurn, keepAgentTabs, listenForTurns, SUBAGENTS_STALE_MS, turnSocketPath } from '../src/turns.mjs';
 
 const page = Object.assign(new EventEmitter(), { setDefaultTimeout() {}, setDefaultNavigationTimeout() {} });
 page.setMaxListeners(0);
@@ -42,6 +42,7 @@ function fakeBrowser() {
       await new Promise((resolve) => setTimeout(resolve, 50)); // slow enough for a concurrent request to join the run
       if (method === 'chrome.tabs.remove') return void owners.delete(params[0]);
       if (method === 'tabs.release') return void owners.delete(params.tabId);
+      if (method === 'tabs.keep') return void Object.assign(owners.get(params.tabId) ?? {}, { kept: true, handedOver: true });
       throw new Error(`unexpected ${method}`);
     },
   };
@@ -84,6 +85,22 @@ test('closes unkept agent tabs, releases kept, claimed and kept children, skips 
   assert.deepEqual(await ask(socketPath), { closed: [], released: [], skipped: [] });
   server.close();
   fs.rmSync(socketPath, { force: true });
+});
+
+test('FOWLBROWSER_KEEP_TABS=1: agent tabs are kept and handed to the user, never closed, at a turn end and at session end', async (t) => {
+  process.env.FOWLBROWSER_KEEP_TABS = '1';
+  t.after(() => { delete process.env.FOWLBROWSER_KEEP_TABS; });
+  const browser = fakeBrowser();
+  const result = await endTurn(managerOf(browser));
+  assert.deepEqual(result.closed, []);
+  assert.ok(result.released.includes('chrome:1'), 'the unkept agent tab goes to the user');
+  assert.ok(browser.calls.some(([m, p]) => m === 'tabs.keep' && p.tabId === 1), 'kept first, so the extension hands it over');
+  assert.ok(!browser.calls.some(([m, p]) => m === 'tabs.keep' && p.tabId === 2), 'an already kept tab is not kept again');
+  assert.ok(!browser.calls.some(([m]) => m === 'chrome.tabs.remove'), 'nothing closed');
+  // A client without turn ends (Codex, OpenCode): its agent tabs are kept before the socket closes.
+  const other = fakeBrowser();
+  await keepAgentTabs(managerOf(other));
+  assert.deepEqual(other.calls.filter(([m]) => m === 'tabs.keep').map(([, p]) => p.tabId).sort(), [1, 4, 7, 8]);
 });
 
 test('a browser the session has no tabs in is not asked: the turn ends at once', async () => {
