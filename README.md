@@ -200,7 +200,8 @@ Claude Code runs a batch of them at once. Every tool names its tab (`chrome:52`,
 
 Any MCP client can run the server: a stdio server with the command
 `~/Library/Application Support/FowlBrowser/mcp/bin/fowlbrowser-mcp` (written out as an absolute path, no arguments).
-`FOWLBROWSER_LABEL` sets the name on the cursor and tab group. `FOWLBROWSER_DEBUG=<file>` logs every call, for bug
+`FOWLBROWSER_LABEL` sets the name on the cursor and tab group. `FOWLBROWSER_KEEP_TABS=1` leaves an agent's tabs open for
+you when its turn or session ends, instead of closing them (agents are then told to close their scratch tabs themselves). `FOWLBROWSER_DEBUG=<file>` logs every call, for bug
 reports (typed text left out; the file is created readable only by you). `sh install.sh --lite` skips Lighthouse (about 160 MB).
 
 ```sh
