@@ -14,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const [node, hostDir, home, mode] = process.argv.slice(1);
 const linux = process.platform === 'linux';
-// macOS: each browser's folder in Application Support. Linux: its folder in $XDG_CONFIG_HOME (~/.config), where it
+// macOS: the folder of each browser in Application Support. Linux: its folder in $XDG_CONFIG_HOME (~/.config), where it
 // looks for NativeMessagingHosts.
 const support = linux ? (process.env.XDG_CONFIG_HOME || path.join(home, '.config')) : path.join(home, 'Library', 'Application Support');
 // [name, its folder in support, its app]: installed when either exists (an app never opened has no folder yet). On
