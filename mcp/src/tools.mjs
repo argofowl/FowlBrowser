@@ -11,6 +11,7 @@ import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
 import { EXPORT_DESCRIPTION, exportShape, exportTab } from './exports.mjs';
 import { registerPerf } from './perf.mjs';
+import { registerJev } from './jev.mjs';
 import { backgroundClick, openingLines, uninstallPopups } from './popups.mjs';
 import { READ_ALL_DESCRIPTION, readAll, readAllShape } from './reader.mjs';
 import * as record from './record.mjs';
@@ -2760,5 +2761,6 @@ export function registerTools(server, manager) {
     withTab(manager, async (tab, args) => text(`${await header(tab)}\n${await cued(tab, 'observe', () => exportTab(tab, args))}`)));
 
   registerBrowserData(tool, manager, { click: (args) => handlers.click(args), parseTabId });
+  registerJev(tool, manager, { handlers, parseTabId });
   registerPerf(tool, manager, { withTab: (handler) => withTab(manager, handler), header, text, tabArg, refuseBlockedPage, blockedSince });
 }

@@ -10,7 +10,7 @@ test('reading tools are marked read-only, acting tools are not', () => {
   const readOnly = [...configs].filter(([, config]) => config.annotations?.readOnlyHint === true).map(([name]) => name).sort();
   assert.deepEqual(readOnly, ['browser_data', 'browser_list', 'console', 'downloads', 'export', 'memory', 'network', 'screenshot', 'snapshot',
     'tab_list', 'trace_insight', 'wait_for']);
-  for (const acting of ['click', 'type', 'navigate', 'evaluate', 'tab_open', 'tab_close', 'download', 'lighthouse', 'trace_start']) {
+  for (const acting of ['click', 'type', 'navigate', 'evaluate', 'tab_open', 'tab_close', 'download', 'lighthouse', 'trace_start', 'jev_run']) {
     assert.ok(configs.has(acting) && !configs.get(acting).annotations, `${acting} is not marked read-only`);
   }
 });

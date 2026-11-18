@@ -7,3 +7,6 @@ host/fowlbrowser-host
 local/
 TASKS.md
 **/NOTES.md
+
+# jev_run key, if one is put next to a dev checkout
+typesafe.key
