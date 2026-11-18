@@ -78,7 +78,7 @@ test('lists the spec tools', async () => {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
   for (const name of ['browser_list', 'tab_list', 'tab_open', 'tab_claim', 'tab_handoff', 'tab_mute', 'snapshot', 'click', 'media', 'network',
-    'trace_start', 'trace_stop', 'trace_insight', 'lighthouse', 'memory', 'read_all']) assert.ok(names.includes(name), name);
+    'trace_start', 'trace_stop', 'trace_insight', 'lighthouse', 'memory', 'read_all', 'jev_run']) assert.ok(names.includes(name), name);
   assert.ok(tools.find((t) => t.name === 'tab_claim').inputSchema.properties.resume, 'tab_claim takes resume');
 });
 

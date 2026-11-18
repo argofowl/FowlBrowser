@@ -932,6 +932,29 @@ a `<select>` click opens a native menu that holds the action; a file input click
 - Turn end waits at most 3 s for an app-link reattach under way; a slower one leaves its tab controlled until the next
   turn end.
 
+## jev_run: a fast inner loop with TypeSafe's Jev (2026-11-18)
+
+`mcp/src/jev.mjs`, after browser-use/jev-ultrafast. `jev_run {tab, goal, inputs?: {name: value}, max_steps?=15 (max 40),
+min_confidence?=0.35, allow_risky?, dry_run?, snapshot_chars?=8000}`. Opt-in: the key comes from `TYPESAFE_API_KEY`, else
+`typesafe.key` in the app folder (install.sh rsyncs only its subfolders); without one the call fails saying where to put
+it. `TYPESAFE_MODEL` (default `jev-latest`) and `TYPESAFE_API_URL` override the model and endpoint.
+
+- Each step: the `snapshot` handler (whole page, 40000 chars), parsed into an element table (fields, then toggles,
+  buttons, links; disabled controls left out; a nameless link borrows its first named child; at most 200 per question)
+  and page text from the `main` landmark (5000 chars). One `POST /v1/systemone` with an `operation` Choice (CLICK,
+  TYPE_TEXT and SELECT only when they have targets, SCROLL_UP/DOWN, WAIT, DONE, BLOCKED) and speculative target Choices
+  (`click_target`, `type_target`, `select_target`, each with `none`), plus, when there are inputs, which input to type or
+  select and a Noul for pressing Enter after typing. State: goal, page title and URL, the last 8 actions, the inputs,
+  `controls_on_page` (every offered control, so the operation question doesn't scroll for a control it can't see in the
+  text) and the page text.
+- Execution goes through the raw handlers of `click`, `type` (`slowly` for comboboxes), `select_option`, `scroll` and
+  `wait_for` with `snapshot: false`, so their guards apply. Text typed is only ever an input value.
+- It stops on: DONE, BLOCKED, an operation below `min_confidence` (uncertain), a click whose name matches the risky list
+  (send, pay, buy, order, publish, post, delete, subscribe…, English and Portuguese; `needs_confirmation`, nothing
+  clicked) unless `allow_risky`, a click that opened a new tab (`new_tab`, naming it), the same action three times or four
+  WAITs in a row, the tab being taken over or handed off, or `max_steps`. The result lists each step with its
+  probabilities and read/decide times, then the final snapshot.
+
 ## Performance tools (2026-10-11): traces, Lighthouse, memory
 
 `mcp/src/perf.mjs` (shared helpers, `memory`), `trace.mjs`, `lighthouse.mjs`. All of them talk to the tab's own debugger

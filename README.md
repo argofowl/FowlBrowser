@@ -128,6 +128,8 @@ Name your browsers (Work, Personal) by clicking the FowlBrowser icon in the tool
 
 - **No servers, no tracking.** FowlBrowser runs on your Mac and sends nothing anywhere. Pages an agent reads go only to
   the agent you use.
+  The one exception is opt-in: `jev_run` (below) sends the pages it works on to TypeSafe's API, and only runs once you
+  give it your own TypeSafe key.
 - **No open debugging port.** Chrome never opens its remote-debugging port. Agents go through the extension, one tab
   at a time, over a local channel only your Mac user can open. Programs running as you can open it too, just as they
   can read your files, so only run agents and tools you trust.
@@ -191,6 +193,14 @@ Extension: chrome.debugger and chrome.tabs
 | Acting | `navigate`, `click`, `hover`, `type`, `fill_form`, `select_option`, `press_key`, `scroll`, `drag`, `upload_files` (inputs, buttons and drop zones), `dialog`, `media` |
 | Files and data | `download`, `downloads`, `export`, `browser_data` |
 | Performance | `trace_start`, `trace_stop`, `trace_insight`, `lighthouse`, `memory` |
+| Fast multi-step (opt-in) | `jev_run`: hands a short sub-goal (a search, filters, a form) to a loop driven by [TypeSafe's Jev](https://docs.typesafe.ai), one fast decision per step and no round trip to the agent |
+
+`jev_run` follows [browser-use/jev-ultrafast](https://github.com/browser-use/jev-ultrafast): each step reads the page
+once, and one TypeSafe request picks the operation and, for each operation, its element; the step then runs through
+the same `click`, `type`, `select_option` and `scroll` an agent would call. Jev never writes text: what it types comes
+only from the `inputs` the agent passes. Clicks on send, pay, buy, publish or delete controls stop it and go back to the
+agent. To turn it on, save your key in `~/Library/Application Support/FowlBrowser/typesafe.key` (it survives
+reinstalls) or set `TYPESAFE_API_KEY` in the server's environment; without a key the tool only says how.
 
 Agents read pages as an accessibility tree with element refs (`[ref=e12]`); after an action on the same page they
 usually get only what changed, and can ask for a screenshot in the same result, or a few frames of an animation as it
